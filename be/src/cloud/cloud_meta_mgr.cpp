@@ -880,6 +880,7 @@ Status CloudMetaMgr::abort_txn(const StreamLoadContext& ctx) {
     AbortTxnRequest req;
     AbortTxnResponse res;
     req.set_cloud_unique_id(config::cloud_unique_id);
+    req.set_reason(std::string(ctx.status.msg().substr(0, 1024)));
     if (ctx.db_id > 0 && !ctx.label.empty()) {
         req.set_db_id(ctx.db_id);
         req.set_label(ctx.label);
@@ -1050,7 +1051,8 @@ Status CloudMetaMgr::update_delete_bitmap(const CloudTablet& tablet, int64_t loc
 
 Status CloudMetaMgr::update_delete_bitmap_without_lock(const CloudTablet& tablet,
                                                        DeleteBitmap* delete_bitmap) {
-    VLOG_DEBUG << "update_delete_bitmap_without_lock , tablet_id: " << tablet.tablet_id();
+    LOG(INFO) << "update_delete_bitmap_without_lock , tablet_id: " << tablet.tablet_id()
+              << ",delete_bitmap size:" << delete_bitmap->delete_bitmap.size();
     UpdateDeleteBitmapRequest req;
     UpdateDeleteBitmapResponse res;
     req.set_cloud_unique_id(config::cloud_unique_id);

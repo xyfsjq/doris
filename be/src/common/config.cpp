@@ -925,6 +925,9 @@ DEFINE_mBool(enable_query_like_bloom_filter, "true");
 DEFINE_Int32(doris_remote_scanner_thread_pool_thread_num, "48");
 // number of s3 scanner thread pool queue size
 DEFINE_Int32(doris_remote_scanner_thread_pool_queue_size, "102400");
+DEFINE_mInt64(block_cache_wait_timeout_ms, "1000");
+DEFINE_mInt64(cache_lock_long_tail_threshold, "1000");
+DEFINE_Int64(file_cache_recycle_keys_size, "1000000");
 
 // limit the queue of pending batches which will be sent by a single nodechannel
 DEFINE_mInt64(nodechannel_pending_queue_max_bytes, "67108864");
@@ -1022,7 +1025,7 @@ DEFINE_mInt32(inverted_index_cache_stale_sweep_time_sec, "600");
 // inverted index searcher cache size
 DEFINE_String(inverted_index_searcher_cache_limit, "10%");
 DEFINE_Bool(enable_inverted_index_cache_check_timestamp, "true");
-DEFINE_Int32(inverted_index_fd_number_limit_percent, "40"); // 40%
+DEFINE_Int32(inverted_index_fd_number_limit_percent, "20"); // 20%
 DEFINE_Int32(inverted_index_query_cache_shards, "256");
 
 // inverted index match bitmap cache size
@@ -1039,7 +1042,7 @@ DEFINE_Int32(inverted_index_read_buffer_size, "4096");
 // tree depth for bkd index
 DEFINE_Int32(max_depth_in_bkd_tree, "32");
 // index compaction
-DEFINE_mBool(inverted_index_compaction_enable, "false");
+DEFINE_mBool(inverted_index_compaction_enable, "true");
 // Only for debug, do not use in production
 DEFINE_mBool(debug_inverted_index_compaction, "false");
 // index by RAM directory
@@ -1071,9 +1074,9 @@ DEFINE_mInt32(schema_cache_sweep_time_sec, "100");
 
 // max number of segment cache, default -1 for backward compatibility fd_number*2/5
 DEFINE_Int32(segment_cache_capacity, "-1");
-DEFINE_Int32(segment_cache_fd_percentage, "40");
-DEFINE_mInt32(estimated_mem_per_column_reader, "1024");
-DEFINE_Int32(segment_cache_memory_percentage, "2");
+DEFINE_Int32(segment_cache_fd_percentage, "20");
+DEFINE_mInt32(estimated_mem_per_column_reader, "512");
+DEFINE_Int32(segment_cache_memory_percentage, "5");
 
 // enable feature binlog, default false
 DEFINE_Bool(enable_feature_binlog, "false");
@@ -1351,6 +1354,8 @@ DEFINE_mBool(enable_pipeline_task_leakage_detect, "false");
 DEFINE_mInt32(check_score_rounds_num, "1000");
 
 DEFINE_Int32(query_cache_size, "512");
+
+DEFINE_mBool(enable_delete_bitmap_merge_on_compaction, "false");
 
 // clang-format off
 #ifdef BE_TEST

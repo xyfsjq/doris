@@ -984,6 +984,9 @@ DECLARE_mInt64(nodechannel_pending_queue_max_bytes);
 
 // The batch size for sending data by brpc streaming client
 DECLARE_mInt64(brpc_streaming_client_batch_bytes);
+DECLARE_mInt64(block_cache_wait_timeout_ms);
+DECLARE_mInt64(cache_lock_long_tail_threshold);
+DECLARE_Int64(file_cache_recycle_keys_size);
 
 DECLARE_Bool(enable_brpc_builtin_services);
 
@@ -1437,6 +1440,8 @@ DECLARE_mInt32(check_score_rounds_num);
 
 // MB
 DECLARE_Int32(query_cache_size);
+
+DECLARE_mBool(enable_delete_bitmap_merge_on_compaction);
 
 #ifdef BE_TEST
 // test s3
