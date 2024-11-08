@@ -20,6 +20,7 @@ package org.apache.doris.datasource.hive;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ListPartitionItem;
+import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.PartitionItem;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.PrimitiveType;
@@ -27,10 +28,12 @@ import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.SchemaCacheValue;
 import org.apache.doris.datasource.hudi.HudiUtils;
 import org.apache.doris.datasource.iceberg.IcebergUtils;
+import org.apache.doris.mtmv.MTMVBaseTableIf;
 import org.apache.doris.mtmv.MTMVMaxTimestampSnapshot;
 import org.apache.doris.mtmv.MTMVRefreshContext;
 import org.apache.doris.mtmv.MTMVRelatedTableIf;
@@ -87,7 +90,7 @@ import java.util.stream.Collectors;
 /**
  * Hive metastore external table.
  */
-public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableIf {
+public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableIf, MTMVBaseTableIf {
     private static final Logger LOG = LogManager.getLogger(HMSExternalTable.class);
 
     public static final Set<String> SUPPORTED_HIVE_FILE_FORMATS;
@@ -337,7 +340,7 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
     }
 
     private long getRowCountFromExternalSource() {
-        long rowCount = -1;
+        long rowCount = UNKNOWN_ROW_COUNT;
         switch (dlaType) {
             case HIVE:
                 rowCount = StatisticsUtil.getHiveRowCount(this);
@@ -350,7 +353,7 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
                     LOG.debug("getRowCount for dlaType {} is not supported.", dlaType);
                 }
         }
-        return rowCount;
+        return rowCount > 0 ? rowCount : UNKNOWN_ROW_COUNT;
     }
 
     @Override
@@ -524,7 +527,7 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
         // Get row count from hive metastore property.
         long rowCount = getRowCountFromExternalSource();
         // Only hive table supports estimate row count by listing file.
-        if (rowCount == -1 && dlaType.equals(DLAType.HIVE)) {
+        if (rowCount == UNKNOWN_ROW_COUNT && dlaType.equals(DLAType.HIVE)) {
             LOG.info("Will estimate row count for table {} from file list.", name);
             rowCount = getRowCountFromFileList();
         }
@@ -586,9 +589,9 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
             case ICEBERG:
                 if (GlobalVariable.enableFetchIcebergStats) {
                     return StatisticsUtil.getIcebergColumnStats(colName,
-                        Env.getCurrentEnv().getExtMetaCacheMgr().getIcebergMetadataCache().getIcebergTable(
-                            catalog, dbName, name
-                        ));
+                            Env.getCurrentEnv().getExtMetaCacheMgr().getIcebergMetadataCache().getIcebergTable(
+                                    catalog, dbName, name
+                            ));
                 } else {
                     break;
                 }
@@ -820,11 +823,6 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
     }
 
     @Override
-    public boolean needAutoRefresh() {
-        return true;
-    }
-
-    @Override
     public boolean isPartitionColumnAllowNull() {
         return true;
     }
@@ -834,11 +832,11 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
      */
     private long getRowCountFromFileList() {
         if (!GlobalVariable.enable_get_row_count_from_file_list) {
-            return -1;
+            return UNKNOWN_ROW_COUNT;
         }
         if (isView()) {
-            LOG.info("Table {} is view, return 0.", name);
-            return 0;
+            LOG.info("Table {} is view, return -1.", name);
+            return UNKNOWN_ROW_COUNT;
         }
         HiveMetaStoreCache.HivePartitionValues partitionValues = getAllPartitionValues();
 
@@ -865,8 +863,8 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
             estimatedRowSize += column.getDataType().getSlotSize();
         }
         if (estimatedRowSize == 0) {
-            LOG.warn("Table {} estimated size is 0, return 0.", name);
-            return 0;
+            LOG.warn("Table {} estimated size is 0, return -1.", name);
+            return UNKNOWN_ROW_COUNT;
         }
 
         int totalPartitionSize = partitionValues == null ? 1 : partitionValues.getIdToPartitionItem().size();
@@ -878,7 +876,7 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
         long rows = totalSize / estimatedRowSize;
         LOG.info("Table {} rows {}, total size is {}, estimatedRowSize is {}",
                 name, rows, totalSize, estimatedRowSize);
-        return rows;
+        return rows > 0 ? rows : UNKNOWN_ROW_COUNT;
     }
 
     // Get all partition values from cache.
@@ -957,5 +955,11 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
     public boolean isPartitionedTable() {
         makeSureInitialized();
         return !isView() && remoteTable.getPartitionKeysSize() > 0;
+    }
+
+    @Override
+    public void beforeMTMVRefresh(MTMV mtmv) throws DdlException {
+        Env.getCurrentEnv().getRefreshManager()
+                .refreshTable(getCatalog().getName(), getDbName(), getName(), true);
     }
 }

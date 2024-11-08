@@ -54,11 +54,11 @@ import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.plans.ComputeResultSet;
 import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.algebra.CatalogRelation;
 import org.apache.doris.nereids.trees.plans.commands.ExplainCommand.ExplainLevel;
 import org.apache.doris.nereids.trees.plans.distribute.DistributePlanner;
 import org.apache.doris.nereids.trees.plans.distribute.DistributedPlan;
 import org.apache.doris.nereids.trees.plans.distribute.FragmentIdMapping;
-import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSqlCache;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
@@ -228,7 +228,7 @@ public class NereidsPlanner extends Planner {
         }
     }
 
-    private Plan planWithoutLock(
+    protected Plan planWithoutLock(
             LogicalPlan plan, ExplainLevel explainLevel,
             boolean showPlanProcess, PhysicalProperties requireProperties) {
         // resolve column, table and function
@@ -272,8 +272,8 @@ public class NereidsPlanner extends Planner {
         //   2. ut test. In ut test, FeConstants.enableInternalSchemaDb is false or FeConstants.runningUnitTest is true
         if (FeConstants.enableInternalSchemaDb && !FeConstants.runningUnitTest
                 && !cascadesContext.isLeadingDisableJoinReorder()) {
-            List<LogicalOlapScan> scans = cascadesContext.getRewritePlan()
-                    .collectToList(LogicalOlapScan.class::isInstance);
+            List<CatalogRelation> scans = cascadesContext.getRewritePlan()
+                    .collectToList(CatalogRelation.class::isInstance);
             Optional<String> disableJoinReorderReason = StatsCalculator
                     .disableJoinReorderIfStatsInvalid(scans, cascadesContext);
             disableJoinReorderReason.ifPresent(statementContext::setDisableJoinReorderReason);
@@ -311,7 +311,7 @@ public class NereidsPlanner extends Planner {
         return physicalPlan;
     }
 
-    private LogicalPlan preprocess(LogicalPlan logicalPlan) {
+    protected LogicalPlan preprocess(LogicalPlan logicalPlan) {
         return new PlanPreprocessors(statementContext).process(logicalPlan);
     }
 
@@ -322,7 +322,7 @@ public class NereidsPlanner extends Planner {
         }
     }
 
-    private void analyze(boolean showPlanProcess) {
+    protected void analyze(boolean showPlanProcess) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Start analyze plan");
         }
@@ -337,7 +337,7 @@ public class NereidsPlanner extends Planner {
     /**
      * Logical plan rewrite based on a series of heuristic rules.
      */
-    private void rewrite(boolean showPlanProcess) {
+    protected void rewrite(boolean showPlanProcess) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Start rewrite plan");
         }
@@ -349,7 +349,7 @@ public class NereidsPlanner extends Planner {
     }
 
     // DependsRules: EnsureProjectOnTopJoin.class
-    private void optimize() {
+    protected void optimize() {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Start optimize plan");
         }
@@ -360,7 +360,7 @@ public class NereidsPlanner extends Planner {
         }
     }
 
-    private void splitFragments(PhysicalPlan resultPlan) {
+    protected void splitFragments(PhysicalPlan resultPlan) {
         if (resultPlan instanceof PhysicalSqlCache) {
             return;
         }
@@ -455,7 +455,7 @@ public class NereidsPlanner extends Planner {
         }
     }
 
-    private void distribute(PhysicalPlan physicalPlan, ExplainLevel explainLevel) {
+    protected void distribute(PhysicalPlan physicalPlan, ExplainLevel explainLevel) {
         boolean canUseNereidsDistributePlanner = SessionVariable.canUseNereidsDistributePlanner();
         if ((!canUseNereidsDistributePlanner && explainLevel.isPlanLevel)) {
             return;
@@ -465,18 +465,21 @@ public class NereidsPlanner extends Planner {
         }
 
         splitFragments(physicalPlan);
+        doDistribute(canUseNereidsDistributePlanner);
+    }
 
+    protected void doDistribute(boolean canUseNereidsDistributePlanner) {
         if (!canUseNereidsDistributePlanner) {
             return;
         }
 
-        distributedPlans = new DistributePlanner(fragments).plan();
+        distributedPlans = new DistributePlanner(statementContext, fragments).plan();
         if (statementContext.getConnectContext().getExecutor() != null) {
             statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsDistributeTime();
         }
     }
 
-    private PhysicalPlan postProcess(PhysicalPlan physicalPlan) {
+    protected PhysicalPlan postProcess(PhysicalPlan physicalPlan) {
         return new PlanPostProcessors(cascadesContext).process(physicalPlan);
     }
 
@@ -595,11 +598,11 @@ public class NereidsPlanner extends Planner {
         ExplainLevel explainLevel = getExplainLevel(explainOptions);
         String plan = "";
         String mvSummary = "";
-        if (this.getPhysicalPlan() != null && cascadesContext != null) {
+        if ((this.getPhysicalPlan() != null || this.getOptimizedPlan() != null) && cascadesContext != null) {
             mvSummary = cascadesContext.getMaterializationContexts().isEmpty() ? "" :
                     "\n\n========== MATERIALIZATIONS ==========\n"
                             + MaterializationContext.toSummaryString(cascadesContext.getMaterializationContexts(),
-                            this.getPhysicalPlan());
+                            this.getPhysicalPlan() == null ? this.getOptimizedPlan() : this.getPhysicalPlan());
         }
         switch (explainLevel) {
             case PARSED_PLAN:
@@ -733,6 +736,10 @@ public class NereidsPlanner extends Planner {
     @VisibleForTesting
     public CascadesContext getCascadesContext() {
         return cascadesContext;
+    }
+
+    public ConnectContext getConnectContext() {
+        return cascadesContext.getConnectContext();
     }
 
     public static PhysicalProperties buildInitRequireProperties() {

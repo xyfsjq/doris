@@ -338,6 +338,10 @@ public class StmtExecutor {
                             context.getSessionVariable().getAutoProfileThresholdMs());
     }
 
+    public boolean isProxy() {
+        return isProxy;
+    }
+
     public static InternalService.PDataRow getRowStringValue(List<Expr> cols,
             FormatOptions options) throws UserException {
         if (cols.isEmpty()) {
@@ -391,7 +395,7 @@ public class StmtExecutor {
         String taskState = "RUNNING";
         if (isFinished) {
             if (coord != null) {
-                taskState = coord.queryStatus.getErrorCode().name();
+                taskState = coord.getExecStatus().getErrorCode().name();
             } else {
                 taskState = context.getState().toString();
             }
@@ -746,6 +750,7 @@ public class StmtExecutor {
             // t3: observer fe receive editlog creating the table from the master fe
             syncJournalIfNeeded();
             try {
+                ((Command) logicalPlan).verifyCommandSupported();
                 ((Command) logicalPlan).run(context, this);
             } catch (MustFallbackException e) {
                 if (LOG.isDebugEnabled()) {
@@ -1912,10 +1917,10 @@ public class StmtExecutor {
                                 : new ShortCircuitQueryContext(planner, (Queriable) parsedStmt);
             coordBase = new PointQueryExecutor(shortCircuitQueryContext,
                         context.getSessionVariable().getMaxMsgSizeOfResultReceiver());
+            context.getState().setIsQuery(true);
         } else if (planner instanceof NereidsPlanner && ((NereidsPlanner) planner).getDistributedPlans() != null) {
             coord = new NereidsCoordinator(context, analyzer,
-                    planner, context.getStatsErrorEstimator(),
-                    (NereidsPlanner) planner);
+                    (NereidsPlanner) planner, context.getStatsErrorEstimator());
             profile.addExecutionProfile(coord.getExecutionProfile());
             QeProcessorImpl.INSTANCE.registerQuery(context.queryId(),
                     new QueryInfo(context, originStmt.originStmt, coord));
@@ -2583,7 +2588,7 @@ public class StmtExecutor {
                 List<Long> tabletIdList = new ArrayList<Long>();
                 Set<Long> beTabletIds = ((CloudEnv) Env.getCurrentEnv())
                                            .getCloudTabletRebalancer()
-                                           .getSnapshotTabletsByBeId(backend.getId());
+                                           .getSnapshotTabletsInPrimaryByBeId(backend.getId());
                 allTabletIds.forEach(tabletId -> {
                     if (beTabletIds.contains(tabletId)) {
                         tabletIdList.add(tabletId);

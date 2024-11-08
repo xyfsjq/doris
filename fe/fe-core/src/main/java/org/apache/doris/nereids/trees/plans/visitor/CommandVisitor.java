@@ -52,6 +52,10 @@ import org.apache.doris.nereids.trees.plans.commands.ShowConstraintsCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowCreateMTMVCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowCreateProcedureCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowProcedureStatusCommand;
+import org.apache.doris.nereids.trees.plans.commands.ShowVariablesCommand;
+import org.apache.doris.nereids.trees.plans.commands.ShowViewCommand;
+import org.apache.doris.nereids.trees.plans.commands.UnsetDefaultStorageVaultCommand;
+import org.apache.doris.nereids.trees.plans.commands.UnsetVariableCommand;
 import org.apache.doris.nereids.trees.plans.commands.UnsupportedCommand;
 import org.apache.doris.nereids.trees.plans.commands.UpdateCommand;
 import org.apache.doris.nereids.trees.plans.commands.insert.BatchInsertIntoTableCommand;
@@ -198,6 +202,15 @@ public interface CommandVisitor<R, C> {
         return visitCommand(unsupportedCommand, context);
     }
 
+    default R visitUnsetVariableCommand(UnsetVariableCommand unsetVariableCommand, C context) {
+        return visitCommand(unsetVariableCommand, context);
+    }
+
+    default R visitUnsetDefaultStorageVaultCommand(UnsetDefaultStorageVaultCommand unsetDefaultStorageVaultCommand,
+                                                   C context) {
+        return visitCommand(unsetDefaultStorageVaultCommand, context);
+    }
+
     default R visitCreateTableLikeCommand(CreateTableLikeCommand createTableLikeCommand, C context) {
         return visitCommand(createTableLikeCommand, context);
     }
@@ -220,5 +233,13 @@ public interface CommandVisitor<R, C> {
 
     default R visitSetDefaultStorageVault(SetDefaultStorageVaultCommand setDefaultStorageVaultCommand, C context) {
         return visitCommand(setDefaultStorageVaultCommand, context);
+    }
+
+    default R visitShowVariablesCommand(ShowVariablesCommand showVariablesCommand, C context) {
+        return visitCommand(showVariablesCommand, context);
+    }
+
+    default R visitShowViewCommand(ShowViewCommand showViewCommand, C context) {
+        return visitCommand(showViewCommand, context);
     }
 }

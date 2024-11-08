@@ -2908,15 +2908,18 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
 
         // Step 3: get snapshot
+        String label = request.getLabelName();
         TGetSnapshotResult result = new TGetSnapshotResult();
         result.setStatus(new TStatus(TStatusCode.OK));
-        Snapshot snapshot = Env.getCurrentEnv().getBackupHandler().getSnapshot(request.getLabelName());
+        Snapshot snapshot = Env.getCurrentEnv().getBackupHandler().getSnapshot(label);
         if (snapshot == null) {
             result.getStatus().setStatusCode(TStatusCode.SNAPSHOT_NOT_EXIST);
-            result.getStatus().addToErrorMsgs("snapshot not exist");
+            result.getStatus().addToErrorMsgs(String.format("snapshot %s not exist", label));
         } else {
             result.setMeta(snapshot.getMeta());
             result.setJobInfo(snapshot.getJobInfo());
+            LOG.info("get snapshot info, snapshot: {}, meta size: {}, job info size: {}",
+                    label, snapshot.getMeta().length, snapshot.getJobInfo().length);
         }
 
         return result;
@@ -3495,7 +3498,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         // build nodes
         List<TNodeInfo> nodeInfos = Lists.newArrayList();
         SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
-        for (Long id : systemInfoService.getAllBackendIds(false)) {
+        for (Long id : systemInfoService.getAllBackendByCurrentCluster(false)) {
             Backend backend = systemInfoService.getBackend(id);
             nodeInfos.add(new TNodeInfo(backend.getId(), 0, backend.getHost(), backend.getBrpcPort()));
         }
@@ -3704,7 +3707,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         // build nodes
         List<TNodeInfo> nodeInfos = Lists.newArrayList();
         SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
-        for (Long id : systemInfoService.getAllBackendIds(false)) {
+        for (Long id : systemInfoService.getAllBackendByCurrentCluster(false)) {
             Backend backend = systemInfoService.getBackend(id);
             nodeInfos.add(new TNodeInfo(backend.getId(), 0, backend.getHost(), backend.getBrpcPort()));
         }
