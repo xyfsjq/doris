@@ -24,7 +24,6 @@
 #include "runtime/runtime_state.h"
 #include "udf/udf.h"
 #include "util/binary_cast.hpp"
-#include "util/type_traits.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_string.h"
 #include "vec/columns/column_vector.h"
@@ -318,6 +317,7 @@ struct TransformerToStringOneArgument {
                     cast_set<UInt32>(Transform::execute(date_time_value, res_data, offset));
             null_map[i] = !date_time_value.is_valid_date();
         }
+        res_data.resize(res_offsets[res_offsets.size() - 1]);
     }
 
     static void vector(FunctionContext* context,
@@ -337,35 +337,7 @@ struct TransformerToStringOneArgument {
                     cast_set<UInt32>(Transform::execute(date_time_value, res_data, offset));
             DCHECK(date_time_value.is_valid_date());
         }
-    }
-};
-
-template <typename Transform>
-struct TransformerToStringTwoArgument {
-    static void vector_constant(FunctionContext* context,
-                                const PaddedPODArray<typename Transform::FromType>& ts,
-                                const StringRef& format, ColumnString::Chars& res_data,
-                                ColumnString::Offsets& res_offsets,
-                                PaddedPODArray<UInt8>& null_map) {
-        auto len = ts.size();
-        res_offsets.resize(len);
-        res_data.reserve(len * format.size + len);
-        null_map.resize_fill(len, false);
-
-        size_t offset = 0;
-        for (int i = 0; i < len; ++i) {
-            const auto& t = ts[i];
-            size_t new_offset;
-            bool is_null;
-            if constexpr (is_specialization_of_v<Transform, FromUnixTimeImpl>) {
-                std::tie(new_offset, is_null) = Transform::execute(
-                        t, format, res_data, offset, context->state()->timezone_obj());
-            } else {
-                std::tie(new_offset, is_null) = Transform::execute(t, format, res_data, offset);
-            }
-            res_offsets[i] = cast_set<UInt32>(new_offset);
-            null_map[i] = is_null;
-        }
+        res_data.resize(res_offsets[res_offsets.size() - 1]);
     }
 };
 
@@ -383,6 +355,9 @@ struct Transformer {
             auto res = Transform::execute(vec_from[i]);
             using RESULT_TYPE = std::decay_t<decltype(res)>;
             vec_to[i] = cast_set<ToType, RESULT_TYPE, false>(res);
+        }
+
+        for (size_t i = 0; i < size; ++i) {
             null_map[i] = !((typename DateTraits<typename Transform::OpArgType>::T&)(vec_from[i]))
                                    .is_valid_date();
         }

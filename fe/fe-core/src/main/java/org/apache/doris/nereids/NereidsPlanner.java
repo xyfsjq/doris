@@ -22,6 +22,7 @@ import org.apache.doris.analysis.ExplainOptions;
 import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.NereidsException;
@@ -29,6 +30,7 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.profile.SummaryProfile;
 import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.mysql.FieldInfo;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.glue.LogicalPlanAdapter;
@@ -98,17 +100,19 @@ import java.util.function.Function;
  */
 public class NereidsPlanner extends Planner {
     public static final Logger LOG = LogManager.getLogger(NereidsPlanner.class);
+
+    protected Plan parsedPlan;
+    protected Plan analyzedPlan;
+    protected Plan rewrittenPlan;
+    protected Plan optimizedPlan;
+    protected PhysicalPlan physicalPlan;
+
     private CascadesContext cascadesContext;
     private final StatementContext statementContext;
     private final List<ScanNode> scanNodeList = Lists.newArrayList();
     private final List<PhysicalRelation> physicalRelations = Lists.newArrayList();
     private DescriptorTable descTable;
 
-    private Plan parsedPlan;
-    private Plan analyzedPlan;
-    private Plan rewrittenPlan;
-    private Plan optimizedPlan;
-    private PhysicalPlan physicalPlan;
     private FragmentIdMapping<DistributedPlan> distributedPlans;
     // The cost of optimized plan
     private double cost = 0;
@@ -483,8 +487,8 @@ public class NereidsPlanner extends Planner {
                     table.isPresent() ? (table.get().getDatabase() != null
                             ? table.get().getDatabase().getFullName() : "") : "",
                     !output.getQualifier().isEmpty() ? output.getQualifier().get(output.getQualifier().size() - 1)
-                            : (table.isPresent() ? table.get().getName() : ""),
-                    table.isPresent() ? table.get().getName() : "",
+                            : (table.isPresent() ? Util.getTempTableDisplayName(table.get().getName()) : ""),
+                    table.isPresent() ? Util.getTempTableDisplayName(table.get().getName()) : "",
                     output.getName(),
                     column.isPresent() ? column.get().getName() : ""
             );
@@ -529,7 +533,19 @@ public class NereidsPlanner extends Planner {
             return;
         }
 
-        distributedPlans = new DistributePlanner(statementContext, fragments).plan();
+        boolean notNeedBackend = false;
+        // if the query can compute without backend, we can skip check cluster privileges
+        if (Config.isCloudMode()
+                && cascadesContext.getConnectContext().supportHandleByFe()
+                && physicalPlan instanceof ComputeResultSet) {
+            Optional<ResultSet> resultSet = ((ComputeResultSet) physicalPlan).computeResultInFe(
+                    cascadesContext, Optional.empty(), physicalPlan.getOutput());
+            if (resultSet.isPresent()) {
+                notNeedBackend = true;
+            }
+        }
+
+        distributedPlans = new DistributePlanner(statementContext, fragments, notNeedBackend, false).plan();
         if (statementContext.getConnectContext().getExecutor() != null) {
             statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsDistributeTime();
         }
@@ -552,7 +568,7 @@ public class NereidsPlanner extends Planner {
         return cascadesContext.getMemo().getRoot();
     }
 
-    private PhysicalPlan chooseNthPlan(Group rootGroup, PhysicalProperties physicalProperties, int nthPlan) {
+    protected PhysicalPlan chooseNthPlan(Group rootGroup, PhysicalProperties physicalProperties, int nthPlan) {
         if (nthPlan <= 1) {
             cost = rootGroup.getLowestCostPlan(physicalProperties).orElseThrow(
                     () -> new AnalysisException("lowestCostPlans with physicalProperties("
@@ -605,6 +621,9 @@ public class NereidsPlanner extends Planner {
     }
 
     private long getGarbageCollectionTime() {
+        if (!ConnectContext.get().getSessionVariable().enableProfile()) {
+            return 0;
+        }
         List<GarbageCollectorMXBean> gcMxBeans = ManagementFactory.getGarbageCollectorMXBeans();
         long initialGCTime = 0;
         for (GarbageCollectorMXBean gcBean : gcMxBeans) {
@@ -708,6 +727,9 @@ public class NereidsPlanner extends Planner {
                         + "========== OPTIMIZED PLAN "
                         + getTimeMetricString(SummaryProfile::getPrettyNereidsOptimizeTime) + " ==========\n"
                         + optimizedPlan.treeString() + "\n\n";
+                if (cascadesContext != null && cascadesContext.getMemo() != null) {
+                    plan += "========== MEMO " + cascadesContext.getMemo().toString() + "\n\n";
+                }
 
                 if (distributedPlans != null && !distributedPlans.isEmpty()) {
                     plan += "========== DISTRIBUTED PLAN "
@@ -881,7 +903,7 @@ public class NereidsPlanner extends Planner {
         return explainOptions != null && explainOptions.showPlanProcess();
     }
 
-    private void keepOrShowPlanProcess(boolean showPlanProcess, Runnable task) {
+    protected void keepOrShowPlanProcess(boolean showPlanProcess, Runnable task) {
         if (showPlanProcess) {
             cascadesContext.withPlanProcess(showPlanProcess, task);
         } else {

@@ -108,6 +108,22 @@ suite("test_analyze_mv") {
         assertTrue(found)
     }
 
+    def stats_dropped = { table ->
+        def result1 = sql """show column cached stats $table"""
+        def result2 = sql """show column stats $table"""
+        boolean dropped = false
+        for (int i = 0; i < 120; i++) {
+            if (0 == result1.size() && 0 == result2.size()) {
+                dropped = true;
+                break;
+            }
+            Thread.sleep(1000)
+            result1 = sql """show column cached stats $table"""
+            result2 = sql """show column stats $table"""
+        }
+        assertTrue(dropped)
+    }
+
     sql """drop database if exists test_analyze_mv"""
     sql """create database test_analyze_mv"""
     sql """use test_analyze_mv"""
@@ -674,6 +690,7 @@ suite("test_analyze_mv") {
     // * Test row count report and report for nereids
     sql """truncate table mvTestDup"""
     result_row = sql """show index stats mvTestDup mv3"""
+    stats_dropped("mvTestDup")
     assertEquals(1, result_row.size())
     assertEquals("mvTestDup", result_row[0][0])
     assertEquals("mv3", result_row[0][1])
@@ -771,6 +788,25 @@ suite("test_analyze_mv") {
     assertEquals("0.0", result[0][6])
     assertEquals("1", result[0][7])
     assertEquals("5", result[0][8])
+
+    sql """drop table if exists testMvDirectSelect"""
+    sql """
+        CREATE TABLE testMvDirectSelect (
+            key1      int NOT NULL,
+            key2      int NOT NULL,
+            value     int SUM
+        )ENGINE=OLAP
+        AGGREGATE KEY(key1, key2)
+        COMMENT "OLAP"
+        DISTRIBUTED BY RANDOM BUCKETS 2
+        PROPERTIES (
+            "replication_num" = "1"
+        );
+    """
+
+    createMV("CREATE MATERIALIZED VIEW aggMv as select key1, SUM(value) from testMvDirectSelect group by key1;")
+    sql """insert into testMvDirectSelect values (1, 1, 1), (1, 2, 2), (1, 3, 3), (2, 1, 4), (2, 2, 5), (3, 2, 6)"""
+    qt_test_agg """select * from testMvDirectSelect index aggMv order by mv_key1"""
 
     sql """drop database if exists test_analyze_mv"""
 }

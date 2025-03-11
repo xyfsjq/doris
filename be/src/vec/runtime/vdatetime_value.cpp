@@ -1635,7 +1635,7 @@ bool VecDateTimeValue::from_date_format_str(const char* format, int format_len, 
 template <TimeUnit unit, bool need_check>
 bool VecDateTimeValue::date_add_interval(const TimeInterval& interval) {
     if constexpr (need_check) {
-        if (!is_valid_date()) {
+        if (!is_valid_date()) [[unlikely]] {
             return false;
         }
     }
@@ -1825,7 +1825,7 @@ void VecDateTimeValue::unchecked_set_time(uint32_t year, uint32_t month, uint32_
 
 template <TimeUnit unit>
 bool VecDateTimeValue::datetime_trunc() {
-    if (!is_valid_date()) {
+    if (!is_valid_date()) [[unlikely]] {
         return false;
     }
     switch (unit) {
@@ -1934,28 +1934,6 @@ std::size_t operator-(const VecDateTimeValue& v1, const DateV2Value<T>& v2) {
 
 std::size_t hash_value(VecDateTimeValue const& value) {
     return HashUtil::hash(&value, sizeof(VecDateTimeValue), 0);
-}
-
-template <typename T>
-bool DateV2Value<T>::is_invalid(uint32_t year, uint32_t month, uint32_t day, uint8_t hour,
-                                uint8_t minute, uint8_t second, uint32_t microsecond,
-                                bool only_time_part) {
-    if (hour >= 24 || minute >= 60 || second >= 60 || microsecond > 999999) {
-        return true;
-    }
-    if (only_time_part) {
-        return false;
-    }
-    if (year > MAX_YEAR) {
-        return true;
-    }
-    if (month == 2 && day == 29 && doris::is_leap(year)) {
-        return false;
-    }
-    if (month == 0 || month > 12 || day > S_DAYS_IN_MONTH[month] || day == 0) {
-        return true;
-    }
-    return false;
 }
 
 template <typename T>
@@ -2726,7 +2704,7 @@ int32_t DateV2Value<T>::to_buffer(char* buffer, int scale) const {
     // if this is an invalid date, write nothing(instead of 0000-00-00) to output string, or else
     // it will cause problem for null DataTypeDateV2 value in cast function,
     // e.g. cast(cast(null_date as char) as date)
-    if (!is_valid_date()) {
+    if (!is_valid_date()) [[unlikely]] {
         return 0;
     }
     char* start = buffer;
@@ -2846,40 +2824,6 @@ int date_day_offset_dict::daynr(int year, int month, int day) const {
 }
 
 template <typename T>
-uint32_t DateV2Value<T>::set_date_uint32(uint32_t int_val) {
-    union DateV2UInt32Union {
-        DateV2Value<T> dt;
-        uint32_t ui32;
-        ~DateV2UInt32Union() {}
-    };
-    DateV2UInt32Union conv = {.ui32 = int_val};
-    if (is_invalid(conv.dt.year(), conv.dt.month(), conv.dt.day(), 0, 0, 0, 0)) {
-        return 0;
-    }
-    this->unchecked_set_time(conv.dt.year(), conv.dt.month(), conv.dt.day(), 0, 0, 0, 0);
-
-    return int_val;
-}
-
-template <typename T>
-uint64_t DateV2Value<T>::set_datetime_uint64(uint64_t int_val) {
-    union DateTimeV2UInt64Union {
-        DateV2Value<T> dt;
-        uint64_t ui64;
-        ~DateTimeV2UInt64Union() {}
-    };
-    DateTimeV2UInt64Union conv = {.ui64 = int_val};
-    if (is_invalid(conv.dt.year(), conv.dt.month(), conv.dt.day(), conv.dt.hour(), conv.dt.minute(),
-                   conv.dt.second(), conv.dt.microsecond())) {
-        return 0;
-    }
-    this->unchecked_set_time(conv.dt.year(), conv.dt.month(), conv.dt.day(), conv.dt.hour(),
-                             conv.dt.minute(), conv.dt.second(), conv.dt.microsecond());
-
-    return int_val;
-}
-
-template <typename T>
 uint8_t DateV2Value<T>::week(uint8_t mode) const {
     uint16_t year = 0;
     return calc_week(this->daynr(), this->year(), this->month(), this->day(), mode, &year);
@@ -2960,7 +2904,7 @@ bool DateV2Value<T>::get_date_from_daynr(uint64_t daynr) {
 template <typename T>
 template <TimeUnit unit, typename TO>
 bool DateV2Value<T>::date_add_interval(const TimeInterval& interval, DateV2Value<TO>& to_value) {
-    if (!is_valid_date()) {
+    if (!is_valid_date()) [[unlikely]] {
         return false;
     }
 
@@ -3033,7 +2977,7 @@ template <typename T>
 template <TimeUnit unit, bool need_check>
 bool DateV2Value<T>::date_add_interval(const TimeInterval& interval) {
     if constexpr (need_check) {
-        if (!is_valid_date()) {
+        if (!is_valid_date()) [[unlikely]] {
             return false;
         }
     }
@@ -3144,7 +3088,7 @@ template <typename T>
 template <TimeUnit unit>
 bool DateV2Value<T>::datetime_trunc() {
     if constexpr (is_datetime) {
-        if (!is_valid_date()) {
+        if (!is_valid_date()) [[unlikely]] {
             return false;
         }
         switch (unit) {
@@ -3217,7 +3161,7 @@ bool DateV2Value<T>::datetime_trunc() {
             return false;
         }
     } else { // is_datev2
-        if (!is_valid_date()) {
+        if (!is_valid_date()) [[unlikely]] {
             return false;
         }
         switch (unit) {
@@ -3705,26 +3649,6 @@ bool DateV2Value<T>::to_format_string_conservative(const char* format, size_t le
     }
     *to++ = '\0';
     return true;
-}
-
-template <typename T>
-bool DateV2Value<T>::from_date(uint32_t value) {
-    DCHECK(!is_datetime);
-    if (value < MIN_DATE_V2 || value > MAX_DATE_V2) {
-        return false;
-    }
-
-    return set_date_uint32(value);
-}
-
-template <typename T>
-bool DateV2Value<T>::from_datetime(uint64_t value) {
-    DCHECK(is_datetime);
-    if (value < MIN_DATETIME_V2 || value > MAX_DATETIME_V2) {
-        return false;
-    }
-
-    return set_datetime_uint64(value);
 }
 
 template <typename T>

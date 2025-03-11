@@ -100,6 +100,7 @@ public:
             const std::unordered_map<uint32_t, uint32_t>& col_ordinal_to_unique_id);
 
     TabletMeta();
+    ~TabletMeta() override;
     TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id, int64_t replica_id,
                int32_t schema_hash, int32_t shard_id, const TTabletSchema& tablet_schema,
                uint32_t next_unique_id,
@@ -128,6 +129,7 @@ public:
     // Function create_from_file is used to be compatible with previous tablet_meta.
     // Previous tablet_meta is a physical file in tablet dir, which is not stored in rocksdb.
     Status create_from_file(const std::string& file_path);
+    static Status load_from_file(const std::string& file_path, TabletMetaPB* tablet_meta_pb);
     Status save(const std::string& file_path);
     Status save_as_json(const string& file_path);
     static Status save(const std::string& file_path, const TabletMetaPB& tablet_meta_pb);
@@ -321,6 +323,7 @@ private:
     // the reference of _schema may use in tablet, so here need keep
     // the lifetime of tablemeta and _schema is same with tablet
     TabletSchemaSPtr _schema;
+    Cache::Handle* _handle = nullptr;
 
     std::vector<RowsetMetaSharedPtr> _rs_metas;
     // This variable _stale_rs_metas is used to record these rowsets‘ meta which are be compacted.
@@ -500,6 +503,14 @@ public:
                 DeleteBitmap* subset_delete_map) const;
 
     /**
+     * Gets count of delete_bitmap with given range [start, end)
+     *
+     * @parma start start
+     * @parma end end
+     */
+    size_t get_count_with_range(const BitmapKey& start, const BitmapKey& end) const;
+
+    /**
      * Merges the given segment delete bitmap into *this
      *
      * @param bmk
@@ -543,6 +554,8 @@ public:
     void remove_stale_delete_bitmap_from_queue(const std::vector<std::string>& vector);
 
     uint64_t get_delete_bitmap_count();
+
+    bool has_calculated_for_multi_segments(const RowsetId& rowset_id) const;
 
     class AggCachePolicy : public LRUCachePolicy {
     public:

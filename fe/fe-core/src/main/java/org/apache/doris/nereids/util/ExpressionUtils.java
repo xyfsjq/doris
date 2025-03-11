@@ -56,6 +56,7 @@ import org.apache.doris.nereids.trees.expressions.functions.agg.Max;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Min;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Sum;
 import org.apache.doris.nereids.trees.expressions.literal.BooleanLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.ComparableLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
@@ -276,6 +277,14 @@ public class ExpressionUtils {
         }
     }
 
+    public static Expression toInPredicateOrEqualTo(Expression reference, Collection<? extends Expression> values) {
+        if (values.size() < 2) {
+            return or(values.stream().map(value -> new EqualTo(reference, value)).collect(Collectors.toList()));
+        } else {
+            return new InPredicate(reference, ImmutableList.copyOf(values));
+        }
+    }
+
     /**
      * Use AND/OR to combine expressions together.
      */
@@ -420,7 +429,7 @@ public class ExpressionUtils {
     /**
      * Generate replaceMap Slot -> Expression from NamedExpression[Expression as name]
      */
-    public static Map<Slot, Expression> generateReplaceMap(List<NamedExpression> namedExpressions) {
+    public static Map<Slot, Expression> generateReplaceMap(List<? extends NamedExpression> namedExpressions) {
         Map<Slot, Expression> replaceMap = Maps.newLinkedHashMapWithExpectedSize(namedExpressions.size());
         for (NamedExpression namedExpression : namedExpressions) {
             if (namedExpression instanceof Alias) {
@@ -463,6 +472,31 @@ public class ExpressionUtils {
         });
     }
 
+    /**
+     * Replace expression node in the expression tree by `replaceMap` in top-down manner.
+     * For example.
+     * <pre>
+     * input expression: a > 1
+     * replaceMap: d -> b + c, transferMap: a -> d
+     * firstly try to get mapping expression from replaceMap by a, if can not then
+     * get mapping d from transferMap by a
+     * and get mapping b + c from replaceMap by d
+     * output:
+     * b + c > 1
+     * </pre>
+     */
+    public static Expression replace(Expression expr, Map<? extends Expression, ? extends Expression> replaceMap,
+            Map<? extends Expression, ? extends Expression> transferMap) {
+        return expr.rewriteDownShortCircuit(e -> {
+            Expression replacedExpr = replaceMap.get(e);
+            if (replacedExpr != null) {
+                return replacedExpr;
+            }
+            replacedExpr = replaceMap.get(transferMap.get(e));
+            return replacedExpr == null ? e : replacedExpr;
+        });
+    }
+
     public static List<Expression> replace(List<Expression> exprs,
             Map<? extends Expression, ? extends Expression> replaceMap) {
         ImmutableList.Builder<Expression> result = ImmutableList.builderWithExpectedSize(exprs.size());
@@ -484,7 +518,7 @@ public class ExpressionUtils {
     /**
      * Replace expression node in the expression tree by `replaceMap` in top-down manner.
      */
-    public static List<NamedExpression> replaceNamedExpressions(List<NamedExpression> namedExpressions,
+    public static List<NamedExpression> replaceNamedExpressions(List<? extends NamedExpression> namedExpressions,
             Map<? extends Expression, ? extends Expression> replaceMap) {
         Builder<NamedExpression> replaceExprs = ImmutableList.builderWithExpectedSize(namedExpressions.size());
         for (NamedExpression namedExpression : namedExpressions) {
@@ -552,9 +586,9 @@ public class ExpressionUtils {
     /**
      * return true if all children are literal but not null literal.
      */
-    public static boolean isAllNonNullLiteral(List<Expression> children) {
+    public static boolean isAllNonNullComparableLiteral(List<Expression> children) {
         for (Expression child : children) {
-            if ((!(child instanceof Literal)) || (child instanceof NullLiteral)) {
+            if ((!(child instanceof ComparableLiteral)) || (child instanceof NullLiteral)) {
                 return false;
             }
         }
@@ -873,8 +907,7 @@ public class ExpressionUtils {
             if (!predicate.getCompareExpr().isSlot()) {
                 return Optional.empty();
             }
-            return Optional.ofNullable(predicate.getOptions().stream()
-                    .allMatch(Expression::isLiteral) ? expression : null);
+            return Optional.ofNullable(predicate.optionsAreLiterals() ? expression : null);
         } else if (expression instanceof ComparisonPredicate) {
             ComparisonPredicate predicate = ((ComparisonPredicate) expression);
             if (predicate.left() instanceof Literal) {

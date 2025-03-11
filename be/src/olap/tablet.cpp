@@ -1091,6 +1091,11 @@ uint32_t Tablet::_calc_cumulative_compaction_score(
     if (cumulative_compaction_policy == nullptr) [[unlikely]] {
         return 0;
     }
+    DBUG_EXECUTE_IF("Tablet._calc_cumulative_compaction_score.return", {
+        LOG_WARNING("Tablet._calc_cumulative_compaction_score.return")
+                .tag("tablet id", tablet_id());
+        return 0;
+    });
 #ifndef BE_TEST
     if (_cumulative_compaction_policy == nullptr ||
         _cumulative_compaction_policy->name() != cumulative_compaction_policy->name()) {
@@ -2006,7 +2011,10 @@ Status Tablet::create_rowset(const RowsetMetaSharedPtr& rowset_meta, RowsetShare
 Status Tablet::cooldown(RowsetSharedPtr rowset) {
     std::unique_lock schema_change_lock(_schema_change_lock, std::try_to_lock);
     if (!schema_change_lock.owns_lock()) {
-        return Status::Error<TRY_LOCK_FAILED>("try schema_change_lock failed");
+        return Status::Error<TRY_LOCK_FAILED>(
+                "try schema_change_lock failed, schema change running or inverted index built on "
+                "this tablet={}",
+                tablet_id());
     }
     // Check executing serially with compaction task.
     std::unique_lock base_compaction_lock(_base_compaction_lock, std::try_to_lock);
@@ -2766,7 +2774,7 @@ void Tablet::check_table_size_correctness() {
     const std::vector<RowsetMetaSharedPtr>& all_rs_metas = _tablet_meta->all_rs_metas();
     for (const auto& rs_meta : all_rs_metas) {
         int64_t total_segment_size = get_segment_file_size(rs_meta);
-        int64_t total_inverted_index_size = get_inverted_index_file_szie(rs_meta);
+        int64_t total_inverted_index_size = get_inverted_index_file_size(rs_meta);
         if (rs_meta->data_disk_size() != total_segment_size ||
             rs_meta->index_disk_size() != total_inverted_index_size ||
             rs_meta->data_disk_size() + rs_meta->index_disk_size() != rs_meta->total_disk_size()) {
@@ -2817,7 +2825,7 @@ int64_t Tablet::get_segment_file_size(const RowsetMetaSharedPtr& rs_meta) {
     return total_segment_size;
 }
 
-int64_t Tablet::get_inverted_index_file_szie(const RowsetMetaSharedPtr& rs_meta) {
+int64_t Tablet::get_inverted_index_file_size(const RowsetMetaSharedPtr& rs_meta) {
     const auto& fs = rs_meta->fs();
     if (!fs) {
         LOG(WARNING) << "get fs failed, resource_id={}" << rs_meta->resource_id();

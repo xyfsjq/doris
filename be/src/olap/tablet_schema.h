@@ -41,6 +41,7 @@
 #include "runtime/define_primitive_type.h"
 #include "runtime/descriptors.h"
 #include "runtime/memory/lru_cache_policy.h"
+#include "util/debug_points.h"
 #include "util/string_util.h"
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/common/string_ref.h"
@@ -252,8 +253,6 @@ private:
 bool operator==(const TabletColumn& a, const TabletColumn& b);
 bool operator!=(const TabletColumn& a, const TabletColumn& b);
 
-class TabletSchema;
-
 class TabletIndex : public MetadataAdder<TabletIndex> {
 public:
     TabletIndex() = default;
@@ -296,6 +295,8 @@ private:
     std::map<string, string> _properties;
 };
 
+using TabletIndexPtr = std::shared_ptr<TabletIndex>;
+
 class TabletSchema : public MetadataAdder<TabletSchema> {
 public:
     enum ColumnType { NORMAL = 0, DROPPED = 1, VARIANT = 2 };
@@ -330,6 +331,8 @@ public:
     // Must make sure the row column is always the last column
     void add_row_column();
     void copy_from(const TabletSchema& tablet_schema);
+    // lightweight copy, take care of lifecycle of TabletColumn
+    void shawdow_copy_without_columns(const TabletSchema& tablet_schema);
     void update_index_info_from(const TabletSchema& tablet_schema);
     std::string to_key() const;
     // get_metadata_size is only the memory of the TabletSchema itself, not include child objects.
@@ -342,6 +345,7 @@ public:
     Result<const TabletColumn*> column(const std::string& field_name) const;
     Status have_column(const std::string& field_name) const;
     bool exist_column(const std::string& field_name) const;
+    bool has_column_unique_id(int32_t col_unique_id) const;
     const TabletColumn& column_by_uid(int32_t col_unique_id) const;
     TabletColumn& mutable_column_by_uid(int32_t col_unique_id);
     TabletColumn& mutable_column(size_t ordinal);
@@ -398,16 +402,25 @@ public:
     const std::vector<const TabletIndex*> inverted_indexes() const {
         std::vector<const TabletIndex*> inverted_indexes;
         for (const auto& index : _indexes) {
-            if (index.index_type() == IndexType::INVERTED) {
-                inverted_indexes.emplace_back(&index);
+            if (index->index_type() == IndexType::INVERTED) {
+                inverted_indexes.emplace_back(index.get());
             }
         }
         return inverted_indexes;
     }
     bool has_inverted_index() const {
         for (const auto& index : _indexes) {
-            if (index.index_type() == IndexType::INVERTED) {
-                return true;
+            DBUG_EXECUTE_IF("tablet_schema::has_inverted_index", {
+                if (index->col_unique_ids().empty()) {
+                    throw Exception(Status::InternalError("col unique ids cannot be empty"));
+                }
+            });
+
+            if (index->index_type() == IndexType::INVERTED) {
+                //if index_id == -1, ignore it.
+                if (!index->col_unique_ids().empty() && index->col_unique_ids()[0] >= 0) {
+                    return true;
+                }
             }
         }
         return false;
@@ -531,8 +544,10 @@ public:
 private:
     friend bool operator==(const TabletSchema& a, const TabletSchema& b);
     friend bool operator!=(const TabletSchema& a, const TabletSchema& b);
+    TabletSchema(const TabletSchema&) = default;
 
     void clear_column_cache_handlers();
+    void clear_index_cache_handlers();
 
     KeysType _keys_type = DUP_KEYS;
     SortType _sort_type = SortType::LEXICAL;
@@ -540,7 +555,8 @@ private:
     std::vector<TabletColumnPtr> _cols;
     std::vector<Cache::Handle*> _column_cache_handlers;
 
-    std::vector<TabletIndex> _indexes;
+    std::vector<TabletIndexPtr> _indexes;
+    std::vector<Cache::Handle*> _index_cache_handlers;
     std::unordered_map<StringRef, int32_t, StringRefHash> _field_name_to_index;
     std::unordered_map<int32_t, int32_t> _field_id_to_index;
     std::unordered_map<vectorized::PathInDataRef, int32_t, vectorized::PathInDataRef::Hash>

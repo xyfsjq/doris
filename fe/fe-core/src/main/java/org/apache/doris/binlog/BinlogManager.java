@@ -112,6 +112,10 @@ public class BinlogManager {
             return;
         }
 
+        LOG.debug("add binlog, db {}, table {}, commitSeq {}, timestamp {}, type {}, data {}",
+                binlog.getDbId(), binlog.getTableIds(), binlog.getCommitSeq(), binlog.getTimestamp(), binlog.getType(),
+                binlog.getData());
+
         DBBinlog dbBinlog;
         lock.writeLock().lock();
         try {
@@ -130,7 +134,7 @@ public class BinlogManager {
     }
 
     private void addBinlog(long dbId, List<Long> tableIds, long commitSeq, long timestamp, TBinlogType type,
-                           String data, boolean removeEnableCache, Object raw) {
+            String data, boolean removeEnableCache, Object raw) {
         if (!Config.enable_feature_binlog) {
             return;
         }
@@ -154,7 +158,11 @@ public class BinlogManager {
         if (tableIds != null) {
             for (long tableId : tableIds) {
                 boolean tableBinlogEnable = binlogConfigCache.isEnableTable(dbId, tableId);
-                anyEnable = anyEnable || tableBinlogEnable;
+                if (tableIds.size() > 1) {
+                    anyEnable = anyEnable || tableBinlogEnable;
+                } else {
+                    anyEnable = tableBinlogEnable;
+                }
                 if (anyEnable) {
                     break;
                 }
@@ -184,7 +192,7 @@ public class BinlogManager {
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(addPartitionRecord.getTableId());
         long commitSeq = addPartitionRecord.getCommitSeq();
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.ADD_PARTITION;
         String data = addPartitionRecord.toJson();
 
@@ -196,7 +204,7 @@ public class BinlogManager {
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(createTableRecord.getTableId());
         long commitSeq = createTableRecord.getCommitSeq();
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.CREATE_TABLE;
         String data = createTableRecord.toJson();
 
@@ -207,7 +215,7 @@ public class BinlogManager {
         long dbId = dropPartitionInfo.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(dropPartitionInfo.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.DROP_PARTITION;
         String data = dropPartitionInfo.toJson();
 
@@ -219,7 +227,7 @@ public class BinlogManager {
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(record.getTableId());
         long commitSeq = record.getCommitSeq();
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.DROP_TABLE;
         String data = record.toJson();
 
@@ -230,7 +238,7 @@ public class BinlogManager {
         long dbId = alterJob.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(alterJob.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.ALTER_JOB;
         AlterJobRecord alterJobRecord = new AlterJobRecord(alterJob);
         String data = alterJobRecord.toJson();
@@ -242,7 +250,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.MODIFY_TABLE_ADD_OR_DROP_COLUMNS;
         String data = info.toJson();
 
@@ -253,7 +261,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
 
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.ALTER_DATABASE_PROPERTY;
         String data = info.toJson();
 
@@ -264,7 +272,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.MODIFY_TABLE_PROPERTY;
         String data = info.toJson();
 
@@ -285,7 +293,7 @@ public class BinlogManager {
 
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(tableId);
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.BARRIER;
         String data = barrierLog.toJson();
 
@@ -297,7 +305,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.MODIFY_PARTITIONS;
         String data = info.toJson();
 
@@ -309,7 +317,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTblId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.REPLACE_PARTITIONS;
         String data = info.toJson();
 
@@ -321,7 +329,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTblId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.TRUNCATE_TABLE;
         TruncateTableRecord record = new TruncateTableRecord(info);
         String data = record.toJson();
@@ -333,7 +341,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.RENAME_TABLE;
         String data = info.toJson();
         addBinlog(dbId, tableIds, commitSeq, timestamp, type, data, false, info);
@@ -343,7 +351,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.RENAME_ROLLUP;
         String data = info.toJson();
         addBinlog(dbId, tableIds, commitSeq, timestamp, type, data, false, info);
@@ -353,7 +361,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.RENAME_PARTITION;
         String data = info.toJson();
         addBinlog(dbId, tableIds, commitSeq, timestamp, type, data, false, info);
@@ -363,7 +371,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTblId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.MODIFY_COMMENT;
         String data = info.toJson();
 
@@ -374,7 +382,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.RENAME_COLUMN;
         String data = info.toJson();
 
@@ -386,7 +394,7 @@ public class BinlogManager {
         long dbId = alterViewInfo.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(alterViewInfo.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.MODIFY_VIEW_DEF;
         String data = alterViewInfo.toJson();
 
@@ -402,7 +410,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getOrigTblId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.REPLACE_TABLE;
         String data = info.toJson();
 
@@ -413,7 +421,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.MODIFY_TABLE_ADD_OR_DROP_INVERTED_INDICES;
         String data = info.toJson();
 
@@ -424,7 +432,7 @@ public class BinlogManager {
         long dbId = indexChangeJob.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(indexChangeJob.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.INDEX_CHANGE_JOB;
         String data = indexChangeJob.toJson();
 
@@ -440,13 +448,12 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.DROP_ROLLUP;
         String data = info.toJson();
 
         addBinlog(dbId, tableIds, commitSeq, timestamp, type, data, false, info);
     }
-
 
     private boolean supportedRecoverInfo(RecoverInfo info) {
         //table name and partitionName added together.
@@ -467,7 +474,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
-        long timestamp = -1;
+        long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.RECOVER_INFO;
         String data = info.toJson();
         addBinlog(dbId, tableIds, commitSeq, timestamp, type, data, false, info);
@@ -475,6 +482,15 @@ public class BinlogManager {
 
     // get binlog by dbId, return first binlog.version > version
     public Pair<TStatus, TBinlog> getBinlog(long dbId, long tableId, long prevCommitSeq) {
+        Pair<TStatus, List<TBinlog>> result = getBinlog(dbId, tableId, prevCommitSeq, 1);
+        if (result.second != null && result.second.size() > 0) {
+            return Pair.of(result.first, result.second.get(0));
+        }
+        return Pair.of(result.first, null);
+    }
+
+    // get binlogs by dbId, return the first N binlogs, which first binlog.version > prevCommitSeq
+    public Pair<TStatus, List<TBinlog>> getBinlog(long dbId, long tableId, long prevCommitSeq, long numAcquired) {
         TStatus status = new TStatus(TStatusCode.OK);
         lock.readLock().lock();
         try {
@@ -485,14 +501,14 @@ public class BinlogManager {
                 return Pair.of(status, null);
             }
 
-            return dbBinlog.getBinlog(tableId, prevCommitSeq);
+            return dbBinlog.getBinlog(tableId, prevCommitSeq, numAcquired);
         } finally {
             lock.readLock().unlock();
         }
     }
 
     // get binlog by dbId, return first binlog.version > version
-    public Pair<TStatus, Long> getBinlogLag(long dbId, long tableId, long prevCommitSeq) {
+    public Pair<TStatus, BinlogLagInfo> getBinlogLag(long dbId, long tableId, long prevCommitSeq) {
         TStatus status = new TStatus(TStatusCode.OK);
         lock.readLock().lock();
         try {
@@ -502,15 +518,34 @@ public class BinlogManager {
                 LOG.warn("dbBinlog not found. dbId: {}", dbId);
                 return Pair.of(status, null);
             }
-
             return dbBinlog.getBinlogLag(tableId, prevCommitSeq);
         } finally {
             lock.readLock().unlock();
         }
     }
 
+    public Pair<TStatus, Long> lockBinlog(long dbId, long tableId,
+            String jobUniqueId, long lockCommitSeq) {
+        LOG.debug("lock binlog. dbId: {}, tableId: {}, jobUniqueId: {}, lockCommitSeq: {}",
+                dbId, tableId, jobUniqueId, lockCommitSeq);
+
+        DBBinlog dbBinlog = null;
+        lock.readLock().lock();
+        try {
+            dbBinlog = dbBinlogMap.get(dbId);
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        if (dbBinlog == null) {
+            LOG.warn("db binlog not found. dbId: {}", dbId);
+            return Pair.of(new TStatus(TStatusCode.BINLOG_NOT_FOUND_DB), -1L);
+        }
+        return dbBinlog.lockBinlog(tableId, jobUniqueId, lockCommitSeq);
+    }
+
     // get the dropped partitions of the db.
-    public List<Long> getDroppedPartitions(long dbId) {
+    public List<Pair<Long, Long>> getDroppedPartitions(long dbId) {
         lock.readLock().lock();
         try {
             DBBinlog dbBinlog = dbBinlogMap.get(dbId);
@@ -524,7 +559,7 @@ public class BinlogManager {
     }
 
     // get the dropped tables of the db.
-    public List<Long> getDroppedTables(long dbId) {
+    public List<Pair<Long, Long>> getDroppedTables(long dbId) {
         lock.readLock().lock();
         try {
             DBBinlog dbBinlog = dbBinlogMap.get(dbId);
@@ -538,7 +573,7 @@ public class BinlogManager {
     }
 
     // get the dropped indexes of the db.
-    public List<Long> getDroppedIndexes(long dbId) {
+    public List<Pair<Long, Long>> getDroppedIndexes(long dbId) {
         lock.readLock().lock();
         try {
             DBBinlog dbBinlog = dbBinlogMap.get(dbId);
@@ -574,6 +609,7 @@ public class BinlogManager {
                 tombstones.add(dbTombstones);
             }
         }
+
         return tombstones;
     }
 
@@ -623,7 +659,6 @@ public class BinlogManager {
         }
     }
 
-
     private static void writeTBinlogToStream(DataOutputStream dos, TBinlog binlog) throws TException, IOException {
         TMemoryBuffer buffer = new TMemoryBuffer(BUFFER_SIZE);
         TBinaryProtocol protocol = new TBinaryProtocol(buffer);
@@ -632,7 +667,6 @@ public class BinlogManager {
         dos.writeInt(data.length);
         dos.write(data);
     }
-
 
     // not thread safety, do this without lock
     public long write(DataOutputStream dos, long checksum) throws IOException {

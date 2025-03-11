@@ -86,8 +86,8 @@ public:
 
 struct RankData {
     int64_t rank = 0;
-    int64_t count = 0;
-    int64_t peer_group_start = 0;
+    int64_t count = 1;
+    int64_t peer_group_start = -1;
 };
 
 class WindowFunctionRank final : public IAggregateFunctionDataHelper<RankData, WindowFunctionRank> {
@@ -131,7 +131,7 @@ public:
 
 struct DenseRankData {
     int64_t rank = 0;
-    int64_t peer_group_start = 0;
+    int64_t peer_group_start = -1;
 };
 
 class WindowFunctionDenseRank final
@@ -173,8 +173,8 @@ public:
 
 struct PercentRankData {
     int64_t rank = 0;
-    int64_t count = 0;
-    int64_t peer_group_start = 0;
+    int64_t count = 1;
+    int64_t peer_group_start = -1;
     int64_t partition_size = 0;
 };
 
@@ -230,7 +230,7 @@ public:
 struct CumeDistData {
     int64_t numerator = 0;
     int64_t denominator = 0;
-    int64_t peer_group_start = 0;
+    int64_t peer_group_start = -1;
 };
 
 class WindowFunctionCumeDist final
@@ -402,7 +402,7 @@ public:
                 if (nullable_column->is_null_at(0)) {
                     _default_value.reset();
                 } else {
-                    _default_value.set_value(nullable_column->get_nested_column_ptr(), 0);
+                    _default_value.set_value(nullable_column->get_nested_column_ptr().get(), 0);
                 }
             } else {
                 _default_value.set_value(column, 0);

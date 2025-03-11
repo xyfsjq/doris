@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include <cstdint>
+#include <memory>
 #include <set>
 #include <utility>
 
@@ -43,7 +44,9 @@
 #include "olap/olap_define.h"
 #include "olap/rowset/rowset.h"
 #include "olap/rowset/rowset_meta_manager.h"
+#include "olap/tablet_fwd.h"
 #include "olap/tablet_meta_manager.h"
+#include "olap/tablet_schema_cache.h"
 #include "olap/utils.h"
 #include "util/debug_points.h"
 #include "util/mem_info.h"
@@ -99,6 +102,12 @@ TabletMetaSharedPtr TabletMeta::create(
             request.time_series_compaction_time_threshold_seconds,
             request.time_series_compaction_empty_rowsets_threshold,
             request.time_series_compaction_level_threshold, inverted_index_file_storage_format);
+}
+
+TabletMeta::~TabletMeta() {
+    if (_handle) {
+        TabletSchemaCache::instance()->release(_handle);
+    }
 }
 
 TabletMeta::TabletMeta()
@@ -447,18 +456,22 @@ void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tco
 }
 
 Status TabletMeta::create_from_file(const string& file_path) {
+    TabletMetaPB tablet_meta_pb;
+    RETURN_IF_ERROR(load_from_file(file_path, &tablet_meta_pb));
+    init_from_pb(tablet_meta_pb);
+    return Status::OK();
+}
+
+Status TabletMeta::load_from_file(const string& file_path, TabletMetaPB* tablet_meta_pb) {
     FileHeader<TabletMetaPB> file_header(file_path);
     // In file_header.deserialize(), it validates file length, signature, checksum of protobuf.
     RETURN_IF_ERROR(file_header.deserialize());
-    TabletMetaPB tablet_meta_pb;
     try {
-        tablet_meta_pb.CopyFrom(file_header.message());
+        tablet_meta_pb->CopyFrom(file_header.message());
     } catch (...) {
         return Status::Error<PARSE_PROTOBUF_ERROR>("fail to copy protocol buffer object. file={}",
                                                    file_path);
     }
-
-    init_from_pb(tablet_meta_pb);
     return Status::OK();
 }
 
@@ -625,7 +638,14 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
     }
 
     // init _schema
-    _schema->init_from_pb(tablet_meta_pb.schema());
+    TabletSchemaSPtr schema = std::make_shared<TabletSchema>();
+    schema->init_from_pb(tablet_meta_pb.schema());
+    if (_handle) {
+        TabletSchemaCache::instance()->release(_handle);
+    }
+    auto pair = TabletSchemaCache::instance()->insert(schema->to_key());
+    _handle = pair.first;
+    _schema = pair.second;
 
     if (tablet_meta_pb.has_enable_unique_key_merge_on_write()) {
         _enable_unique_key_merge_on_write = tablet_meta_pb.enable_unique_key_merge_on_write();
@@ -1170,6 +1190,20 @@ void DeleteBitmap::subset(const BitmapKey& start, const BitmapKey& end,
     }
 }
 
+size_t DeleteBitmap::get_count_with_range(const BitmapKey& start, const BitmapKey& end) const {
+    DCHECK(start < end);
+    size_t count = 0;
+    std::shared_lock l(lock);
+    for (auto it = delete_bitmap.lower_bound(start); it != delete_bitmap.end(); ++it) {
+        auto& [k, bm] = *it;
+        if (k >= end) {
+            break;
+        }
+        count++;
+    }
+    return count;
+}
+
 void DeleteBitmap::merge(const BitmapKey& bmk, const roaring::Roaring& segment_delete_bitmap) {
     std::lock_guard l(lock);
     auto [iter, succ] = delete_bitmap.emplace(bmk, segment_delete_bitmap);
@@ -1243,6 +1277,10 @@ uint64_t DeleteBitmap::get_delete_bitmap_count() {
         }
     }
     return count;
+}
+
+bool DeleteBitmap::has_calculated_for_multi_segments(const RowsetId& rowset_id) const {
+    return contains({rowset_id, INVALID_SEGMENT_ID, TEMP_VERSION_COMMON}, ROWSET_SENTINEL_MARK);
 }
 
 // We cannot just copy the underlying memory to construct a string
