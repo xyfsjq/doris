@@ -43,7 +43,7 @@ class VBloomPredicate final : public VExpr {
 public:
     VBloomPredicate(const TExprNode& node);
     ~VBloomPredicate() override = default;
-    Status execute(VExprContext* context, Block* block, int* result_column_id) override;
+    Status execute(VExprContext* context, Block* block, int* result_column_id) const override;
     Status prepare(RuntimeState* state, const RowDescriptor& desc, VExprContext* context) override;
     Status open(RuntimeState* state, VExprContext* context,
                 FunctionContext::FunctionStateScope scope) override;
@@ -53,8 +53,10 @@ public:
 
     std::shared_ptr<BloomFilterFuncBase> get_bloom_filter_func() const override { return _filter; }
 
+    uint64_t get_digest(uint64_t seed) const override;
+
 private:
     std::shared_ptr<BloomFilterFuncBase> _filter;
-    std::string _expr_name;
+    inline static const std::string EXPR_NAME = "bloom_predicate";
 };
 } // namespace doris::vectorized

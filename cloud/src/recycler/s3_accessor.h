@@ -17,12 +17,14 @@
 
 #pragma once
 
+#include <aws/core/Aws.h>
 #include <bvar/latency_recorder.h>
 
 #include <array>
 #include <cstdint>
 #include <memory>
 
+#include "cpp/aws_common.h"
 #include "recycler/obj_storage_client.h"
 #include "recycler/storage_vault_accessor.h"
 
@@ -51,6 +53,29 @@ extern bvar::LatencyRecorder s3_get_bucket_version_latency;
 extern bvar::LatencyRecorder s3_copy_object_latency;
 }; // namespace s3_bvar
 
+class S3Environment {
+public:
+    S3Environment(const S3Environment&) = delete;
+    S3Environment& operator=(const S3Environment&) = delete;
+
+    static S3Environment& getInstance();
+
+    static Aws::Client::ClientConfiguration& getClientConfiguration() {
+        // The default constructor of ClientConfiguration will do some http call
+        // such as Aws::Internal::GetEC2MetadataClient and other init operation,
+        // which is unnecessary.
+        // So here we use a static instance, and deep copy every time
+        // to avoid unnecessary operations.
+        static Aws::Client::ClientConfiguration instance;
+        return instance;
+    }
+
+    ~S3Environment();
+
+private:
+    S3Environment();
+    Aws::SDKOptions aws_options_;
+};
 struct AccessorRateLimiter {
 public:
     ~AccessorRateLimiter() = default;
@@ -70,6 +95,10 @@ struct S3Conf {
     std::string bucket;
     std::string prefix;
     bool use_virtual_addressing {true};
+
+    CredProviderType cred_provider_type = CredProviderType::Default;
+    std::string role_arn;
+    std::string external_id;
 
     enum Provider : uint8_t {
         S3,
@@ -112,6 +141,8 @@ public:
 
     int exists(const std::string& path) override;
 
+    int abort_multipart_upload(const std::string& path, const std::string& upload_id) override;
+
     // Get the objects' expiration time on the conf.bucket
     // returns 0 for success otherwise error
     int get_life_cycle(int64_t* expiration_days);
@@ -125,11 +156,21 @@ protected:
 
     virtual int delete_prefix_impl(const std::string& path_prefix, int64_t expiration_time = 0);
 
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> _get_aws_credentials_provider_v1(
+            const S3Conf& s3_conf);
+
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> _get_aws_credentials_provider_v2(
+            const S3Conf& s3_conf);
+
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> get_aws_credentials_provider(
+            const S3Conf& s3_conf);
+
     std::string get_key(const std::string& relative_path) const;
     std::string to_uri(const std::string& relative_path) const;
 
     S3Conf conf_;
     std::shared_ptr<ObjStorageClient> obj_client_;
+    std::string _ca_cert_file_path;
 };
 
 class GcsAccessor final : public S3Accessor {

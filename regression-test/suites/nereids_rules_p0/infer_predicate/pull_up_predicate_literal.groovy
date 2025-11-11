@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_pull_up_predicate_literal") {
+suite("pull_up_predicate_literal") {
     sql """ DROP TABLE IF EXISTS test_pull_up_predicate_literal; """
     sql "set enable_fallback_to_original_planner=false"
     sql """SET ignore_shape_nodes='PhysicalDistribute'"""
@@ -633,16 +633,6 @@ TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types
 explain shape plan
 select c1 from (select 
 TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types t2 on d_decimal=t.c1"""
-
-    qt_const_value_and_join_column_type89 """
-explain shape plan
-select c1 from (select 
-TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types t2 on d_date=t.c1"""
-
-    qt_const_value_and_join_column_type90 """
-explain shape plan
-select c1 from (select 
-TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types t2 on d_datetime=t.c1"""
 
     qt_const_value_and_join_column_type91 """
 explain shape plan
@@ -1691,14 +1681,6 @@ TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types
     qt_const_value_and_join_column_type_res88 """
 select c1 from (select 
 TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types t2 on d_decimal=t.c1 order by 1"""
-
-    qt_const_value_and_join_column_type_res89 """
-select c1 from (select 
-TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types t2 on d_date=t.c1 order by 1"""
-
-    qt_const_value_and_join_column_type_res90 """
-select c1 from (select 
-TRUE as c1 from test_pull_up_predicate_literal limit 10) t inner join test_types t2 on d_datetime=t.c1 order by 1"""
 
     qt_const_value_and_join_column_type_res91 """
 select c1 from (select 

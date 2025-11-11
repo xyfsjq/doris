@@ -24,6 +24,7 @@
 #include "util/runtime_profile.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 static constexpr int32_t CACHE_MIN_PRUNE_SIZE = 67108864; // 64M
 static constexpr int32_t CACHE_MIN_PRUNE_NUMBER = 1024;
@@ -55,6 +56,7 @@ public:
         QUERY_CACHE = 20,
         TABLET_COLUMN_OBJECT_POOL = 21,
         SCHEMA_CLOUD_DICTIONARY_CACHE = 22,
+        CONDITION_CACHE = 23,
     };
 
     static std::string type_string(CacheType type) {
@@ -103,6 +105,8 @@ public:
             return "TabletColumnObjectPool";
         case CacheType::SCHEMA_CLOUD_DICTIONARY_CACHE:
             return "SchemaCloudDictionaryCache";
+        case CacheType::CONDITION_CACHE:
+            return "ConditionCache";
         default:
             throw Exception(Status::FatalError("not match type of cache policy :{}",
                                                static_cast<int>(type)));
@@ -132,7 +136,6 @@ public:
             {"ForUTCacheNumber", CacheType::FOR_UT_CACHE_NUMBER},
             {"QueryCache", CacheType::QUERY_CACHE},
             {"TabletColumnObjectPool", CacheType::TABLET_COLUMN_OBJECT_POOL},
-            {"SchemaCloudDictionaryCache", CacheType::SCHEMA_CLOUD_DICTIONARY_CACHE},
     };
 
     static CacheType string_to_type(std::string type) {
@@ -156,6 +159,7 @@ public:
 
     CacheType type() { return _type; }
     size_t initial_capacity() const { return _initial_capacity; }
+    virtual int64_t reset_initial_capacity(double adjust_weighted) = 0;
     bool enable_prune() const { return _enable_prune; }
     RuntimeProfile* profile() { return _profile.get(); }
 
@@ -188,4 +192,5 @@ protected:
     bool _enable_prune = true;
 };
 
+#include "common/compile_check_end.h"
 } // namespace doris

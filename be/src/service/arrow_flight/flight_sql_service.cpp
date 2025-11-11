@@ -17,12 +17,12 @@
 
 #include "service/arrow_flight/flight_sql_service.h"
 
+#include <absl/strings/str_split.h>
 #include <arrow/status.h>
 
 #include <memory>
 
 #include "arrow/flight/sql/server.h"
-#include "gutil/strings/split.h"
 #include "service/arrow_flight/arrow_flight_batch_reader.h"
 #include "service/arrow_flight/flight_sql_info.h"
 #include "service/backend_options.h"
@@ -44,13 +44,19 @@ private:
     }
 
     arrow::Result<std::shared_ptr<QueryStatement>> decode_ticket(const std::string& ticket) {
-        std::vector<string> fields = strings::Split(ticket, "&");
+        std::vector<std::string> fields = absl::StrSplit(ticket, "&");
         if (fields.size() != 4) {
             return arrow::Status::Invalid(fmt::format("Malformed ticket, size: {}", fields.size()));
         }
 
+        std::vector<std::string> str = absl::StrSplit(fields[0], "-");
+        if (str.size() != 2) {
+            return arrow::Status::Invalid("Malformed ticket, missing query id: {}", fields[0]);
+        }
+
         TUniqueId queryid;
-        parse_id(fields[0], &queryid);
+        from_hex(&queryid.hi, str[0]);
+        from_hex(&queryid.lo, str[1]);
         TNetworkAddress result_addr;
         result_addr.hostname = fields[1];
         result_addr.port = std::stoi(fields[2]);

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "pipeline/dependency.h"
+#include "vec/data_types/data_type_number.h"
 
 namespace doris::pipeline {
 
@@ -91,7 +92,7 @@ TEST_F(DataQueueTest, MultiTest) {
         int i = 0;
         while (i < 50) {
             if (sink_deps[id]->ready()) {
-                data_queue->push_block(std::move(input_blocks[id][i]), id);
+                EXPECT_TRUE(data_queue->push_block(std::move(input_blocks[id][i]), id).ok());
                 i++;
             }
         }
@@ -108,6 +109,14 @@ TEST_F(DataQueueTest, MultiTest) {
     output1.join();
 
     EXPECT_EQ(output_count, 150);
+    for (int i = 0; i < 3; i++) {
+        EXPECT_TRUE(data_queue->is_finish(i));
+    }
+    EXPECT_TRUE(data_queue->is_all_finish());
+    data_queue->clear_free_blocks();
+    for (int i = 0; i < 3; i++) {
+        EXPECT_TRUE(data_queue->_free_blocks[i].empty());
+    }
 }
 
 // ./run-be-ut.sh --run --filter=DataQueueTest.*

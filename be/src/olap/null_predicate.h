@@ -53,7 +53,7 @@ public:
                     roaring::Roaring* roaring) const override;
 
     Status evaluate(const vectorized::IndexFieldNameAndTypePair& name_with_type,
-                    InvertedIndexIterator* iterator, uint32_t num_rows,
+                    IndexIterator* iterator, uint32_t num_rows,
                     roaring::Roaring* bitmap) const override;
 
     void evaluate_or(const vectorized::IColumn& column, const uint16_t* sel, uint16_t size,
@@ -67,6 +67,17 @@ public:
             return statistic.first->is_null();
         } else {
             return !statistic.second->is_null();
+        }
+    }
+
+    bool evaluate_and(vectorized::ParquetPredicate::ColumnStat* statistic) const override {
+        if (!(*statistic->get_stat_func)(statistic, column_id())) {
+            return true;
+        }
+        if (_is_null) {
+            return true;
+        } else {
+            return !statistic->is_all_null;
         }
     }
 
@@ -93,11 +104,6 @@ public:
     }
 
     bool can_do_bloom_filter(bool ngram) const override { return _is_null && !ngram; }
-
-    bool can_do_apply_safely(PrimitiveType input_type, bool is_null) const override {
-        // Always safe to apply is null predicate
-        return true;
-    }
 
     void evaluate_vec(const vectorized::IColumn& column, uint16_t size, bool* flags) const override;
 

@@ -62,6 +62,9 @@ using namespace ErrorCode;
 
 DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(routine_load_task_count, MetricUnit::NOUNIT);
 
+bvar::LatencyRecorder g_routine_load_commit_and_publish_latency_ms("routine_load",
+                                                                   "commit_and_publish_ms");
+
 RoutineLoadTaskExecutor::RoutineLoadTaskExecutor(ExecEnv* exec_env) : _exec_env(exec_env) {
     REGISTER_HOOK_METRIC(routine_load_task_count, [this]() {
         // std::lock_guard<std::mutex> l(_lock);
@@ -206,19 +209,32 @@ Status RoutineLoadTaskExecutor::get_kafka_real_offsets_for_partitions(
 
 Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     std::unique_lock<std::mutex> l(_lock);
+    // check if already submitted
     if (_task_map.find(task.id) != _task_map.end()) {
-        // already submitted
         LOG(INFO) << "routine load task " << UniqueId(task.id) << " has already been submitted";
         return Status::OK();
     }
 
-    if (_task_map.size() >= config::max_routine_load_thread_pool_size || _reach_memory_limit()) {
+    // check task num limit
+    if (_task_map.size() >= config::max_routine_load_thread_pool_size) {
         LOG(INFO) << "too many tasks in thread pool. reject task: " << UniqueId(task.id)
                   << ", job id: " << task.job_id
                   << ", queue size: " << _thread_pool->get_queue_size()
                   << ", current tasks num: " << _task_map.size();
         return Status::TooManyTasks("{}_{}", UniqueId(task.id).to_string(),
                                     BackendOptions::get_localhost());
+    }
+
+    // check memory limit
+    std::string reason;
+    DBUG_EXECUTE_IF("RoutineLoadTaskExecutor.submit_task.memory_limit", {
+        _reach_memory_limit(reason);
+        return Status::MemoryLimitExceeded("fake reason: " + reason);
+    });
+    if (_reach_memory_limit(reason)) {
+        LOG(INFO) << "reach memory limit. reject task: " << UniqueId(task.id)
+                  << ", job id: " << task.job_id << ", reason: " << reason;
+        return Status::MemoryLimitExceeded(reason);
     }
 
     // create the context
@@ -262,13 +278,29 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     TStatus tstatus;
     tstatus.status_code = TStatusCode::OK;
     put_result.status = tstatus;
-    if (task.__isset.params) {
-        put_result.params = task.params;
-        put_result.__isset.params = true;
-    } else {
-        put_result.pipeline_params = task.pipeline_params;
-        put_result.__isset.pipeline_params = true;
+
+    put_result.pipeline_params = task.pipeline_params;
+    put_result.__isset.pipeline_params = true;
+    if (task.pipeline_params.__isset.file_scan_params &&
+        task.pipeline_params.file_scan_params.size() > 0) {
+        const auto& file_scan_range_param = task.pipeline_params.file_scan_params.begin()->second;
+        if (file_scan_range_param.__isset.strict_mode && file_scan_range_param.strict_mode) {
+            put_result.pipeline_params.query_options.__set_enable_insert_strict(true);
+        }
+    } else if (task.pipeline_params.local_params.size() > 0 &&
+               task.pipeline_params.local_params[0].per_node_scan_ranges.size() > 0) {
+        auto scan_ranges =
+                task.pipeline_params.local_params[0].per_node_scan_ranges.begin()->second;
+        if (scan_ranges.size() > 0 &&
+            scan_ranges[0].scan_range.ext_scan_range.file_scan_range.__isset.params) {
+            const auto& params = scan_ranges[0].scan_range.ext_scan_range.file_scan_range.params;
+            if (params.__isset.strict_mode) {
+                put_result.pipeline_params.query_options.__set_enable_insert_strict(
+                        params.strict_mode);
+            }
+        }
     }
+
     ctx->put_result = put_result;
     if (task.__isset.format) {
         ctx->format = task.format;
@@ -315,13 +347,17 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     }
 }
 
-bool RoutineLoadTaskExecutor::_reach_memory_limit() {
+bool RoutineLoadTaskExecutor::_reach_memory_limit(std::string& reason) {
+    DBUG_EXECUTE_IF("RoutineLoadTaskExecutor.submit_task.memory_limit", {
+        reason = "reach memory limit";
+        return true;
+    });
     bool is_exceed_soft_mem_limit = GlobalMemoryArbitrator::is_exceed_soft_mem_limit();
     auto current_load_mem_value = MemoryProfile::load_current_usage();
     if (is_exceed_soft_mem_limit || current_load_mem_value > _load_mem_limit) {
-        LOG(INFO) << "is_exceed_soft_mem_limit: " << is_exceed_soft_mem_limit
-                  << " current_load_mem_value: " << current_load_mem_value
-                  << " _load_mem_limit: " << _load_mem_limit;
+        reason = "is_exceed_soft_mem_limit: " + std::to_string(is_exceed_soft_mem_limit) +
+                 " current_load_mem_value: " + std::to_string(current_load_mem_value) +
+                 " _load_mem_limit: " + std::to_string(_load_mem_limit);
         return true;
     }
     return false;
@@ -441,7 +477,10 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
     consumer_pool->return_consumers(consumer_grp.get());
 
     // commit txn
+    int64_t commit_and_publish_start_time = MonotonicNanos();
     HANDLE_ERROR(_exec_env->stream_load_executor()->commit_txn(ctx.get()), "commit failed");
+    g_routine_load_commit_and_publish_latency_ms
+            << (MonotonicNanos() - commit_and_publish_start_time) / 1000000;
     // commit kafka offset
     switch (ctx->load_src_type) {
     case TLoadSourceType::KAFKA: {

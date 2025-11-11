@@ -20,11 +20,14 @@ package org.apache.doris.nereids.rules.expression;
 import org.apache.doris.nereids.rules.expression.rules.AddMinMax;
 import org.apache.doris.nereids.rules.expression.rules.ArrayContainToArrayOverlap;
 import org.apache.doris.nereids.rules.expression.rules.BetweenToEqual;
+import org.apache.doris.nereids.rules.expression.rules.CaseWhenToCompoundPredicate;
 import org.apache.doris.nereids.rules.expression.rules.CaseWhenToIf;
+import org.apache.doris.nereids.rules.expression.rules.CondReplaceNullWithFalse;
 import org.apache.doris.nereids.rules.expression.rules.DateFunctionRewrite;
 import org.apache.doris.nereids.rules.expression.rules.DistinctPredicatesRule;
 import org.apache.doris.nereids.rules.expression.rules.ExtractCommonFactorRule;
 import org.apache.doris.nereids.rules.expression.rules.LikeToEqualRewrite;
+import org.apache.doris.nereids.rules.expression.rules.NestedCaseWhenCondToLiteral;
 import org.apache.doris.nereids.rules.expression.rules.NullSafeEqualToEqual;
 import org.apache.doris.nereids.rules.expression.rules.SimplifyComparisonPredicate;
 import org.apache.doris.nereids.rules.expression.rules.SimplifyConflictCompound;
@@ -41,18 +44,26 @@ import java.util.List;
  * optimize expression of plan rule set.
  */
 public class ExpressionOptimization extends ExpressionRewrite {
-    public static final List<ExpressionRewriteRule> OPTIMIZE_REWRITE_RULES = ImmutableList.of(
+    public static final List<ExpressionRewriteRule<ExpressionRewriteContext>> OPTIMIZE_REWRITE_RULES = ImmutableList.of(
             bottomUp(
-                    ExtractCommonFactorRule.INSTANCE,
-                    DistinctPredicatesRule.INSTANCE,
-                    SimplifyComparisonPredicate.INSTANCE,
                     SimplifyInPredicate.INSTANCE,
-                    SimplifyRange.INSTANCE,
+
+                    // comparison predicates
+                    SimplifyComparisonPredicate.INSTANCE,
                     SimplifySelfComparison.INSTANCE,
+
+                    // compound predicates
+                    SimplifyRange.INSTANCE,
                     SimplifyConflictCompound.INSTANCE,
+                    DistinctPredicatesRule.INSTANCE,
+                    ExtractCommonFactorRule.INSTANCE,
+
                     DateFunctionRewrite.INSTANCE,
                     ArrayContainToArrayOverlap.INSTANCE,
+                    CondReplaceNullWithFalse.INSTANCE,
+                    NestedCaseWhenCondToLiteral.INSTANCE,
                     CaseWhenToIf.INSTANCE,
+                    CaseWhenToCompoundPredicate.INSTANCE,
                     TopnToMax.INSTANCE,
                     NullSafeEqualToEqual.INSTANCE,
                     LikeToEqualRewrite.INSTANCE,
@@ -67,7 +78,7 @@ public class ExpressionOptimization extends ExpressionRewrite {
      *      => LogicalFilter((origin expr)) // use PushDownFilterThroughJoin
      *      => ...
      */
-    public static final List<ExpressionRewriteRule> ADD_RANGE = ImmutableList.of(
+    public static final List<ExpressionRewriteRule<ExpressionRewriteContext>> ADD_RANGE = ImmutableList.of(
             bottomUp(
                     AddMinMax.INSTANCE
             )

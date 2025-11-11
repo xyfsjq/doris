@@ -21,7 +21,7 @@ suite("test_query_tvf_auth", "p0,auth,external,external_docker") {
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         String user = "test_jdbc_user";
         String pwd = '123456';
@@ -53,7 +53,7 @@ suite("test_query_tvf_auth", "p0,auth,external,external_docker") {
 
         sql """grant select_priv on regression_test to ${dorisuser}"""
 
-        connect(user=dorisuser, password="${dorispwd}", url=context.config.jdbcUrl) {
+        connect(dorisuser, "${dorispwd}", context.config.jdbcUrl) {
             test {
                   sql """
                      select * from query('catalog' = '${catalog_name}', 'query' = 'select * from doris_test.all_types');
@@ -62,7 +62,7 @@ suite("test_query_tvf_auth", "p0,auth,external,external_docker") {
             }
         }
         sql """grant select_priv on ${catalog_name}.*.* to ${dorisuser}"""
-        connect(user=dorisuser, password="${dorispwd}", url=context.config.jdbcUrl) {
+        connect(dorisuser, "${dorispwd}", context.config.jdbcUrl) {
           sql """
              select * from query('catalog' = '${catalog_name}', 'query' = 'select * from doris_test.all_types');
           """

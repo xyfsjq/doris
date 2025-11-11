@@ -32,6 +32,8 @@ import org.apache.doris.datasource.jdbc.JdbcExternalTable;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.analyzer.Scope;
 import org.apache.doris.nereids.analyzer.UnboundAlias;
+import org.apache.doris.nereids.analyzer.UnboundBlackholeSink;
+import org.apache.doris.nereids.analyzer.UnboundDictionarySink;
 import org.apache.doris.nereids.analyzer.UnboundFunction;
 import org.apache.doris.nereids.analyzer.UnboundHiveTableSink;
 import org.apache.doris.nereids.analyzer.UnboundIcebergTableSink;
@@ -63,6 +65,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.UnboundLogicalSink;
 import org.apache.doris.nereids.types.AggStateType;
 import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.VarcharType;
 import org.apache.doris.nereids.util.RelationUtil;
 import org.apache.doris.nereids.util.TypeCoercionUtils;
 import org.apache.doris.proto.InternalService;
@@ -190,7 +193,7 @@ public class InsertUtils {
         }
         TTxnParams txnConf = txnEntry.getTxnConf();
         SessionVariable sessionVariable = ctx.getSessionVariable();
-        long timeoutSecond = ctx.getExecTimeout();
+        long timeoutSecond = ctx.getExecTimeoutS();
         TransactionState.LoadJobSourceType sourceType = TransactionState.LoadJobSourceType.INSERT_STREAMING;
         Database dbObj = Env.getCurrentInternalCatalog()
                 .getDbOrException(dbName, s -> new AnalysisException("database is invalid for dbName: " + s));
@@ -320,7 +323,7 @@ public class InsertUtils {
                                     throw new AnalysisException("Partial update should include all key columns,"
                                             + " missing: " + col.getName());
                                 }
-                                if (!col.getGeneratedColumnsThatReferToThis().isEmpty()
+                                if (CollectionUtils.isNotEmpty(col.getGeneratedColumnsThatReferToThis())
                                         && col.getGeneratedColumnInfo() == null && !insertCol.isPresent()) {
                                     throw new AnalysisException("Partial update should include"
                                             + " all ordinary columns referenced"
@@ -371,7 +374,7 @@ public class InsertUtils {
         Optional<ExpressionAnalyzer> analyzer = analyzeContext.map(
                 cascadesContext -> buildExprAnalyzer(plan, cascadesContext)
         );
-
+        boolean strictCast = SessionVariable.enableStrictCast();
         for (List<NamedExpression> values : unboundInlineTable.getConstantExprsList()) {
             ImmutableList.Builder<NamedExpression> optimizedRowConstructor = ImmutableList.builder();
             if (values.isEmpty()) {
@@ -381,7 +384,8 @@ public class InsertUtils {
                 for (int i = 0; i < columns.size(); i++) {
                     Column column = columns.get(i);
                     NamedExpression defaultExpression = generateDefaultExpression(column);
-                    addColumnValue(analyzer, optimizedRowConstructor, defaultExpression);
+                    addColumnValue(analyzer, optimizedRowConstructor, defaultExpression,
+                            null, rewriteContext, strictCast);
                 }
             } else {
                 if (CollectionUtils.isNotEmpty(unboundLogicalSink.getColNames())) {
@@ -408,14 +412,12 @@ public class InsertUtils {
                         }
                         if (values.get(i) instanceof DefaultValueSlot) {
                             NamedExpression defaultExpression = generateDefaultExpression(sameNameColumn);
-                            addColumnValue(analyzer, optimizedRowConstructor, defaultExpression);
+                            addColumnValue(analyzer, optimizedRowConstructor, defaultExpression,
+                                    null, rewriteContext, strictCast);
                         } else {
                             DataType targetType = DataType.fromCatalogType(sameNameColumn.getType());
-                            Expression castValue = castValue(values.get(i), targetType);
-                            castValue = rewriteContext == null
-                                    ? castValue
-                                    : FoldConstantRuleOnFE.evaluate(castValue, rewriteContext);
-                            addColumnValue(analyzer, optimizedRowConstructor, (NamedExpression) castValue);
+                            addColumnValue(analyzer, optimizedRowConstructor, values.get(i),
+                                    targetType, rewriteContext, strictCast);
                         }
                     }
                 } else {
@@ -431,14 +433,12 @@ public class InsertUtils {
                         }
                         if (values.get(i) instanceof DefaultValueSlot) {
                             NamedExpression defaultExpression = generateDefaultExpression(columns.get(i));
-                            addColumnValue(analyzer, optimizedRowConstructor, defaultExpression);
+                            addColumnValue(analyzer, optimizedRowConstructor, defaultExpression,
+                                    null, rewriteContext, strictCast);
                         } else {
                             DataType targetType = DataType.fromCatalogType(columns.get(i).getType());
-                            Expression castValue = castValue(values.get(i), targetType);
-                            castValue = rewriteContext == null
-                                    ? castValue
-                                    : FoldConstantRuleOnFE.evaluate(castValue, rewriteContext);
-                            addColumnValue(analyzer, optimizedRowConstructor, (NamedExpression) castValue);
+                            addColumnValue(analyzer, optimizedRowConstructor, values.get(i), targetType,
+                                    rewriteContext, strictCast);
                         }
                     }
                 }
@@ -518,26 +518,39 @@ public class InsertUtils {
     private static void addColumnValue(
             Optional<ExpressionAnalyzer> analyzer,
             ImmutableList.Builder<NamedExpression> optimizedRowConstructor,
-            NamedExpression value) {
+            NamedExpression value, DataType targetType, ExpressionRewriteContext rewriteContext,
+            boolean strictCast) {
+        if (targetType != null) {
+            // In strict cast/insert mode, we don't cast to target varchar type here,
+            // we cast to varchar max here and do substring accordingly in BindSink.
+            if (strictCast && (targetType.isVarcharType() || targetType.isCharType())) {
+                value = castValue(value, VarcharType.MAX_VARCHAR_TYPE);
+            } else {
+                value = castValue(value, targetType);
+            }
+        }
         if (analyzer.isPresent() && !(value instanceof Alias && value.child(0) instanceof Literal)) {
             ExpressionAnalyzer expressionAnalyzer = analyzer.get();
             value = (NamedExpression) expressionAnalyzer.analyze(
-                value, new ExpressionRewriteContext(expressionAnalyzer.getCascadesContext())
+                    value, new ExpressionRewriteContext(expressionAnalyzer.getCascadesContext())
             );
+            value = rewriteContext == null
+                    ? value
+                    : (NamedExpression) FoldConstantRuleOnFE.evaluate(value, rewriteContext);
         }
         optimizedRowConstructor.add(value);
     }
 
-    private static Expression castValue(Expression value, DataType targetType) {
+    private static NamedExpression castValue(Expression value, DataType targetType) {
         if (value instanceof Alias) {
             Expression oldChild = value.child(0);
             Expression newChild = TypeCoercionUtils.castUnbound(oldChild, targetType);
-            return oldChild == newChild ? value : value.withChildren(newChild);
+            return (Alias) (oldChild == newChild ? value : value.withChildren(newChild));
         } else if (value instanceof UnboundAlias) {
             UnboundAlias unboundAlias = (UnboundAlias) value;
-            return new Alias(TypeCoercionUtils.castUnbound(unboundAlias.child(), targetType));
+            return new UnboundAlias(TypeCoercionUtils.castUnbound(unboundAlias.child(), targetType));
         } else {
-            return TypeCoercionUtils.castUnbound(value, targetType);
+            return new UnboundAlias(TypeCoercionUtils.castUnbound(value, targetType));
         }
     }
 
@@ -546,7 +559,7 @@ public class InsertUtils {
      */
     public static TableIf getTargetTable(Plan plan, ConnectContext ctx) {
         List<String> tableQualifier = getTargetTableQualified(plan, ctx);
-        return RelationUtil.getTable(tableQualifier, ctx.getEnv());
+        return RelationUtil.getTable(tableQualifier, ctx.getEnv(), Optional.empty());
     }
 
     /**
@@ -562,42 +575,40 @@ public class InsertUtils {
             unboundTableSink = (UnboundIcebergTableSink<? extends Plan>) plan;
         } else if (plan instanceof UnboundJdbcTableSink) {
             unboundTableSink = (UnboundJdbcTableSink<? extends Plan>) plan;
+        } else if (plan instanceof UnboundDictionarySink) {
+            unboundTableSink = (UnboundDictionarySink<? extends Plan>) plan;
+        } else if (plan instanceof UnboundBlackholeSink) {
+            unboundTableSink = (UnboundBlackholeSink<? extends Plan>) plan;
         } else {
-            throw new AnalysisException("the root of plan should be"
-                    + " [UnboundTableSink, UnboundHiveTableSink, UnboundIcebergTableSink],"
-                    + " but it is " + plan.getType());
+            throw new AnalysisException(
+                    "the root of plan only accept Olap, Dictionary, Hive, Iceberg or Jdbc table sink, but it is "
+                            + plan.getType());
         }
         return RelationUtil.getQualifierName(ctx, unboundTableSink.getNameParts());
     }
 
     private static NamedExpression generateDefaultExpression(Column column) {
-        try {
-            GeneratedColumnInfo generatedColumnInfo = column.getGeneratedColumnInfo();
-            // Using NullLiteral as a placeholder.
-            // If return the expr in generatedColumnInfo, will lead to slot not found error in analyze.
-            // Instead, getting the generated column expr and analyze the expr in BindSink can avoid the error.
-            if (generatedColumnInfo != null) {
-                return new Alias(new NullLiteral(DataType.fromCatalogType(column.getType())), column.getName());
+        GeneratedColumnInfo generatedColumnInfo = column.getGeneratedColumnInfo();
+        // Using NullLiteral as a placeholder.
+        // If return the expr in generatedColumnInfo, will lead to slot not found error in analyze.
+        // Instead, getting the generated column expr and analyze the expr in BindSink can avoid the error.
+        if (generatedColumnInfo != null) {
+            return new Alias(new NullLiteral(DataType.fromCatalogType(column.getType())), column.getName());
+        }
+        if (column.getDefaultValue() == null) {
+            if (!column.isAllowNull() && !column.isAutoInc()) {
+                throw new AnalysisException("Column has no default value, column=" + column.getName());
             }
-            if (column.getDefaultValue() == null) {
-                if (!column.isAllowNull() && !column.isAutoInc()) {
-                    throw new AnalysisException("Column has no default value, column=" + column.getName());
-                }
+            return new Alias(Literal.of(column.getDefaultValue())
+                    .checkedCastWithStrictChecking(DataType.fromCatalogType(column.getType())),
+                    column.getName());
+        } else {
+            Expression defualtValueExpression = new NereidsParser().parseExpression(
+                    column.getDefaultValueSql());
+            if (!(defualtValueExpression instanceof UnboundAlias)) {
+                defualtValueExpression = new UnboundAlias(defualtValueExpression);
             }
-            if (column.getDefaultValueExpr() != null) {
-                Expression defualtValueExpression = new NereidsParser().parseExpression(
-                        column.getDefaultValueExpr().toSqlWithoutTbl());
-                if (!(defualtValueExpression instanceof UnboundAlias)) {
-                    defualtValueExpression = new UnboundAlias(defualtValueExpression);
-                }
-                return (NamedExpression) defualtValueExpression;
-            } else {
-                return new Alias(Literal.of(column.getDefaultValue())
-                        .checkedCastTo(DataType.fromCatalogType(column.getType())),
-                        column.getName());
-            }
-        } catch (org.apache.doris.common.AnalysisException e) {
-            throw new AnalysisException(e.getMessage(), e);
+            return (NamedExpression) defualtValueExpression;
         }
     }
 

@@ -175,7 +175,7 @@ struct TReportExecStatusResult {
 
 // Service Protocol Details
 enum FrontendServiceVersion {
-  V1
+  V1 = 0
 }
 
 struct TDetailedReportParams {
@@ -201,11 +201,18 @@ struct TQueryStatistics {
     11: optional i64 scan_bytes_from_remote_storage
     12: optional i64 spill_write_bytes_to_local_storage
     13: optional i64 spill_read_bytes_from_local_storage
+    14: optional i64 bytes_write_into_cache
+}
+
+struct TQueryStatisticsResult {
+    1: optional bool query_finished
+    2: optional TQueryStatistics statistics
 }
 
 struct TReportWorkloadRuntimeStatusParams {
     1: optional i64 backend_id
-    2: optional map<string, TQueryStatistics> query_statistics_map
+    2: optional map<string, TQueryStatistics> query_statistics_map // deprecated
+    3: optional map<string, TQueryStatisticsResult> query_statistics_result_map
 }
 
 struct TQueryProfile {
@@ -307,6 +314,8 @@ struct TReportExecStatusParams {
   30: optional string label
 
   31: optional list<TFragmentInstanceReport> fragment_instance_reports;
+
+  33: optional string first_error_msg
 }
 
 struct TFeResult {
@@ -383,6 +392,7 @@ struct TMasterOpRequest {
     29: optional TTxnLoadInfo txnLoadInfo
     30: optional TGroupCommitInfo groupCommitInfo
     31: optional binary prepareExecuteBuffer
+    32: optional bool moreResultExists // Server has more result to send
 
     // selectdb cloud
     1000: optional string cloud_cluster
@@ -420,12 +430,7 @@ struct TMasterOpResult {
     // transaction load
     9: optional TTxnLoadInfo txnLoadInfo;
     10: optional i64 groupCommitLoadBeId;
-}
-
-struct TUpdateExportTaskStatusRequest {
-    1: required FrontendServiceVersion protocolVersion
-    2: required Types.TUniqueId taskId
-    3: required PaloInternalService.TExportStatusResult taskStatus
+    11: optional i64 affectedRows;
 }
 
 struct TLoadTxnBeginRequest {
@@ -554,6 +559,8 @@ struct TStreamLoadPutRequest {
     55: optional i32 stream_per_node;
     56: optional string group_commit_mode
     57: optional Types.TUniqueKeyUpdateMode unique_key_update_mode
+    58: optional Descriptors.TPartialUpdateNewRowPolicy partial_update_new_key_policy
+    59: optional bool empty_field_as_null
 
     // For cloud
     1000: optional string cloud_cluster
@@ -563,7 +570,7 @@ struct TStreamLoadPutRequest {
 struct TStreamLoadPutResult {
     1: required Status.TStatus status
     // valid when status is OK
-    2: optional PaloInternalService.TExecPlanFragmentParams params
+    //2: optional PaloInternalService.TExecPlanFragmentParams params # deprecated
     3: optional PaloInternalService.TPipelineFragmentParams pipeline_params
     // used for group commit
     4: optional i64 base_schema_version
@@ -577,7 +584,7 @@ struct TStreamLoadPutResult {
 struct TStreamLoadMultiTablePutResult {
     1: required Status.TStatus status
     // valid when status is OK
-    2: optional list<PaloInternalService.TExecPlanFragmentParams> params
+    // 2: optional list<PaloInternalService.TExecPlanFragmentParams> params # deprecated
     3: optional list<PaloInternalService.TPipelineFragmentParams> pipeline_params
 }
 
@@ -822,6 +829,8 @@ enum TSchemaTableName {
   TABLE_PROPERTIES = 8,
   CATALOG_META_CACHE_STATS = 9,
   PARTITIONS = 10,
+  VIEW_DEPENDENCY = 11,
+  SQL_BLOCK_RULE_STATUS = 12,
 }
 
 struct TMetadataTableRequestParams {
@@ -848,6 +857,7 @@ struct TSchemaTableRequestParams {
     4: optional string catalog  // use for table specific queries
     5: optional i64 dbId         // used for table specific queries
     6: optional string time_zone // used for DATETIME field
+    7: optional string frontend_conjuncts
 }
 
 struct TFetchSchemaTableDataRequest {
@@ -1000,6 +1010,7 @@ struct TGetBinlogRequest {
     8: optional string token
     9: optional i64 prev_commit_seq
     10: optional i64 num_acquired // the max num of binlogs in a batch
+    11: optional bool allow_follower_read
 }
 
 enum TBinlogType {
@@ -1028,7 +1039,8 @@ enum TBinlogType {
   RENAME_PARTITION = 22,
   DROP_ROLLUP = 23,
   RECOVER_INFO = 24,
-  MODIFY_DISTRIBUTION_BUCKET_NUM = 25
+  MODIFY_DISTRIBUTION_BUCKET_NUM = 25,
+  MODIFY_DISTRIBUTION_TYPE = 26,
 
   // Keep some IDs for allocation so that when new binlog types are added in the
   // future, the changes can be picked back to the old versions without breaking
@@ -1045,8 +1057,7 @@ enum TBinlogType {
   //    MODIFY_XXX = 17,
   //    MIN_UNKNOWN = 18,
   //    UNKNOWN_3 = 19,
-  MIN_UNKNOWN = 26,
-  UNKNOWN_11 = 27,
+  MIN_UNKNOWN = 27,
   UNKNOWN_12 = 28,
   UNKNOWN_13 = 29,
   UNKNOWN_14 = 30,
@@ -1161,6 +1172,7 @@ struct TGetBinlogResult {
 
 struct TGetTabletReplicaInfosRequest {
     1: required list<i64> tablet_ids
+    2: optional i64 warm_up_job_id
 }
 
 struct TGetTabletReplicaInfosResult {
@@ -1309,6 +1321,11 @@ struct TUpdateFollowerStatsCacheRequest {
     1: optional string key;
     2: optional list<string> statsRows;
     3: optional string colStatsData;
+}
+
+struct TUpdatePlanStatsCacheRequest {
+    1: optional string key;
+    2: optional string planStatsData;
 }
 
 struct TInvalidateFollowerStatsCacheRequest {
@@ -1587,6 +1604,80 @@ struct TFetchRoutineLoadJobResult {
     1: optional list<TRoutineLoadJob> routineLoadJobs
 }
 
+struct TFetchLoadJobRequest {
+}
+
+struct TLoadJob {
+    1: optional string job_id
+    2: optional string label
+    3: optional string state
+    4: optional string progress
+    5: optional string type
+    6: optional string etl_info
+    7: optional string task_info
+    8: optional string error_msg
+    9: optional string create_time
+    10: optional string etl_start_time
+    11: optional string etl_finish_time
+    12: optional string load_start_time
+    13: optional string load_finish_time
+    14: optional string url
+    15: optional string job_details
+    16: optional string transaction_id
+    17: optional string error_tablets
+    18: optional string user
+    19: optional string comment
+    20: optional string first_error_msg
+}
+
+struct TFetchLoadJobResult {
+    1: optional list<TLoadJob> loadJobs
+}
+
+struct TPlanNodeRuntimeStatsItem {
+    // node_id means PlanNodeId, add this field so that we can merge RuntimeProfile of same node more easily
+    1: optional i32 node_id
+    2: optional i64 input_rows
+    3: optional i64 output_rows
+    4: optional i64 common_filter_rows
+    5: optional i64 common_filter_input_rows
+    6: optional i64 runtime_filter_rows
+    7: optional i64 runtime_filter_input_rows
+    8: optional i64 join_builder_rows
+    9: optional i64 join_probe_rows
+    10: optional i32 join_builder_skew_ratio
+    11: optional i32 join_prober_skew_ratio
+    12: optional i32 instance_num
+}
+
+enum TEncryptionKeyType {
+    MASTER_KEY = 0,
+    DATA_KEY = 1,
+}
+
+struct TEncryptionKey {
+    1: optional binary key_pb;
+}
+
+struct TGetEncryptionKeysRequest {
+    2: optional i32 version
+}
+
+struct TGetEncryptionKeysResult {
+    1: optional Status.TStatus status
+    2: optional list<TEncryptionKey> master_keys
+}
+
+struct TGetTableTDEInfoRequest {
+    1: optional i64 db_id
+    2: optional i64 table_id
+}
+
+struct TGetTableTDEInfoResult {
+    1: optional Status.TStatus status
+    2: optional AgentService.TEncryptionAlgorithm algorithm
+}
+
 service FrontendService {
     TGetDbsResult getDbNames(1: TGetDbsParams params)
     TGetTablesResult getTableNames(1: TGetTablesParams params)
@@ -1606,8 +1697,6 @@ service FrontendService {
     TListPrivilegesResult listTablePrivilegeStatus(1: TGetTablesParams params)
     TListPrivilegesResult listSchemaPrivilegeStatus(1: TGetTablesParams params)
     TListPrivilegesResult listUserPrivilegeStatus(1: TGetTablesParams params)
-
-    TFeResult updateExportTaskStatus(1: TUpdateExportTaskStatusRequest request)
 
     TLoadTxnBeginResult loadTxnBegin(1: TLoadTxnBeginRequest request)
     TLoadTxnCommitResult loadTxnPreCommit(1: TLoadTxnCommitRequest request)
@@ -1661,6 +1750,8 @@ service FrontendService {
     TGetBinlogLagResult getBinlogLag(1: TGetBinlogLagRequest request)
 
     Status.TStatus updateStatsCache(1: TUpdateFollowerStatsCacheRequest request)
+    
+    Status.TStatus updatePlanStatsCache(1: TUpdatePlanStatsCacheRequest request)
 
     TAutoIncrementRangeResult getAutoIncrementRange(1: TAutoIncrementRangeRequest request)
 
@@ -1687,4 +1778,10 @@ service FrontendService {
     TFetchRunningQueriesResult fetchRunningQueries(1: TFetchRunningQueriesRequest request)
 
     TFetchRoutineLoadJobResult fetchRoutineLoadJob(1: TFetchRoutineLoadJobRequest request)
+
+    TFetchLoadJobResult fetchLoadJob(1: TFetchLoadJobRequest request)
+
+    TGetEncryptionKeysResult getEncryptionKeys(1: TGetEncryptionKeysRequest request)
+
+    TGetTableTDEInfoResult getTableTDEInfo(1: TGetTableTDEInfoRequest request)
 }

@@ -42,10 +42,14 @@ suite("test_default_cluster", "docker") {
         def user1 = "default_user1"
         // admin role
         def user2 = "default_user2"
+        // domain user
+        def user3 = "default_user3@'175.%'"
 
         sql """CREATE USER $user1 IDENTIFIED BY 'Cloud123456' DEFAULT ROLE 'admin'"""
         sql """CREATE USER $user2 IDENTIFIED BY 'Cloud123456'"""
+        sql """CREATE USER $user3 IDENTIFIED BY 'Cloud123456'"""
         sql """GRANT SELECT_PRIV on *.*.* to ${user2}"""
+        sql """GRANT SELECT_PRIV on *.*.* to ${user3}"""
 
         def clusters = sql " SHOW CLUSTERS "
         assertTrue(!clusters.isEmpty())
@@ -55,13 +59,13 @@ suite("test_default_cluster", "docker") {
         setAndCheckDefaultCluster validCluster
 
         // user1
-        connectInDocker(user = user1, password = 'Cloud123456') {
+        connectInDocker(user1, 'Cloud123456') {
             setAndCheckDefaultCluster validCluster
             def ret = sql """show grants"""
             log.info("ret = {}", ret)
         }
 
-        connectInDocker(user = user2, password = 'Cloud123456') {
+        connectInDocker(user2, 'Cloud123456') {
             //java.sql.SQLException: errCode = 2, detailMessage = set default compute group failed, user default_user2 has no permission to use compute group 'compute_cluster', please
             //grant use privilege first , ComputeGroupException: CURRENT_USER_NO_AUTH_TO_USE_COMPUTE_GROUP, you canuse SQL `GRANT USAGE_PRIV ON COMPUTE GROUP {compute_group_name} TO
             //{user}`
@@ -85,12 +89,23 @@ suite("test_default_cluster", "docker") {
         // admin clean
         sql """set property for $user2 'DEFAULT_CLOUD_CLUSTER' = '' """
 
-        connectInDocker(user = user2, password = 'Cloud123456') {
+        connectInDocker(user2, 'Cloud123456') {
             // user set himself
             setAndCheckDefaultCluster validCluster
             sql """set property 'DEFAULT_CLOUD_CLUSTER' = '' """
             def ret = getProperty("default_cloud_cluster")
             assertEquals(ret.Value as String, "")
+        }
+        
+        // user3
+        sql """GRANT USAGE_PRIV ON COMPUTE GROUP $validCluster TO $user3"""  
+        // succ
+        connectInDocker('default_user3', 'Cloud123456') {
+            // user set himself
+            setAndCheckDefaultCluster validCluster
+            // sql """set property 'DEFAULT_CLOUD_CLUSTER' = '' """
+            // def ret = getProperty("default_cloud_cluster")
+            // assertEquals(ret.Value as String, "")
         }
     }
 }

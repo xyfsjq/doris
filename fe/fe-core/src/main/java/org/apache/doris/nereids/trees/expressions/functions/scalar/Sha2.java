@@ -18,16 +18,20 @@
 package org.apache.doris.nereids.trees.expressions.functions.scalar;
 
 import org.apache.doris.catalog.FunctionSignature;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.functions.PropagateNullable;
+import org.apache.doris.nereids.trees.expressions.literal.IntegerLikeLiteral;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.IntegerType;
 import org.apache.doris.nereids.types.StringType;
+import org.apache.doris.nereids.types.VarBinaryType;
 import org.apache.doris.nereids.types.VarcharType;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 
 import java.util.List;
 
@@ -39,7 +43,11 @@ public class Sha2 extends ScalarFunction
 
     public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
             FunctionSignature.ret(VarcharType.SYSTEM_DEFAULT).args(VarcharType.SYSTEM_DEFAULT, IntegerType.INSTANCE),
-            FunctionSignature.ret(VarcharType.SYSTEM_DEFAULT).args(StringType.INSTANCE, IntegerType.INSTANCE));
+            FunctionSignature.ret(VarcharType.SYSTEM_DEFAULT).args(StringType.INSTANCE, IntegerType.INSTANCE),
+            FunctionSignature.ret(VarcharType.SYSTEM_DEFAULT).args(VarBinaryType.INSTANCE, IntegerType.INSTANCE)
+    );
+
+    private static final List<Integer> validDigest = Lists.newArrayList(224, 256, 384, 512);
 
     /**
      * constructor with 2 arguments.
@@ -48,13 +56,34 @@ public class Sha2 extends ScalarFunction
         super("sha2", arg0, arg1);
     }
 
+    /** constructor for withChildren and reuse signature */
+    private Sha2(ScalarFunctionParams functionParams) {
+        super(functionParams);
+    }
+
+    @Override
+    public void checkLegalityBeforeTypeCoercion() {
+        checkLegalityAfterRewrite();
+    }
+
+    @Override
+    public void checkLegalityAfterRewrite() {
+        if (!(child(1) instanceof IntegerLikeLiteral)) {
+            throw new AnalysisException("the second parameter of sha2 must be a literal but got: " + child(1).toSql());
+        }
+        final int constParam = ((IntegerLikeLiteral) child(1)).getIntValue();
+        if (!validDigest.contains(constParam)) {
+            throw new AnalysisException("sha2 functions only support digest length of " + validDigest.toString());
+        }
+    }
+
     /**
      * withChildren.
      */
     @Override
     public Sha2 withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 2);
-        return new Sha2(children.get(0), children.get(1));
+        return new Sha2(getFunctionParams(children));
     }
 
     @Override

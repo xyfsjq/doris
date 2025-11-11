@@ -26,6 +26,7 @@
 // Note: To filter out tables from sql files, use the following one-liner comamnd
 // sed -nr 's/.*tables: (.*)$/\1/gp' /path/to/*.sql | sed -nr 's/,/\n/gp' | sort | uniq
 suite("mv_tpch_test") {
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     def tables = [customer: ["c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment,temp"],
                   lineitem: ["l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag,l_linestatus, l_shipdate,l_commitdate,l_receiptdate,l_shipinstruct,l_shipmode,l_comment,temp"],
                   nation  : ["n_nationkey, n_name, n_regionkey, n_comment, temp"],
@@ -227,7 +228,7 @@ suite("mv_tpch_test") {
     """
     // contains limit, doesn't support now
     order_qt_query2_before "${query2}"
-    async_mv_rewrite_fail(db, mv2, query2, "mv2")
+    async_mv_rewrite_success(db, mv2, query2, "mv2")
     order_qt_query2_after "${query2}"
     sql """ DROP MATERIALIZED VIEW IF EXISTS mv2"""
 
@@ -1231,8 +1232,7 @@ suite("mv_tpch_test") {
               )
     """
     // contains subquery, doesn't support now
-    order_qt_query17_before "${query17}"
-    async_mv_rewrite_fail(db, mv17, query17, "mv17")
+    async_mv_rewrite_success(db, mv17, query17, "mv17")
     order_qt_query17_after "${query17}"
     sql """ DROP MATERIALIZED VIEW IF EXISTS mv17"""
 

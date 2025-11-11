@@ -151,7 +151,6 @@ Status TxnManager::prepare_txn(TPartitionId partition_id, TTransactionId transac
         auto& load_info = load_itr->second;
         // case 1: user commit rowset, then the load id must be equal
         // check if load id is equal
-        auto& load_id = load_info->load_id;
         if (load_info->load_id.hi() == load_id.hi() && load_info->load_id.lo() == load_id.lo() &&
             load_info->rowset != nullptr) {
             LOG(WARNING) << "find transaction exists when add to engine."
@@ -200,9 +199,11 @@ Status TxnManager::commit_txn(TPartitionId partition_id, const Tablet& tablet,
 
 Status TxnManager::publish_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
                                TTransactionId transaction_id, const Version& version,
-                               TabletPublishStatistics* stats) {
+                               TabletPublishStatistics* stats,
+                               std::shared_ptr<TabletTxnInfo>& extend_tablet_txn_info) {
     return publish_txn(tablet->data_dir()->get_meta(), partition_id, transaction_id,
-                       tablet->tablet_id(), tablet->tablet_uid(), version, stats);
+                       tablet->tablet_id(), tablet->tablet_uid(), version, stats,
+                       extend_tablet_txn_info);
 }
 
 void TxnManager::abort_txn(TPartitionId partition_id, TTransactionId transaction_id,
@@ -457,7 +458,8 @@ Status TxnManager::commit_txn(OlapMeta* meta, TPartitionId partition_id,
 Status TxnManager::publish_txn(OlapMeta* meta, TPartitionId partition_id,
                                TTransactionId transaction_id, TTabletId tablet_id,
                                TabletUid tablet_uid, const Version& version,
-                               TabletPublishStatistics* stats) {
+                               TabletPublishStatistics* stats,
+                               std::shared_ptr<TabletTxnInfo>& extend_tablet_txn_info) {
     auto tablet = _engine.tablet_manager()->get_tablet(tablet_id);
     if (tablet == nullptr) {
         return Status::OK();
@@ -483,6 +485,7 @@ Status TxnManager::publish_txn(OlapMeta* meta, TPartitionId partition_id,
                 // found load for txn,tablet
                 // case 1: user commit rowset, then the load id must be equal
                 tablet_txn_info = txn_info_iter->second;
+                extend_tablet_txn_info = tablet_txn_info;
                 rowset = tablet_txn_info->rowset;
             }
         }
@@ -545,7 +548,8 @@ Status TxnManager::publish_txn(OlapMeta* meta, TPartitionId partition_id,
             std::vector<segment_v2::SegmentSharedPtr> segments;
             RETURN_IF_ERROR(std::static_pointer_cast<BetaRowset>(rowset)->load_segments(&segments));
             RETURN_IF_ERROR(tablet->calc_delete_bitmap_between_segments(
-                    rowset->rowset_id(), segments, tablet_txn_info->delete_bitmap));
+                    rowset->tablet_schema(), rowset->rowset_id(), segments,
+                    tablet_txn_info->delete_bitmap));
         }
 
         RETURN_IF_ERROR(

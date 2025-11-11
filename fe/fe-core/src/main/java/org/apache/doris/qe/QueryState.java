@@ -36,6 +36,7 @@ public class QueryState {
 
     public enum ErrType {
         ANALYSIS_ERR,
+        SYNTAX_PARSE_ERR,
         OTHER_ERR
     }
 
@@ -49,7 +50,8 @@ public class QueryState {
     private int warningRows = 0;
     // make it public for easy to use
     public int serverStatus = 0;
-    public boolean isNereids = false;
+    private boolean isNereids = true;
+    private boolean isInternal = false;
     private ShowResultSet rs = null;
 
     public QueryState() {
@@ -58,6 +60,7 @@ public class QueryState {
     public void reset() {
         stateType = MysqlStateType.OK;
         errorCode = null;
+        errType = ErrType.OTHER_ERR;
         infoMessage = null;
         errorMessage = "";
         serverStatus = 0;
@@ -150,6 +153,15 @@ public class QueryState {
 
     public boolean isNereids() {
         return isNereids;
+    }
+
+    public boolean isInternal() {
+
+        return isInternal;
+    }
+
+    public void setInternal(boolean internal) {
+        isInternal = internal;
     }
 
     public void setResultSet(ShowResultSet rs) {

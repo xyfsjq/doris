@@ -44,8 +44,8 @@ using SegIdMapping = std::vector<uint32_t>;
 using FailedTablets = std::vector<std::pair<int64_t, Status>>;
 class TabletStream {
 public:
-    TabletStream(PUniqueId load_id, int64_t id, int64_t txn_id, LoadStreamMgr* load_stream_mgr,
-                 RuntimeProfile* profile);
+    TabletStream(const PUniqueId& load_id, int64_t id, int64_t txn_id,
+                 LoadStreamMgr* load_stream_mgr, RuntimeProfile* profile);
 
     Status init(std::shared_ptr<OlapTableSchemaParam> schema, int64_t index_id,
                 int64_t partition_id);
@@ -85,7 +85,7 @@ using TabletStreamSharedPtr = std::shared_ptr<TabletStream>;
 
 class IndexStream {
 public:
-    IndexStream(PUniqueId load_id, int64_t id, int64_t txn_id,
+    IndexStream(const PUniqueId& load_id, int64_t id, int64_t txn_id,
                 std::shared_ptr<OlapTableSchemaParam> schema, LoadStreamMgr* load_stream_mgr,
                 RuntimeProfile* profile);
 
@@ -116,7 +116,7 @@ using IndexStreamSharedPtr = std::shared_ptr<IndexStream>;
 using StreamId = brpc::StreamId;
 class LoadStream : public brpc::StreamInputHandler {
 public:
-    LoadStream(PUniqueId load_id, LoadStreamMgr* load_stream_mgr, bool enable_profile);
+    LoadStream(const PUniqueId& load_id, LoadStreamMgr* load_stream_mgr, bool enable_profile);
     ~LoadStream() override;
 
     Status init(const POpenLoadStreamRequest* request);
@@ -129,7 +129,8 @@ public:
         }
     }
 
-    void close(int64_t src_id, const std::vector<PTabletID>& tablets_to_commit,
+    // return true if all streams are closed, otherwise return false
+    bool close(int64_t src_id, const std::vector<PTabletID>& tablets_to_commit,
                std::vector<int64_t>* success_tablet_ids, FailedTablets* failed_tablet_ids);
 
     // callbacks called by brpc
@@ -177,6 +178,7 @@ private:
     RuntimeProfile::Counter* _close_wait_timer = nullptr;
     LoadStreamMgr* _load_stream_mgr = nullptr;
     std::shared_ptr<ResourceContext> _resource_ctx;
+    std::vector<int64_t> _closing_stream_ids;
     bool _is_incremental = false;
 };
 

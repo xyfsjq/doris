@@ -109,9 +109,10 @@ public class JobScheduler<T extends AbstractJob<?, C>, C> implements Closeable {
     }
 
     public void scheduleOneJob(T job) throws JobException {
-        if (!job.getJobStatus().equals(JobStatus.RUNNING)) {
+        if (!job.isJobRunning()) {
             return;
         }
+        // not-schedule task
         if (!job.getJobConfig().checkIsTimerJob()) {
             //manual job will not scheduler
             if (JobExecuteType.MANUAL.equals(job.getJobConfig().getExecuteType())) {
@@ -126,14 +127,28 @@ public class JobScheduler<T extends AbstractJob<?, C>, C> implements Closeable {
                 schedulerInstantJob(job, TaskType.SCHEDULED, null);
             }
         }
+        // one-time task
         if (job.getJobConfig().isImmediate() && JobExecuteType.ONE_TIME.equals(job.getJobConfig().getExecuteType())) {
             schedulerInstantJob(job, TaskType.SCHEDULED, null);
             return;
         }
-        //RECURRING job and  immediate is true
+        // when reach here, it has time schedule rules. it's RECURRING job and immediate
+        // is true
+        // FIXME: why not check RECURRING?
         if (job.getJobConfig().isImmediate()) {
             job.getJobConfig().getTimerDefinition().setLatestSchedulerTimeMs(System.currentTimeMillis());
             schedulerInstantJob(job, TaskType.SCHEDULED, null);
+        }
+        //if it's timer job and trigger last window already start, we will scheduler it immediately
+        cycleTimerJobScheduler(job, System.currentTimeMillis());
+    }
+
+    public void cycleTimerJobScheduler(T job) {
+        if (!job.isJobRunning()) {
+            return;
+        }
+        if (!JobExecuteType.RECURRING.equals(job.getJobConfig().getExecuteType())) {
+            return;
         }
         //if it's timer job and trigger last window already start, we will scheduler it immediately
         cycleTimerJobScheduler(job, System.currentTimeMillis());
@@ -165,6 +180,7 @@ public class JobScheduler<T extends AbstractJob<?, C>, C> implements Closeable {
 
 
     public void schedulerInstantJob(T job, TaskType taskType, C context) throws JobException {
+        // if context is null, maybe no tasks generated
         List<? extends AbstractTask> tasks = job.commonCreateTasks(taskType, context);
         if (CollectionUtils.isEmpty(tasks)) {
             log.info("job create task is empty, skip scheduler, job id is {}, job name is {}", job.getJobId(),
@@ -209,7 +225,7 @@ public class JobScheduler<T extends AbstractJob<?, C>, C> implements Closeable {
                 clearEndJob(job);
                 continue;
             }
-            if (job.getJobStatus().equals(JobStatus.RUNNING) && job.getJobConfig().checkIsTimerJob()) {
+            if (job.isJobRunning() && job.getJobConfig().checkIsTimerJob()) {
                 cycleTimerJobScheduler(job, lastTimeWindowMs);
             }
         }

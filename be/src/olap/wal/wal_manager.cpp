@@ -17,6 +17,7 @@
 
 #include "olap/wal/wal_manager.h"
 
+#include <absl/strings/str_split.h>
 #include <bvar/bvar.h>
 #include <glog/logging.h>
 
@@ -29,7 +30,6 @@
 
 #include "common/config.h"
 #include "common/status.h"
-#include "gutil/strings/split.h"
 #include "io/fs/local_file_system.h"
 #include "olap/wal/wal_dirs_info.h"
 #include "runtime/exec_env.h"
@@ -46,7 +46,7 @@ WalManager::WalManager(ExecEnv* exec_env, const std::string& wal_dir_list)
           _stop(false),
           _stop_background_threads_latch(1),
           _first_replay(true) {
-    _wal_dirs = strings::Split(wal_dir_list, ";", strings::SkipWhitespace());
+    _wal_dirs = absl::StrSplit(wal_dir_list, ";", absl::SkipWhitespace());
     static_cast<void>(ThreadPoolBuilder("GroupCommitReplayWalThreadPool")
                               .set_min_threads(1)
                               .set_max_threads(config::group_commit_relay_wal_threads)
@@ -480,7 +480,7 @@ Status WalManager::update_wal_dir_estimated_wal_bytes(const std::string& wal_dir
 Status WalManager::_update_wal_dir_info_thread() {
     while (!_stop.load()) {
         if (!ExecEnv::ready()) {
-            LOG(INFO) << "Sleep 1s to wait for storage engine init.";
+            VLOG_DEBUG << "Sleep 1s to wait for storage engine init.";
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }

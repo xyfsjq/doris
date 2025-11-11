@@ -122,19 +122,6 @@ Status RuntimeFilterProducerHelper::build(
     return Status::OK();
 }
 
-Status RuntimeFilterProducerHelper::terminate(RuntimeState* state) {
-    if (_skip_runtime_filters_process) {
-        return Status::OK();
-    }
-
-    for (const auto& filter : _producers) {
-        filter->set_wrapper_state_and_ready_to_publish(RuntimeFilterWrapper::State::DISABLED);
-    }
-
-    RETURN_IF_ERROR(_publish(state));
-    return Status::OK();
-}
-
 Status RuntimeFilterProducerHelper::publish(RuntimeState* state) {
     if (_skip_runtime_filters_process) {
         return Status::OK();
@@ -175,10 +162,6 @@ void RuntimeFilterProducerHelper::collect_realtime_profile(
             "SkipProcess", _skip_runtime_filters_process ? "True" : "False", "RuntimeFilterInfo");
     publish_timer->set(_publish_runtime_filter_timer->value());
     build_timer->set(_runtime_filter_compute_timer->value());
-
-    for (auto& producer : _producers) {
-        producer->collect_realtime_profile(parent_operator_profile);
-    }
 }
 
 } // namespace doris

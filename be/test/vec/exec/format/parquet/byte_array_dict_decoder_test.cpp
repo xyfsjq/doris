@@ -26,6 +26,7 @@
 #include "vec/columns/column_dictionary.h"
 #include "vec/columns/column_string.h"
 #include "vec/columns/column_vector.h"
+#include "vec/common/custom_allocator.h"
 #include "vec/data_types/data_type_string.h"
 
 namespace doris::vectorized {
@@ -43,7 +44,7 @@ protected:
             dict_data_size += 4 + strlen(values[i]); // 4 bytes for length + string data
         }
 
-        auto dict_data = std::make_unique<uint8_t[]>(dict_data_size);
+        auto dict_data = make_unique_buffer<uint8_t>(dict_data_size);
         size_t offset = 0;
         for (int i = 0; i < 3; i++) {
             uint32_t len = strlen(values[i]);
@@ -180,14 +181,14 @@ TEST_F(ByteArrayDictDecoderTest, test_decode_with_filter_and_null) {
 // Test empty dictionary case
 TEST_F(ByteArrayDictDecoderTest, test_empty_dict) {
     ByteArrayDictDecoder empty_decoder;
-    auto dict_data = std::make_unique<uint8_t[]>(0);
+    auto dict_data = make_unique_buffer<uint8_t>(0);
     ASSERT_TRUE(empty_decoder.set_dict(dict_data, 0, 0).ok());
 }
 
 // Test decoding with ColumnDictI32
 TEST_F(ByteArrayDictDecoderTest, test_decode_with_column_dict_i32) {
     // Create ColumnDictI32 column
-    MutableColumnPtr column = ColumnDictI32::create();
+    MutableColumnPtr column = ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_VARCHAR);
     DataTypePtr data_type = std::make_shared<DataTypeInt32>();
 
     // RLE encoded data: 4 zeros followed by 1, 2, 1, padded to 8 values, [0 0 0 0 1 2 1]
@@ -230,7 +231,7 @@ TEST_F(ByteArrayDictDecoderTest, test_decode_with_column_dict_i32) {
 // Test decoding with ColumnDictI32 and filter
 TEST_F(ByteArrayDictDecoderTest, test_decode_with_column_dict_i32_with_filter) {
     // Create ColumnDictI32 column
-    MutableColumnPtr column = ColumnDictI32::create();
+    MutableColumnPtr column = ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_VARCHAR);
     DataTypePtr data_type = std::make_shared<DataTypeInt32>();
 
     // RLE encoded data: 4 zeros followed by 1, 2, 1, padded to 8 values, [0 0 0 0 1 2 1]
@@ -271,7 +272,7 @@ TEST_F(ByteArrayDictDecoderTest, test_decode_with_column_dict_i32_with_filter) {
 // Test decoding with ColumnDictI32 with filter and null
 TEST_F(ByteArrayDictDecoderTest, test_decode_with_column_dict_i32_with_filter_and_null) {
     // Create ColumnDictI32 column
-    MutableColumnPtr column = ColumnDictI32::create();
+    MutableColumnPtr column = ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_VARCHAR);
     DataTypePtr data_type = std::make_shared<DataTypeInt32>();
 
     // RLE encoded data: 4 zeros followed by 2, padded to 8 values, [0 0 0 0 2]
@@ -453,10 +454,10 @@ TEST_F(ByteArrayDictDecoderTest, test_read_dict_values_to_column) {
 TEST_F(ByteArrayDictDecoderTest, test_convert_dict_column_to_string_column) {
     // Create a ColumnInt32 with some dictionary codes
     MutableColumnPtr dict_column = ColumnInt32::create();
-    dict_column->insert(0);
-    dict_column->insert(1);
-    dict_column->insert(2);
-    dict_column->insert(1);
+    dict_column->insert(vectorized::Field::create_field<TYPE_INT>(0));
+    dict_column->insert(vectorized::Field::create_field<TYPE_INT>(1));
+    dict_column->insert(vectorized::Field::create_field<TYPE_INT>(2));
+    dict_column->insert(vectorized::Field::create_field<TYPE_INT>(1));
 
     // Convert to string column
     MutableColumnPtr string_column = _decoder.convert_dict_column_to_string_column(

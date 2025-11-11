@@ -243,8 +243,8 @@ void HttpStreamAction::on_chunk_data(HttpRequest* req) {
     //      -> process_put
     //      -> StreamLoadExecutor::execute_plan_fragment
     //      -> exec_plan_fragment
-    // , SCOPED_SWITCH_RESOURCE_CONTEXT will be called, SCOPED_ATTACH_TASK not allow nesting.
-    SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->stream_load_pipe_tracker());
+    // , SCOPED_ATTACH_TASK will be called.
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->stream_load_pipe_tracker());
 
     int64_t start_read_data_time = MonotonicNanos();
     Status st = ctx->allocate_schema_buffer();
@@ -347,6 +347,7 @@ Status HttpStreamAction::process_put(HttpRequest* http_req,
             [&request, ctx](FrontendServiceConnection& client) {
                 client->streamLoadPut(ctx->put_result, request);
             }));
+    ctx->put_result.pipeline_params.query_options.__set_enable_strict_cast(false);
     ctx->stream_load_put_cost_nanos = MonotonicNanos() - stream_load_put_start_time;
     Status plan_status(Status::create(ctx->put_result.status));
     if (!plan_status.ok()) {

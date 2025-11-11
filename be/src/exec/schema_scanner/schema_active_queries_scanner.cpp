@@ -39,6 +39,7 @@ std::vector<SchemaScanner::ColumnDesc> SchemaActiveQueriesScanner::_s_tbls_colum
         {"QUEUE_START_TIME", TYPE_VARCHAR, sizeof(StringRef), true},
         {"QUEUE_END_TIME", TYPE_VARCHAR, sizeof(StringRef), true},
         {"QUERY_STATUS", TYPE_VARCHAR, sizeof(StringRef), true},
+        {"USER", TYPE_VARCHAR, sizeof(StringRef), true},
         {"SQL", TYPE_STRING, sizeof(StringRef), true}};
 
 SchemaActiveQueriesScanner::SchemaActiveQueriesScanner()
@@ -86,8 +87,8 @@ Status SchemaActiveQueriesScanner::_get_active_queries_block_from_fe() {
 
     _active_query_block = vectorized::Block::create_unique();
     for (int i = 0; i < _s_tbls_columns.size(); ++i) {
-        TypeDescriptor descriptor(_s_tbls_columns[i].type);
-        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(descriptor, true);
+        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(
+                _s_tbls_columns[i].type, true);
         _active_query_block->insert(vectorized::ColumnWithTypeAndName(
                 data_type->create_column(), data_type, _s_tbls_columns[i].name));
     }

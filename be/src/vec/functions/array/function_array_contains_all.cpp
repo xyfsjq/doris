@@ -21,7 +21,10 @@
 #include <type_traits>
 
 #include "common/status.h"
+#include "runtime/primitive_type.h"
+#include "vec/columns/column_decimal.h"
 #include "vec/common/assert_cast.h"
+#include "vec/core/call_on_type_index.h"
 #include "vec/data_types/data_type_array.h"
 #include "vec/data_types/data_type_number.h"
 #include "vec/functions/array/function_array_utils.h"
@@ -45,13 +48,13 @@ public:
     DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
         auto left_data_type = remove_nullable(arguments[0]);
         auto right_data_type = remove_nullable(arguments[1]);
-        DCHECK(is_array(left_data_type)) << arguments[0]->get_name();
-        DCHECK(is_array(right_data_type)) << arguments[1]->get_name();
+        DCHECK(left_data_type->get_primitive_type() == TYPE_ARRAY) << arguments[0]->get_name();
+        DCHECK(right_data_type->get_primitive_type() == TYPE_ARRAY) << arguments[1]->get_name();
         auto left_nested_type = remove_nullable(
                 assert_cast<const DataTypeArray&>(*left_data_type).get_nested_type());
         auto right_nested_type = remove_nullable(
                 assert_cast<const DataTypeArray&>(*right_data_type).get_nested_type());
-        DCHECK(left_nested_type->equals(*right_nested_type))
+        DCHECK(left_nested_type->equals_ignore_precision(*right_nested_type))
                 << "data type " << arguments[0]->get_name() << " not equal with "
                 << arguments[1]->get_name();
         return std::make_shared<DataTypeUInt8>();
@@ -65,7 +68,6 @@ public:
                 unpack_if_const(block.get_by_position(arguments[1]).column);
         ColumnArrayExecutionData left_exec_data;
         ColumnArrayExecutionData right_exec_data;
-        Status ret = Status::OK();
 
         // extract array column
         if (!extract_column_array_info(*left_column, left_exec_data) ||
@@ -76,108 +78,37 @@ public:
                     block.get_by_position(arguments[1]).type->get_name());
         }
         // prepare return column
-        auto dst_nested_col = ColumnVector<UInt8>::create(input_rows_count, 0);
-        auto dst_null_map = ColumnVector<UInt8>::create(input_rows_count, 0);
+        auto dst_nested_col = ColumnUInt8::create(input_rows_count, 0);
+        auto dst_null_map = ColumnUInt8::create(input_rows_count, 0);
         UInt8* dst_null_map_data = dst_null_map->get_data().data();
 
         // execute check of contains all
         auto array_type = remove_nullable(block.get_by_position(arguments[0]).type);
         auto left_element_type =
                 remove_nullable(assert_cast<const DataTypeArray&>(*array_type).get_nested_type());
-        WhichDataType left_which_type(left_element_type);
-        if (left_which_type.is_string()) {
-            ret = _execute_internal<ColumnString>(left_exec_data, right_exec_data,
-                                                  dst_null_map_data,
-                                                  dst_nested_col->get_data().data(),
-                                                  input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_date()) {
-            ret = _execute_internal<ColumnDate>(left_exec_data, right_exec_data, dst_null_map_data,
-                                                dst_nested_col->get_data().data(), input_rows_count,
-                                                left_is_const, right_is_const);
-        } else if (left_which_type.is_date_time()) {
-            ret = _execute_internal<ColumnDateTime>(
+
+        Status status = Status::OK();
+        auto call = [&](const auto& type) -> bool {
+            using DataType = std::decay_t<decltype(type)>;
+            status = _execute_internal<typename DataType::ColumnType>(
                     left_exec_data, right_exec_data, dst_null_map_data,
                     dst_nested_col->get_data().data(), input_rows_count, left_is_const,
                     right_is_const);
-        } else if (left_which_type.is_date_v2()) {
-            ret = _execute_internal<ColumnDateV2>(left_exec_data, right_exec_data,
-                                                  dst_null_map_data,
-                                                  dst_nested_col->get_data().data(),
-                                                  input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_date_time_v2()) {
-            ret = _execute_internal<ColumnDateTimeV2>(
-                    left_exec_data, right_exec_data, dst_null_map_data,
-                    dst_nested_col->get_data().data(), input_rows_count, left_is_const,
-                    right_is_const);
-        } else if (left_which_type.is_uint8()) {
-            ret = _execute_internal<ColumnUInt8>(left_exec_data, right_exec_data, dst_null_map_data,
-                                                 dst_nested_col->get_data().data(),
-                                                 input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_int8()) {
-            ret = _execute_internal<ColumnInt8>(left_exec_data, right_exec_data, dst_null_map_data,
-                                                dst_nested_col->get_data().data(), input_rows_count,
-                                                left_is_const, right_is_const);
-        } else if (left_which_type.is_int16()) {
-            ret = _execute_internal<ColumnInt16>(left_exec_data, right_exec_data, dst_null_map_data,
-                                                 dst_nested_col->get_data().data(),
-                                                 input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_int32()) {
-            ret = _execute_internal<ColumnInt32>(left_exec_data, right_exec_data, dst_null_map_data,
-                                                 dst_nested_col->get_data().data(),
-                                                 input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_int64()) {
-            ret = _execute_internal<ColumnInt64>(left_exec_data, right_exec_data, dst_null_map_data,
-                                                 dst_nested_col->get_data().data(),
-                                                 input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_int128()) {
-            ret = _execute_internal<ColumnInt128>(left_exec_data, right_exec_data,
-                                                  dst_null_map_data,
-                                                  dst_nested_col->get_data().data(),
-                                                  input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_float32()) {
-            ret = _execute_internal<ColumnFloat32>(left_exec_data, right_exec_data,
-                                                   dst_null_map_data,
-                                                   dst_nested_col->get_data().data(),
-                                                   input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_float64()) {
-            ret = _execute_internal<ColumnFloat64>(left_exec_data, right_exec_data,
-                                                   dst_null_map_data,
-                                                   dst_nested_col->get_data().data(),
-                                                   input_rows_count, left_is_const, right_is_const);
-        } else if (left_which_type.is_decimal32()) {
-            ret = _execute_internal<ColumnDecimal32>(
-                    left_exec_data, right_exec_data, dst_null_map_data,
-                    dst_nested_col->get_data().data(), input_rows_count, left_is_const,
-                    right_is_const);
-        } else if (left_which_type.is_decimal64()) {
-            ret = _execute_internal<ColumnDecimal64>(
-                    left_exec_data, right_exec_data, dst_null_map_data,
-                    dst_nested_col->get_data().data(), input_rows_count, left_is_const,
-                    right_is_const);
-        } else if (left_which_type.is_decimal128v3()) {
-            ret = _execute_internal<ColumnDecimal128V3>(
-                    left_exec_data, right_exec_data, dst_null_map_data,
-                    dst_nested_col->get_data().data(), input_rows_count, left_is_const,
-                    right_is_const);
-        } else if (left_which_type.is_decimal128v2()) {
-            ret = _execute_internal<ColumnDecimal128V2>(
-                    left_exec_data, right_exec_data, dst_null_map_data,
-                    dst_nested_col->get_data().data(), input_rows_count, left_is_const,
-                    right_is_const);
-        } else if (left_which_type.is_decimal256()) {
-            ret = _execute_internal<ColumnDecimal256>(
-                    left_exec_data, right_exec_data, dst_null_map_data,
-                    dst_nested_col->get_data().data(), input_rows_count, left_is_const,
-                    right_is_const);
-        } else {
-            ret = Status::RuntimeError(
-                    fmt::format("execute failed about function {}, the argument not support {} ",
-                                get_name(), block.get_by_position(arguments[0]).type->get_name()));
+            return true;
+        };
+
+        if (!dispatch_switch_all(left_element_type->get_primitive_type(), call)) {
+            return Status::InternalError(
+                    "execute failed, unsupported types for function {}({}, {})", get_name(),
+                    block.get_by_position(arguments[0]).type->get_name(),
+                    block.get_by_position(arguments[1]).type->get_name());
         }
-        if (ret.ok()) {
-            block.replace_by_position(result, std::move(dst_nested_col));
-        }
-        return ret;
+
+        RETURN_IF_ERROR(status);
+
+        block.replace_by_position(result, std::move(dst_nested_col));
+
+        return Status::OK();
     }
 
 private:

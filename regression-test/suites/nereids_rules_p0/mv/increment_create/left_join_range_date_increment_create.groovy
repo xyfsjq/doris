@@ -29,7 +29,7 @@ suite("left_join_range_date_increment_create") {
     sql """CREATE TABLE `orders_left_2` (
       `o_orderkey` BIGINT NULL,
       `o_custkey` INT NULL,
-      `o_orderstatus` VARCHAR(1) NULL,
+      `o_orderstatus` VARCHAR(9) NULL,
       `o_totalprice` DECIMAL(15, 2)  NULL,
       `o_orderpriority` VARCHAR(15) NULL,
       `o_clerk` VARCHAR(15) NULL,
@@ -293,12 +293,12 @@ suite("left_join_range_date_increment_create") {
     }
 
     def sql_all_list = [mv_sql_1, mv_sql_3, mv_sql_4, mv_sql_6, mv_sql_7, mv_sql_8, mv_sql_9, mv_sql_10, mv_sql_11, mv_sql_12]
-    def sql_increment_list = [mv_sql_1, mv_sql_3, mv_sql_4, mv_sql_6, mv_sql_7, mv_sql_10]
+    def sql_increment_list = [mv_sql_1, mv_sql_3, mv_sql_4, mv_sql_6, mv_sql_7]
     def sql_complete_list = []
 
     // change left table data
     // create mv base on left table with partition col
-    def sql_error_list = [mv_sql_8, mv_sql_9, mv_sql_11, mv_sql_12]
+    def sql_error_list = [mv_sql_8, mv_sql_9, mv_sql_10, mv_sql_11, mv_sql_12]
     list_judgement(sql_all_list, sql_increment_list, sql_complete_list, sql_error_list,
             partition_by_part_col, primary_tb_change, is_complete_change)
 
@@ -319,9 +319,9 @@ suite("left_join_range_date_increment_create") {
 
     // change right table data
     // create mv base on left table with partition col
-    sql_error_list = [mv_sql_8, mv_sql_9, mv_sql_11, mv_sql_12]
+    sql_error_list = [mv_sql_8, mv_sql_9, mv_sql_10, mv_sql_11, mv_sql_12]
     sql_increment_list = []
-    sql_complete_list = [mv_sql_1, mv_sql_3, mv_sql_4, mv_sql_6, mv_sql_7, mv_sql_10]
+    sql_complete_list = [mv_sql_1, mv_sql_3, mv_sql_4, mv_sql_6, mv_sql_7]
     list_judgement(sql_all_list, sql_increment_list, sql_complete_list, sql_error_list,
             partition_by_part_col, slave_tb_change, is_complete_change)
 

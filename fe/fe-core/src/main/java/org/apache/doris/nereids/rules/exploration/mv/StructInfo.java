@@ -17,9 +17,8 @@
 
 package org.apache.doris.nereids.rules.exploration.mv;
 
-import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Pair;
-import org.apache.doris.datasource.ExternalTable;
+import org.apache.doris.mtmv.BaseColInfo;
 import org.apache.doris.mtmv.BaseTableInfo;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.jobs.executor.Rewriter;
@@ -30,10 +29,10 @@ import org.apache.doris.nereids.jobs.joinorder.hypergraph.node.StructInfoNode;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.rules.exploration.mv.MaterializedViewUtils.TableQueryOperatorChecker;
 import org.apache.doris.nereids.rules.exploration.mv.Predicates.SplitPredicate;
+import org.apache.doris.nereids.rules.rewrite.PushDownFilterThroughWindow;
 import org.apache.doris.nereids.trees.copier.DeepCopierContext;
 import org.apache.doris.nereids.trees.copier.LogicalPlanDeepCopier;
 import org.apache.doris.nereids.trees.expressions.EqualTo;
-import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
@@ -50,30 +49,27 @@ import org.apache.doris.nereids.trees.plans.algebra.Project;
 import org.apache.doris.nereids.trees.plans.commands.UpdateMvByPartitionCommand.PredicateAddContext;
 import org.apache.doris.nereids.trees.plans.commands.UpdateMvByPartitionCommand.PredicateAdder;
 import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
-import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
-import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan.SelectedPartitions;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
+import org.apache.doris.nereids.trees.plans.logical.LogicalWindow;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanRewriter;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanVisitor;
-import org.apache.doris.nereids.trees.plans.visitor.ExpressionLineageReplacer;
 import org.apache.doris.nereids.util.ExpressionUtils;
 
 import com.google.common.collect.HashMultimap;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -92,8 +88,7 @@ public class StructInfo {
     public static final ScanPlanPatternChecker SCAN_PLAN_PATTERN_CHECKER = new ScanPlanPatternChecker();
     // struct info splitter
     public static final PlanSplitter PLAN_SPLITTER = new PlanSplitter();
-    private static final RelationCollector RELATION_COLLECTOR = new RelationCollector();
-    private static final PredicateCollector PREDICATE_COLLECTOR = new PredicateCollector();
+    public static final PredicateCollector PREDICATE_COLLECTOR = new PredicateCollector();
     // source data
     private final Plan originalPlan;
     private final ObjectId originalPlanId;
@@ -133,8 +128,6 @@ public class StructInfo {
     // this is for building LogicalCompatibilityContext later.
     private final Map<ExpressionPosition, Map<Expression, Expression>> expressionToShuttledExpressionToMap;
 
-    // Record the exprId and the corresponding expr map, this is used by expression shuttled
-    private final Map<ExprId, Expression> namedExprIdAndExprMapping;
     private final List<? extends Expression> planOutputShuttledExpressions;
 
     /**
@@ -147,7 +140,6 @@ public class StructInfo {
             Map<ExpressionPosition, Multimap<Expression, Pair<Expression, HyperElement>>>
                     shuttledExpressionsToExpressionsMap,
             Map<ExpressionPosition, Map<Expression, Expression>> expressionToShuttledExpressionToMap,
-            Map<ExprId, Expression> namedExprIdAndExprMapping,
             BitSet tableIdSet,
             SplitPredicate splitPredicate,
             EquivalenceClass equivalenceClass,
@@ -166,7 +158,6 @@ public class StructInfo {
         this.equivalenceClass = equivalenceClass;
         this.shuttledExpressionsToExpressionsMap = shuttledExpressionsToExpressionsMap;
         this.expressionToShuttledExpressionToMap = expressionToShuttledExpressionToMap;
-        this.namedExprIdAndExprMapping = namedExprIdAndExprMapping;
         this.planOutputShuttledExpressions = planOutputShuttledExpressions;
     }
 
@@ -177,19 +168,7 @@ public class StructInfo {
         return new StructInfo(this.originalPlan, this.originalPlanId, this.hyperGraph, this.valid, this.topPlan,
                 this.bottomPlan, this.relations, this.relationIdStructInfoNodeMap, predicates,
                 this.shuttledExpressionsToExpressionsMap, this.expressionToShuttledExpressionToMap,
-                this.namedExprIdAndExprMapping, this.tableBitSet,
-                null, null, this.planOutputShuttledExpressions);
-    }
-
-    /**
-     * Construct StructInfo with new tableBitSet
-     */
-    public StructInfo withTableBitSet(BitSet tableBitSet) {
-        return new StructInfo(this.originalPlan, this.originalPlanId, this.hyperGraph, this.valid, this.topPlan,
-                this.bottomPlan, this.relations, this.relationIdStructInfoNodeMap, this.predicates,
-                this.shuttledExpressionsToExpressionsMap, this.expressionToShuttledExpressionToMap,
-                this.namedExprIdAndExprMapping, tableBitSet,
-                this.splitPredicate, this.equivalenceClass, this.planOutputShuttledExpressions);
+                this.tableBitSet, null, null, this.planOutputShuttledExpressions);
     }
 
     private static boolean collectStructInfoFromGraph(HyperGraph hyperGraph,
@@ -197,7 +176,6 @@ public class StructInfo {
             Map<ExpressionPosition, Multimap<Expression, Pair<Expression, HyperElement>>>
                     shuttledExpressionsToExpressionsMap,
             Map<ExpressionPosition, Map<Expression, Expression>> expressionToShuttledExpressionToMap,
-            Map<ExprId, Expression> namedExprIdAndExprMapping,
             List<CatalogRelation> relations,
             Map<RelationId, StructInfoNode> relationIdStructInfoNodeMap,
             BitSet hyperTableBitSet,
@@ -206,35 +184,37 @@ public class StructInfo {
         // Collect relations from hyper graph which in the bottom plan firstly
         hyperGraph.getNodes().forEach(node -> {
             // plan relation collector and set to map
-            Plan nodePlan = node.getPlan();
-            List<CatalogRelation> nodeRelations = new ArrayList<>();
-            nodePlan.accept(RELATION_COLLECTOR, nodeRelations);
-            relations.addAll(nodeRelations);
-            nodeRelations.forEach(relation -> hyperTableBitSet.set(
-                    cascadesContext.getStatementContext().getTableId(relation.getTable()).asInt()));
-            // plan relation collector and set to map
             StructInfoNode structInfoNode = (StructInfoNode) node;
+            // plan relation collector and set to map
+            Set<CatalogRelation> nodeRelations = structInfoNode.getCatalogRelation();
+            relations.addAll(structInfoNode.getCatalogRelation());
+            nodeRelations.forEach(relation -> hyperTableBitSet.set(relation.getRelationId().asInt()));
             // record expressions in node
-            if (structInfoNode.getExpressions() != null) {
-                structInfoNode.getExpressions().forEach(expression -> {
-                    ExpressionLineageReplacer.ExpressionReplaceContext replaceContext =
-                            new ExpressionLineageReplacer.ExpressionReplaceContext(
-                                    Lists.newArrayList(expression), ImmutableSet.of(),
-                                    ImmutableSet.of(), new BitSet());
-                    structInfoNode.getPlan().accept(ExpressionLineageReplacer.INSTANCE, replaceContext);
-                    // Replace expressions by expression map
-                    List<Expression> replacedExpressions = replaceContext.getReplacedExpressions();
+            List<Expression> nodeExpressions = structInfoNode.getCouldMoveExpressions();
+            if (nodeExpressions != null) {
+                List<? extends Expression> shuttledExpressions = ExpressionUtils.shuttleExpressionWithLineage(
+                        nodeExpressions, structInfoNode.getPlan(),
+                        new BitSet());
+                for (int index = 0; index < nodeExpressions.size(); index++) {
                     putShuttledExpressionToExpressionsMap(shuttledExpressionsToExpressionsMap,
-                            expressionToShuttledExpressionToMap,
-                            ExpressionPosition.NODE, replacedExpressions.get(0), expression, node);
-                    // Record this, will be used in top level expression shuttle later, see the method
-                    // ExpressionLineageReplacer#visitGroupPlan
-                    namedExprIdAndExprMapping.putAll(replaceContext.getExprIdExpressionMap());
-                });
+                            expressionToShuttledExpressionToMap, ExpressionPosition.NODE_COULD_MOVE,
+                            shuttledExpressions.get(index), nodeExpressions.get(index), node);
+                }
+            }
+            nodeExpressions = structInfoNode.getCouldNotMoveExpressions();
+            if (nodeExpressions != null) {
+                List<? extends Expression> shuttledExpressions = ExpressionUtils.shuttleExpressionWithLineage(
+                        nodeExpressions, structInfoNode.getPlan(),
+                        new BitSet());
+                for (int index = 0; index < nodeExpressions.size(); index++) {
+                    putShuttledExpressionToExpressionsMap(shuttledExpressionsToExpressionsMap,
+                            expressionToShuttledExpressionToMap, ExpressionPosition.NODE_COULD_NOT_MOVE,
+                            shuttledExpressions.get(index), nodeExpressions.get(index), node);
+                }
             }
             // every node should only have one relation, this is for LogicalCompatibilityContext
             if (!nodeRelations.isEmpty()) {
-                relationIdStructInfoNodeMap.put(nodeRelations.get(0).getRelationId(), structInfoNode);
+                relationIdStructInfoNodeMap.put(nodeRelations.iterator().next().getRelationId(), structInfoNode);
             }
         });
         // Collect expression from join condition in hyper graph
@@ -242,37 +222,27 @@ public class StructInfo {
             List<? extends Expression> joinConjunctExpressions = edge.getExpressions();
             // shuttle expression in edge for the build of LogicalCompatibilityContext later.
             // Record the exprId to expr map in the processing to strut info
-            // TODO get exprId to expr map when complex project is ready in join dege
-            ExpressionLineageReplacer.ExpressionReplaceContext replaceContext =
-                    new ExpressionLineageReplacer.ExpressionReplaceContext(
-                            joinConjunctExpressions.stream().map(expr -> (Expression) expr)
-                                    .collect(Collectors.toList()),
-                            ImmutableSet.of(), ImmutableSet.of(), new BitSet());
-            topPlan.accept(ExpressionLineageReplacer.INSTANCE, replaceContext);
             // Replace expressions by expression map
-            List<Expression> replacedExpressions = replaceContext.getReplacedExpressions();
-            for (int i = 0; i < replacedExpressions.size(); i++) {
+            List<? extends Expression> shuttledExpressions = ExpressionUtils.shuttleExpressionWithLineage(
+                    joinConjunctExpressions, topPlan, new BitSet());
+            for (int i = 0; i < shuttledExpressions.size(); i++) {
                 putShuttledExpressionToExpressionsMap(shuttledExpressionsToExpressionsMap,
                         expressionToShuttledExpressionToMap,
-                        ExpressionPosition.JOIN_EDGE, replacedExpressions.get(i), joinConjunctExpressions.get(i),
-                        edge);
+                        ExpressionPosition.JOIN_EDGE, shuttledExpressions.get(i),
+                        joinConjunctExpressions.get(i), edge);
             }
-            // Record this, will be used in top level expression shuttle later, see the method
-            // ExpressionLineageReplacer#visitGroupPlan
-            namedExprIdAndExprMapping.putAll(replaceContext.getExprIdExpressionMap());
         }
         // Collect expression from where in hyper graph
         hyperGraph.getFilterEdges().forEach(filterEdge -> {
             List<? extends Expression> filterExpressions = filterEdge.getExpressions();
-            filterExpressions.forEach(predicate -> {
-                // this is used for LogicalCompatibilityContext
-                ExpressionUtils.extractConjunction(predicate).forEach(expr ->
-                        putShuttledExpressionToExpressionsMap(shuttledExpressionsToExpressionsMap,
-                                expressionToShuttledExpressionToMap,
-                                ExpressionPosition.FILTER_EDGE,
-                                ExpressionUtils.shuttleExpressionWithLineage(predicate, topPlan, new BitSet()),
-                                predicate, filterEdge));
-            });
+            List<? extends Expression> shuttledExpressions = ExpressionUtils.shuttleExpressionWithLineage(
+                    filterExpressions, topPlan, new BitSet());
+            for (int i = 0; i < shuttledExpressions.size(); i++) {
+                putShuttledExpressionToExpressionsMap(shuttledExpressionsToExpressionsMap,
+                        expressionToShuttledExpressionToMap,
+                        ExpressionPosition.FILTER_EDGE, shuttledExpressions.get(i),
+                        filterExpressions.get(i), filterEdge);
+            }
         });
         return true;
     }
@@ -313,6 +283,9 @@ public class StructInfo {
      * Maybe return multi structInfo when original plan already be rewritten by mv
      */
     public static StructInfo of(Plan derivedPlan, Plan originalPlan, CascadesContext cascadesContext) {
+        if (originalPlan == null) {
+            originalPlan = derivedPlan;
+        }
         // Split plan by the boundary which contains multi child
         LinkedHashSet<Class<? extends Plan>> set = Sets.newLinkedHashSet();
         set.add(LogicalJoin.class);
@@ -345,12 +318,10 @@ public class StructInfo {
         Map<RelationId, StructInfoNode> relationIdStructInfoNodeMap = new LinkedHashMap<>();
         Map<ExpressionPosition, Multimap<Expression, Pair<Expression, HyperElement>>>
                 shuttledHashConjunctsToConjunctsMap = new LinkedHashMap<>();
-        Map<ExprId, Expression> namedExprIdAndExprMapping = new LinkedHashMap<>();
         BitSet tableBitSet = new BitSet();
         Map<ExpressionPosition, Map<Expression, Expression>> expressionToShuttledExpressionToMap = new HashMap<>();
         boolean valid = collectStructInfoFromGraph(hyperGraph, topPlan, shuttledHashConjunctsToConjunctsMap,
                 expressionToShuttledExpressionToMap,
-                namedExprIdAndExprMapping,
                 relationList,
                 relationIdStructInfoNodeMap,
                 tableBitSet,
@@ -363,16 +334,17 @@ public class StructInfo {
                 ((AbstractPlan) relation).accept(TableQueryOperatorChecker.INSTANCE, null));
         valid = valid && !invalid;
         // collect predicate from top plan which not in hyper graph
-        Set<Expression> topPlanPredicates = new LinkedHashSet<>();
-        topPlan.accept(PREDICATE_COLLECTOR, topPlanPredicates);
-        Predicates predicates = Predicates.of(topPlanPredicates);
+        PredicateCollectorContext predicateCollectorContext = new PredicateCollectorContext();
+        topPlan.accept(PREDICATE_COLLECTOR, predicateCollectorContext);
+        Predicates predicates = Predicates.of(predicateCollectorContext.getCouldPullUpPredicates(),
+                predicateCollectorContext.getCouldNotPullUpPredicates());
         // this should use the output of originalPlan to make sure the output right order
         List<? extends Expression> planOutputShuttledExpressions =
                 ExpressionUtils.shuttleExpressionWithLineage(originalPlan.getOutput(), originalPlan, new BitSet());
         return new StructInfo(originalPlan, originalPlanId, hyperGraph, valid, topPlan, bottomPlan,
                 relationList, relationIdStructInfoNodeMap, predicates, shuttledHashConjunctsToConjunctsMap,
                 expressionToShuttledExpressionToMap,
-                namedExprIdAndExprMapping, tableBitSet, null, null,
+                tableBitSet, null, null,
                 planOutputShuttledExpressions);
     }
 
@@ -473,10 +445,6 @@ public class StructInfo {
         return originalPlanId;
     }
 
-    public Map<ExprId, Expression> getNamedExprIdAndExprMapping() {
-        return namedExprIdAndExprMapping;
-    }
-
     public BitSet getTableBitSet() {
         return tableBitSet;
     }
@@ -511,19 +479,65 @@ public class StructInfo {
         }
     }
 
-    private static class PredicateCollector extends DefaultPlanVisitor<Void, Set<Expression>> {
+    private static class PredicateCollector extends DefaultPlanVisitor<Void, PredicateCollectorContext> {
         @Override
-        public Void visit(Plan plan, Set<Expression> predicates) {
-            // Just collect the filter in top plan, if meet other node except project and filter, return
-            if (!(plan instanceof LogicalProject)
+        public Void visit(Plan plan, PredicateCollectorContext collectorContext) {
+            // Just collect the filter in top plan, if meet other node except the following node, return
+            if (!(plan instanceof LogicalSink)
+                    && !(plan instanceof LogicalProject)
                     && !(plan instanceof LogicalFilter)
-                    && !(plan instanceof LogicalAggregate)) {
+                    && !(plan instanceof LogicalAggregate)
+                    && !(plan instanceof LogicalWindow)
+                    && !(plan instanceof LogicalSort)
+                    && !(plan instanceof LogicalRepeat)) {
                 return null;
             }
-            if (plan instanceof LogicalFilter) {
-                predicates.addAll(ExpressionUtils.extractConjunction(((LogicalFilter) plan).getPredicate()));
+            return super.visit(plan, collectorContext);
+        }
+
+        @Override
+        public Void visitLogicalFilter(LogicalFilter<? extends Plan> filter, PredicateCollectorContext context) {
+            if (context.getWindowCommonPartitionKeys().isEmpty()) {
+                context.getCouldPullUpPredicates().addAll(filter.getConjuncts());
+            } else {
+                // if the filter contains the partition key of window, it can be pulled up
+                for (Expression conjunct : filter.getConjuncts()) {
+                    if (PushDownFilterThroughWindow.canPushDown(conjunct, context.getWindowCommonPartitionKeys())) {
+                        context.getCouldPullUpPredicates().add(conjunct);
+                    } else {
+                        context.getCouldNotPullUpPredicates().add(conjunct);
+                    }
+                }
             }
-            return super.visit(plan, predicates);
+            return super.visit(filter, context);
+        }
+
+        @Override
+        public Void visitLogicalWindow(LogicalWindow<? extends Plan> window, PredicateCollectorContext context) {
+            Set<SlotReference> commonPartitionKeys = window.getCommonPartitionKeyFromWindowExpressions();
+            context.getWindowCommonPartitionKeys().addAll(commonPartitionKeys);
+            return super.visit(window, context);
+        }
+    }
+
+    /**
+     * PredicateCollectorContext
+     */
+    public static class PredicateCollectorContext {
+        private Set<Expression> couldPullUpPredicates = new HashSet<>();
+        private Set<Expression> couldNotPullUpPredicates = new HashSet<>();
+        private Set<SlotReference> windowCommonPartitionKeys = new HashSet<>();
+
+        public Set<Expression> getCouldPullUpPredicates() {
+            return couldPullUpPredicates;
+        }
+
+        public Set<Expression> getCouldNotPullUpPredicates() {
+            return couldNotPullUpPredicates;
+        }
+
+        public Set<SlotReference> getWindowCommonPartitionKeys() {
+            return windowCommonPartitionKeys;
         }
     }
 
@@ -610,10 +624,19 @@ public class StructInfo {
      * The context for plan check context, make sure that the plan in query and mv is valid or not
      */
     public static class PlanCheckContext {
-        // the aggregate above join
+        // Record if aggregate is above join or not
         private boolean containsTopAggregate = false;
         private int topAggregateNum = 0;
+        // This indicates whether the operators above the join contain any window operator.
+        private boolean containsTopWindow = false;
+        // This records the number of window operators above the join.
+        private int topWindowNum = 0;
         private boolean alreadyMeetJoin = false;
+        // Records whether an Aggregate operator has been meet when check window operator
+        private boolean alreadyMeetAggregate = false;
+        // Indicates if a window operator is under an Aggregate operator, because the window operator under
+        // aggregate is not supported now.
+        private boolean windowUnderAggregate = false;
         private final Set<JoinType> supportJoinTypes;
 
         public PlanCheckContext(Set<JoinType> supportJoinTypes) {
@@ -626,6 +649,22 @@ public class StructInfo {
 
         public void setContainsTopAggregate(boolean containsTopAggregate) {
             this.containsTopAggregate = containsTopAggregate;
+        }
+
+        public boolean isContainsTopWindow() {
+            return containsTopWindow;
+        }
+
+        public void setContainsTopWindow(boolean containsTopWindow) {
+            this.containsTopWindow = containsTopWindow;
+        }
+
+        public int getTopWindowNum() {
+            return topWindowNum;
+        }
+
+        public void plusTopWindowNum() {
+            this.topWindowNum += 1;
         }
 
         public boolean isAlreadyMeetJoin() {
@@ -646,6 +685,22 @@ public class StructInfo {
 
         public void plusTopAggregateNum() {
             this.topAggregateNum += 1;
+        }
+
+        public boolean isAlreadyMeetAggregate() {
+            return alreadyMeetAggregate;
+        }
+
+        public void setAlreadyMeetAggregate(boolean alreadyMeetAggregate) {
+            this.alreadyMeetAggregate = alreadyMeetAggregate;
+        }
+
+        public boolean isWindowUnderAggregate() {
+            return windowUnderAggregate;
+        }
+
+        public void setWindowUnderAggregate(boolean windowUnderAggregate) {
+            this.windowUnderAggregate = windowUnderAggregate;
         }
 
         public static PlanCheckContext of(Set<JoinType> supportJoinTypes) {
@@ -672,9 +727,23 @@ public class StructInfo {
                 PlanCheckContext checkContext) {
             if (!checkContext.isAlreadyMeetJoin()) {
                 checkContext.setContainsTopAggregate(true);
+                checkContext.setAlreadyMeetAggregate(true);
                 checkContext.plusTopAggregateNum();
             }
             return visit(aggregate, checkContext);
+        }
+
+        @Override
+        public Boolean visitLogicalWindow(LogicalWindow<? extends Plan> window, PlanCheckContext checkContext) {
+            if (!checkContext.isAlreadyMeetJoin()) {
+                if (checkContext.isAlreadyMeetAggregate()) {
+                    checkContext.setWindowUnderAggregate(true);
+                    return false;
+                }
+                checkContext.setContainsTopWindow(true);
+                checkContext.plusTopWindowNum();
+            }
+            return visit(window, checkContext);
         }
 
         @Override
@@ -692,7 +761,8 @@ public class StructInfo {
                     || plan instanceof LogicalSort
                     || plan instanceof LogicalAggregate
                     || plan instanceof GroupPlan
-                    || plan instanceof LogicalRepeat) {
+                    || plan instanceof LogicalRepeat
+                    || plan instanceof LogicalWindow) {
                 return doVisit(plan, checkContext);
             }
             return false;
@@ -721,12 +791,20 @@ public class StructInfo {
         }
 
         @Override
+        public Boolean visitLogicalWindow(LogicalWindow<? extends Plan> window, PlanCheckContext checkContext) {
+            checkContext.setContainsTopWindow(true);
+            checkContext.plusTopWindowNum();
+            return visit(window, checkContext);
+        }
+
+        @Override
         public Boolean visit(Plan plan, PlanCheckContext checkContext) {
             if (plan instanceof Filter
                     || plan instanceof Project
                     || plan instanceof CatalogRelation
                     || plan instanceof GroupPlan
-                    || plan instanceof LogicalRepeat) {
+                    || plan instanceof LogicalRepeat
+                    || plan instanceof LogicalWindow) {
                 return doVisit(plan, checkContext);
             }
             return false;
@@ -767,53 +845,17 @@ public class StructInfo {
     }
 
     /**
-     * Collect partitions on base table
-     */
-    public static class QueryScanPartitionsCollector extends DefaultPlanVisitor<Plan,
-            Map<BaseTableInfo, Set<String>>> {
-        @Override
-        public Plan visitLogicalCatalogRelation(LogicalCatalogRelation catalogRelation,
-                Map<BaseTableInfo, Set<String>> targetTablePartitionMap) {
-            TableIf table = catalogRelation.getTable();
-            BaseTableInfo relatedPartitionTable = new BaseTableInfo(table);
-            if (!targetTablePartitionMap.containsKey(relatedPartitionTable)) {
-                return catalogRelation;
-            }
-            Set<String> tablePartitions = targetTablePartitionMap.get(relatedPartitionTable);
-            if (catalogRelation instanceof LogicalOlapScan) {
-                // Handle olap table
-                LogicalOlapScan logicalOlapScan = (LogicalOlapScan) catalogRelation;
-                for (Long partitionId : logicalOlapScan.getSelectedPartitionIds()) {
-                    tablePartitions.add(logicalOlapScan.getTable().getPartition(partitionId).getName());
-                }
-            } else if (catalogRelation instanceof LogicalFileScan
-                    && catalogRelation.getTable() instanceof ExternalTable
-                    && ((ExternalTable) catalogRelation.getTable()).supportInternalPartitionPruned()) {
-                LogicalFileScan logicalFileScan = (LogicalFileScan) catalogRelation;
-                SelectedPartitions selectedPartitions = logicalFileScan.getSelectedPartitions();
-                tablePartitions.addAll(selectedPartitions.selectedPartitions.keySet());
-            } else {
-                // todo Support other type partition table
-                // Not support to partition check now when query external catalog table, support later.
-                targetTablePartitionMap.clear();
-            }
-            return catalogRelation;
-        }
-    }
-
-    /**
      * Add filter on table scan according to table filter map
      *
      * @return Pair(Plan, Boolean) first is the added filter plan, value is the identifier that represent whether
      *         need to add filter.
      *         return null if add filter fail.
      */
-    public static Pair<Plan, Boolean> addFilterOnTableScan(Plan queryPlan, Map<BaseTableInfo,
-            Set<String>> partitionOnOriginPlan, String partitionColumn, CascadesContext parentCascadesContext) {
+    public static Pair<Plan, Boolean> addFilterOnTableScan(Plan queryPlan,
+            Map<BaseColInfo, Set<String>> partitionOnBaseTableMap, CascadesContext parentCascadesContext) {
         // Firstly, construct filter form invalid partition, this filter should be added on origin plan
-        PredicateAddContext predicateAddContext = new PredicateAddContext(partitionOnOriginPlan, partitionColumn);
-        Plan queryPlanWithUnionFilter = queryPlan.accept(new PredicateAdder(),
-                predicateAddContext);
+        PredicateAddContext predicateAddContext = new PredicateAddContext(null, partitionOnBaseTableMap);
+        Plan queryPlanWithUnionFilter = queryPlan.accept(new PredicateAdder(), predicateAddContext);
         if (!predicateAddContext.isHandleSuccess()) {
             return null;
         }
@@ -828,7 +870,7 @@ public class StructInfo {
         return Pair.of(MaterializedViewUtils.rewriteByRules(parentCascadesContext, context -> {
             Rewriter.getWholeTreeRewriter(context).execute();
             return context.getRewritePlan();
-        }, queryPlanWithUnionFilter, queryPlan), true);
+        }, queryPlanWithUnionFilter, queryPlan, false), true);
     }
 
     /**
@@ -837,7 +879,34 @@ public class StructInfo {
      */
     public static enum ExpressionPosition {
         JOIN_EDGE,
-        NODE,
+        NODE_COULD_MOVE,
+        NODE_COULD_NOT_MOVE,
         FILTER_EDGE
+    }
+
+    /**
+     * Check the tempRewrittenPlan is valid, should only contain project, scan or filter
+     */
+    public static boolean checkWindowTmpRewrittenPlanIsValid(Plan tempRewrittenPlan) {
+        if (tempRewrittenPlan == null) {
+            return false;
+        }
+        return tempRewrittenPlan.accept(new DefaultPlanVisitor<Boolean, Void>() {
+            @Override
+            public Boolean visit(Plan plan, Void context) {
+                if (plan instanceof LogicalProject || plan instanceof CatalogRelation
+                        || plan instanceof LogicalFilter) {
+                    boolean isValid;
+                    for (Plan child : plan.children()) {
+                        isValid = child.accept(this, context);
+                        if (!isValid) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }, null);
     }
 }

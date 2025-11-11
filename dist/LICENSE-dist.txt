@@ -223,18 +223,6 @@ Copyright 2007 Google Inc.
 
 --------------------------------------------------------------------------------
 
-be/src/gutil/arm_instruction_set_select.h : Apache 2.0 License
-
-Copyright 2011 Google Inc.
-
---------------------------------------------------------------------------------
-
-be/src/gutil/stl_util.h : Apache 2.0 License
-
-Copyright 2007 Google Inc.
-
---------------------------------------------------------------------------------
-
 be/src/gutil/utf/*: licensed under the following terms:
 
   UTF-8 Library
@@ -1247,6 +1235,8 @@ The Apache Software License, Version 2.0
         - oro:oro:2.0.8 (no url defined)
     * je:
         - com.sleepycat:je:18.3.12 (no url defined)
+    * arthas-packaging:
+        - com.taobao.arthas:arthas-packaging:4.0.5 (https://github.com/alibaba/arthas)
     ### The following components use multiple licenses and we choose APLv2
     * JAX-RS provider for JSON content type:
         - org.codehaus.jackson:jackson-jaxrs:1.8.3 (http://jackson.codehaus.org)
@@ -1522,7 +1512,7 @@ Other dependencies:
     * unixodbc: 2.3.7 -- licenses/LICENSE-unixodbc.txt
     * leveldb: 1.23 -- licenses/LICENSE-leveldb.txt
     * cyrus-sasl: 2.1.27 -- licenses/LICENSE-cyrus-sasl.txt
-    * librdkafka: 1.8.2 -- licenses/LICENSE-librdkafka.txt
+    * librdkafka: 2.11.0 -- licenses/LICENSE-librdkafka.txt
     * zstd: 1.5.2 -- licenses/LICENSE-zstd.txt
     * brotli: 1.0.9 -- licenses/LICENSE-brotli.txt
     * bitshuffle: 0.5.1 -- licenses/LICENSE-bigshuffle.txt

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "olap/olap_common.h"
 #include "olap/rowset/rowset.h"
 #include "olap/rowset/rowset_meta.h"
 #include "olap/rowset/rowset_reader.h"
@@ -76,7 +77,8 @@ public:
     Status load_segments(int64_t seg_id_begin, int64_t seg_id_end,
                          std::vector<segment_v2::SegmentSharedPtr>* segments);
 
-    Status load_segment(int64_t seg_id, segment_v2::SegmentSharedPtr* segment);
+    Status load_segment(int64_t seg_id, OlapReaderStatistics* read_stats,
+                        segment_v2::SegmentSharedPtr* segment);
 
     Status get_segments_size(std::vector<size_t>* segments_size);
 
@@ -89,7 +91,8 @@ public:
     Status show_nested_index_file(rapidjson::Value* rowset_value,
                                   rapidjson::Document::AllocatorType& allocator);
 
-    Status get_segment_num_rows(std::vector<uint32_t>* segment_rows);
+    Status get_segment_num_rows(std::vector<uint32_t>* segment_rows,
+                                OlapReaderStatistics* read_stats);
 
 protected:
     BetaRowset(const TabletSchemaSPtr& schema, const RowsetMetaSharedPtr& rowset_meta,

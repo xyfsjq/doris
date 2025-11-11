@@ -54,13 +54,10 @@ protected:
         column_dict_data = ColumnString::create();
         column_dict_indices = ColumnInt32::create();
 
-        column_dict_char =
-                ColumnDictionary<doris::vectorized::Int32>::create(FieldType::OLAP_FIELD_TYPE_CHAR);
+        column_dict_char = ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_CHAR);
         EXPECT_TRUE(column_dict_char->is_dict_empty());
-        column_dict_varchar = ColumnDictionary<doris::vectorized::Int32>::create(
-                FieldType::OLAP_FIELD_TYPE_STRING);
-        column_dict_str = ColumnDictionary<doris::vectorized::Int32>::create(
-                FieldType::OLAP_FIELD_TYPE_STRING);
+        column_dict_varchar = ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_STRING);
+        column_dict_str = ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_STRING);
 
         load_columns_data();
     }
@@ -71,9 +68,9 @@ protected:
     static ColumnInt32::MutablePtr column_dict_indices;
     static std::vector<StringRef> dict_array;
 
-    static ColumnDictionary<doris::vectorized::Int32>::MutablePtr column_dict_char;
-    static ColumnDictionary<doris::vectorized::Int32>::MutablePtr column_dict_varchar;
-    static ColumnDictionary<doris::vectorized::Int32>::MutablePtr column_dict_str;
+    static ColumnDictI32::MutablePtr column_dict_char;
+    static ColumnDictI32::MutablePtr column_dict_varchar;
+    static ColumnDictI32::MutablePtr column_dict_str;
 
     static void load_columns_data() {
         std::cout << "loading test dataset" << std::endl;
@@ -187,15 +184,11 @@ TEST_F(ColumnDictionaryTest, insert_default) {
 }
 */
 TEST_F(ColumnDictionaryTest, clear) {
-    auto target_column = column_dict_char->clone();
-    auto* col_vec_src = assert_cast<ColumnDictI32*>(column_dict_char.get());
-    auto* col_vec_target = assert_cast<ColumnDictI32*>(target_column.get());
-    EXPECT_EQ(target_column->size(), column_dict_char->size());
-    EXPECT_EQ(col_vec_target->get_data().size(), col_vec_src->get_data().size());
+    auto target_column = ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_CHAR);
+    target_column->insert_many_dict_data(dict_array.data(), dict_array.size());
 
     target_column->clear();
     EXPECT_EQ(target_column->size(), 0);
-    EXPECT_EQ(col_vec_target->get_data().size(), 0);
 }
 TEST_F(ColumnDictionaryTest, byte_size) {
     EXPECT_EQ(column_dict_char->byte_size(), column_dict_char->size() * 4);
@@ -204,7 +197,9 @@ TEST_F(ColumnDictionaryTest, allocated_bytes) {
     EXPECT_EQ(column_dict_char->allocated_bytes(), column_dict_char->size() * 4);
 }
 TEST_F(ColumnDictionaryTest, has_enough_capacity) {
-    EXPECT_THROW(column_dict_char->has_enough_capacity(ColumnDictI32()), Exception);
+    EXPECT_THROW(column_dict_char->has_enough_capacity(
+                         ColumnDictI32(FieldType::OLAP_FIELD_TYPE_VARCHAR)),
+                 Exception);
 }
 TEST_F(ColumnDictionaryTest, pop_back) {
     EXPECT_THROW(column_dict_char->pop_back(9), Exception);
@@ -247,13 +242,12 @@ TEST_F(ColumnDictionaryTest, filter) {
     EXPECT_THROW(column_dict_char->filter(filt, 10), Exception);
     EXPECT_THROW(column_dict_char->filter(filt), Exception);
 }
+TEST_F(ColumnDictionaryTest, clone) {
+    EXPECT_THROW(column_dict_char->clone(), Exception);
+}
 TEST_F(ColumnDictionaryTest, permute) {
     IColumn::Permutation perm;
     EXPECT_THROW(column_dict_char->permute(perm, 1), Exception);
-}
-TEST_F(ColumnDictionaryTest, replicate) {
-    IColumn::Offsets offsets;
-    EXPECT_THROW(column_dict_char->replicate(offsets), Exception);
 }
 TEST_F(ColumnDictionaryTest, filter_by_selector) {
     auto test_func = [&](const auto& source_column) {
@@ -288,8 +282,8 @@ TEST_F(ColumnDictionaryTest, filter_by_selector) {
     test_func(column_dict_char);
 }
 TEST_F(ColumnDictionaryTest, insert_many_dict_data) {
-    ColumnDictionary<Int32>::MutablePtr tmp_column_dict =
-            ColumnDictionary<Int32>::create(FieldType::OLAP_FIELD_TYPE_CHAR);
+    ColumnDictI32::MutablePtr tmp_column_dict =
+            ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_CHAR);
     tmp_column_dict->insert_many_dict_data(dict_array.data(), dict_array.size());
     for (size_t i = 0; i != dict_array.size(); ++i) {
         EXPECT_EQ(tmp_column_dict->get_value(i), dict_array[i]);
@@ -297,8 +291,8 @@ TEST_F(ColumnDictionaryTest, insert_many_dict_data) {
 }
 TEST_F(ColumnDictionaryTest, convert_dict_codes_if_necessary) {
     {
-        ColumnDictionary<Int32>::MutablePtr tmp_column_dict =
-                ColumnDictionary<Int32>::create(FieldType::OLAP_FIELD_TYPE_CHAR);
+        ColumnDictI32::MutablePtr tmp_column_dict =
+                ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_CHAR);
         tmp_column_dict->convert_dict_codes_if_necessary();
         EXPECT_FALSE(tmp_column_dict->is_dict_sorted());
         EXPECT_FALSE(tmp_column_dict->is_dict_code_converted());
@@ -322,8 +316,8 @@ TEST_F(ColumnDictionaryTest, find_code) {
 }
 /*
 TEST_F(ColumnDictionaryTest, initialize_hash_values_for_runtime_filter) {
-    ColumnDictionary<Int32>::MutablePtr tmp_column_dict =
-            ColumnDictionary<Int32>::create(FieldType::OLAP_FIELD_TYPE_CHAR);
+    ColumnDictI32::MutablePtr tmp_column_dict =
+            ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_CHAR);
     auto dict_data_row_count = column_dict_data->size();
     auto dict_indices_row_count = column_dict_indices->size();
     tmp_column_dict->reserve(dict_indices_row_count);
@@ -351,8 +345,8 @@ TEST_F(ColumnDictionaryTest, rowset_segment_id) {
     EXPECT_EQ(ids.second, segment_id);
 }
 TEST_F(ColumnDictionaryTest, convert_to_predicate_column_if_dictionary) {
-    ColumnDictionary<Int32>::MutablePtr tmp_column_dict =
-            ColumnDictionary<Int32>::create(FieldType::OLAP_FIELD_TYPE_CHAR);
+    ColumnDictI32::MutablePtr tmp_column_dict =
+            ColumnDictI32::create(FieldType::OLAP_FIELD_TYPE_CHAR);
     auto dict_data_row_count = column_dict_data->size();
     auto dict_indices_row_count = column_dict_indices->size();
     tmp_column_dict->reserve(dict_indices_row_count);
@@ -373,7 +367,7 @@ ColumnString::MutablePtr ColumnDictionaryTest::column_dict_data;
 ColumnInt32::MutablePtr ColumnDictionaryTest::column_dict_indices;
 std::vector<StringRef> ColumnDictionaryTest::dict_array;
 
-ColumnDictionary<doris::vectorized::Int32>::MutablePtr ColumnDictionaryTest::column_dict_char;
-ColumnDictionary<doris::vectorized::Int32>::MutablePtr ColumnDictionaryTest::column_dict_varchar;
-ColumnDictionary<doris::vectorized::Int32>::MutablePtr ColumnDictionaryTest::column_dict_str;
+ColumnDictI32::MutablePtr ColumnDictionaryTest::column_dict_char;
+ColumnDictI32::MutablePtr ColumnDictionaryTest::column_dict_varchar;
+ColumnDictI32::MutablePtr ColumnDictionaryTest::column_dict_str;
 } // namespace doris::vectorized

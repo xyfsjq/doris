@@ -21,28 +21,35 @@
 #include <gen_cpp/cloud.pb.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <numeric>
+#include <queue>
 #include <regex>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 
+#include "common/bvars.h"
+#include "common/config.h"
 #include "common/encryption_util.h"
 #include "common/logging.h"
 #include "common/network_util.h"
+#include "common/stats.h"
 #include "common/string_util.h"
 #include "cpp/sync_point.h"
-#include "meta-service/keys.h"
 #include "meta-service/meta_service.h"
 #include "meta-service/meta_service_helper.h"
-#include "meta-service/txn_kv.h"
-#include "meta-service/txn_kv_error.h"
+#include "meta-store/keys.h"
+#include "meta-store/txn_kv.h"
+#include "meta-store/txn_kv_error.h"
 
 using namespace std::chrono;
 
 namespace {
 constexpr char pattern_str[] = "^[a-zA-Z][0-9a-zA-Z_]*$";
+
 bool is_valid_storage_vault_name(const std::string& str) {
     const std::regex pattern(pattern_str);
     return std::regex_match(str, pattern);
@@ -50,13 +57,6 @@ bool is_valid_storage_vault_name(const std::string& str) {
 } // namespace
 
 namespace doris::cloud {
-
-static void* run_bthread_work(void* arg) {
-    auto f = reinterpret_cast<std::function<void()>*>(arg);
-    (*f)();
-    delete f;
-    return nullptr;
-}
 
 static std::string_view print_cluster_status(const ClusterStatus& status) {
     switch (status) {
@@ -80,7 +80,7 @@ static int encrypt_ak_sk_helper(const std::string plain_ak, const std::string pl
                                 MetaServiceCode& code, std::string& msg) {
     std::string key;
     int64_t key_id;
-    LOG_INFO("enter encrypt_ak_sk_helper, plain_ak {}", plain_ak);
+    LOG_INFO("enter encrypt_ak_sk_helper, plain_ak {}", hide_access_key(plain_ak));
     int ret = get_newest_encryption_key_for_ak_sk(&key_id, &key);
     TEST_SYNC_POINT_CALLBACK("encrypt_ak_sk:get_encryption_key", &ret, &key, &key_id);
     if (ret != 0) {
@@ -198,11 +198,257 @@ static int decrypt_and_update_ak_sk(ObjectStoreInfoPB& obj_info, MetaServiceCode
     return 0;
 };
 
+// Asynchronously notify refresh instance in background thread
+static void async_notify_refresh_instance(
+        std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id, bool include_self,
+        std::function<void(const KVStats&)> stats_handler = nullptr) {
+    auto f = new std::function<void()>([instance_id, include_self, txn_kv = std::move(txn_kv),
+                                        stats_handler = std::move(stats_handler)] {
+        KVStats stats;
+        notify_refresh_instance(txn_kv, instance_id, &stats, include_self);
+        if (stats_handler) {
+            stats_handler(stats);
+        }
+    });
+    bthread_t bid;
+    if (bthread_start_background(&bid, nullptr, run_bthread_work, f) != 0) {
+        LOG(WARNING) << "notify refresh instance inplace, instance_id=" << instance_id;
+        run_bthread_work(f);
+    }
+}
+
+// Find all instances that need cascade update using BFS traversal
+// Returns 0 on success, -1 on error
+// Uses separate read-only transactions to avoid read conflicts with the main write transaction
+static int collect_direct_derived_instances(TxnKv* txn_kv, const std::string& source_instance_id,
+                                            std::vector<std::string>* derived_ids) {
+    if (!derived_ids) {
+        return -1;
+    }
+    derived_ids->clear();
+
+    if (source_instance_id.empty()) {
+        return 0;
+    }
+
+    constexpr Versionstamp kMinVersionstamp = Versionstamp::min();
+
+    std::string key_start =
+            versioned::snapshot_reference_key_prefix(source_instance_id, kMinVersionstamp);
+    std::string key_end =
+            versioned::snapshot_reference_key_prefix(source_instance_id + '\x00', kMinVersionstamp);
+    std::string current_start = key_start;
+
+    std::unique_ptr<RangeGetIterator> it;
+    while (true) {
+        std::unique_ptr<Transaction> read_txn;
+        TxnErrorCode err = txn_kv->create_txn(&read_txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to create read transaction for snapshot reference scan, err="
+                         << err << " source_instance_id=" << source_instance_id;
+            return -1;
+        }
+
+        err = read_txn->get(current_start, key_end, &it);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to scan snapshot reference keys, err=" << err
+                         << " source_instance_id=" << source_instance_id;
+            return -1;
+        }
+
+        while (it->has_next()) {
+            auto [key, value] = it->next();
+            std::string derived_id;
+            std::string_view key_view = key;
+            if (versioned::decode_snapshot_ref_key(&key_view, nullptr, nullptr, &derived_id) &&
+                !derived_id.empty()) {
+                derived_ids->push_back(std::move(derived_id));
+            } else {
+                LOG(WARNING) << "failed to decode snapshot reference key for source_instance_id="
+                             << source_instance_id << " key=" << hex(key);
+            }
+        }
+
+        if (!it->more()) {
+            break;
+        }
+
+        current_start = it->next_begin_key();
+        if (current_start.empty() || current_start >= key_end) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int find_cascade_instances(TxnKv* txn_kv, const std::string& root_instance_id,
+                                  std::vector<std::string>* out) {
+    std::queue<std::string> to_visit;
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> direct_children;
+
+    to_visit.push(root_instance_id);
+    visited.insert(root_instance_id);
+
+    while (!to_visit.empty()) {
+        std::string current_instance_id = to_visit.front();
+        to_visit.pop();
+
+        if (collect_direct_derived_instances(txn_kv, current_instance_id, &direct_children) != 0) {
+            LOG(WARNING) << "failed to collect derived instances for source_instance_id="
+                         << current_instance_id;
+            return -1;
+        }
+
+        for (auto& derived_id : direct_children) {
+            if (derived_id.empty() || visited.contains(derived_id)) {
+                continue;
+            }
+
+            out->push_back(derived_id);
+            to_visit.push(derived_id);
+            visited.insert(derived_id);
+            LOG(INFO) << "found derived instance: " << derived_id
+                      << " from source: " << current_instance_id;
+        }
+    }
+
+    LOG(INFO) << "find_cascade_instances completed, found " << out->size()
+              << " instances to cascade from root: " << root_instance_id;
+    return 0;
+}
+
+// Helper function to update AK/SK for a single instance
+// Returns 0 on success, -1 on error
+static int update_instance_ak_sk(InstanceInfoPB& instance, const UpdateAkSkRequest* request,
+                                 uint64_t time, MetaServiceCode& code, std::string& msg,
+                                 std::stringstream& update_record) {
+    // Update ram_user if has ram_user
+    if (request->has_ram_user()) {
+        if (request->ram_user().user_id().empty() || request->ram_user().ak().empty() ||
+            request->ram_user().sk().empty()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "ram user info err " + proto_to_json(*request);
+            return -1;
+        }
+        if (!instance.has_ram_user()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "instance doesn't have ram user info";
+            return -1;
+        }
+        auto& ram_user = request->ram_user();
+        EncryptionInfoPB encryption_info;
+        AkSkPair cipher_ak_sk_pair;
+        if (encrypt_ak_sk_helper(ram_user.ak(), ram_user.sk(), &encryption_info, &cipher_ak_sk_pair,
+                                 code, msg) != 0) {
+            return -1;
+        }
+        const auto& [ak, sk] = cipher_ak_sk_pair;
+        auto& instance_ram_user = *instance.mutable_ram_user();
+        if (ram_user.user_id() != instance_ram_user.user_id()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "ram user_id err";
+            return -1;
+        }
+        std::string old_ak = instance_ram_user.ak();
+        std::string old_sk = instance_ram_user.sk();
+        if (old_ak == ak && old_sk == sk) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "ak sk eq original, please check it";
+            return -1;
+        }
+        instance_ram_user.set_ak(std::move(cipher_ak_sk_pair.first));
+        instance_ram_user.set_sk(std::move(cipher_ak_sk_pair.second));
+        instance_ram_user.mutable_encryption_info()->CopyFrom(encryption_info);
+        update_record << "update ram_user's ak sk, instance_id: " << instance.instance_id()
+                      << " user_id: " << ram_user.user_id() << " old:  cipher ak: " << old_ak
+                      << " cipher sk: " << old_sk << " new: cipher ak: " << ak
+                      << " cipher sk: " << sk << "; ";
+    }
+
+    // Update internal_bucket_user
+    bool has_found_alter_obj_info = false;
+    for (auto& alter_bucket_user : request->internal_bucket_user()) {
+        if (!alter_bucket_user.has_ak() || !alter_bucket_user.has_sk() ||
+            !alter_bucket_user.has_user_id()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "s3 bucket info err " + proto_to_json(*request);
+            return -1;
+        }
+        std::string user_id = alter_bucket_user.user_id();
+        EncryptionInfoPB encryption_info;
+        AkSkPair cipher_ak_sk_pair;
+        if (encrypt_ak_sk_helper(alter_bucket_user.ak(), alter_bucket_user.sk(), &encryption_info,
+                                 &cipher_ak_sk_pair, code, msg) != 0) {
+            return -1;
+        }
+        const auto& [ak, sk] = cipher_ak_sk_pair;
+        auto& obj_info =
+                const_cast<std::decay_t<decltype(instance.obj_info())>&>(instance.obj_info());
+        for (auto& it : obj_info) {
+            std::string old_ak = it.ak();
+            std::string old_sk = it.sk();
+            if (!it.has_user_id()) {
+                has_found_alter_obj_info = true;
+                // For compatibility, obj_info without a user_id only allow
+                // single internal_bucket_user to modify it.
+                if (request->internal_bucket_user_size() != 1) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    msg = "fail to update old instance's obj_info, s3 obj info err " +
+                          proto_to_json(*request);
+                    return -1;
+                }
+                if (it.ak() == ak && it.sk() == sk) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    msg = "ak sk eq original, please check it";
+                    return -1;
+                }
+                it.set_mtime(time);
+                it.set_user_id(user_id);
+                it.set_ak(ak);
+                it.set_sk(sk);
+                it.mutable_encryption_info()->CopyFrom(encryption_info);
+                update_record << "update obj_info's ak sk without user_id, instance_id: "
+                              << instance.instance_id() << " obj_info_id: " << it.id()
+                              << " new user_id: " << user_id << " old:  cipher ak: " << old_ak
+                              << " cipher sk: " << old_sk << " new:  cipher ak: " << ak
+                              << " cipher sk: " << sk << "; ";
+                continue;
+            }
+            if (it.user_id() == user_id) {
+                has_found_alter_obj_info = true;
+                if (it.ak() == ak && it.sk() == sk) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    msg = "ak sk eq original, please check it";
+                    return -1;
+                }
+                it.set_mtime(time);
+                it.set_ak(ak);
+                it.set_sk(sk);
+                it.mutable_encryption_info()->CopyFrom(encryption_info);
+                update_record << "update obj_info's ak sk, instance_id: " << instance.instance_id()
+                              << " obj_info_id: " << it.id() << " user_id: " << user_id
+                              << " old:  cipher ak: " << old_ak << " cipher sk: " << old_sk
+                              << " new:  cipher ak: " << ak << " cipher sk: " << sk << "; ";
+            }
+        }
+    }
+
+    if (!request->internal_bucket_user().empty() && !has_found_alter_obj_info) {
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        msg = "fail to find the alter obj info";
+        return -1;
+    }
+
+    return 0;
+}
+
 void MetaServiceImpl::get_obj_store_info(google::protobuf::RpcController* controller,
                                          const GetObjStoreInfoRequest* request,
                                          GetObjStoreInfoResponse* response,
                                          ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_obj_store_info);
+    RPC_PREPROCESS(get_obj_store_info, get);
     TEST_SYNC_POINT_CALLBACK("obj-store-info_sk_response", &response);
     TEST_SYNC_POINT_RETURN_WITH_VOID("obj-store-info_sk_response_return");
     // Prepare data
@@ -226,7 +472,6 @@ void MetaServiceImpl::get_obj_store_info(google::protobuf::RpcController* contro
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -364,6 +609,17 @@ bool normalize_hdfs_fs_name(std::string& fs_name) {
 static int add_hdfs_storage_vault(InstanceInfoPB& instance, Transaction* txn,
                                   StorageVaultPB& hdfs_param, MetaServiceCode& code,
                                   std::string& msg) {
+#ifndef ENABLE_HDFS_STORAGE_VAULT
+    code = MetaServiceCode::INVALID_ARGUMENT;
+    msg = fmt::format(
+            "HDFS is disabled (via the ENABLE_HDFS_STORAGE_VAULT build option), "
+            "but HDFS storage vaults were detected: {}",
+            hdfs_param.name());
+    LOG(ERROR) << "HDFS is disabled (via the ENABLE_HDFS_STORAGE_VAULT build option), "
+               << "but HDFS storage vaults were detected: " << hdfs_param.name();
+    return -1;
+#endif
+
     if (!hdfs_param.has_hdfs_info()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
         msg = fmt::format("vault_name={} passed invalid argument", hdfs_param.name());
@@ -421,25 +677,37 @@ static void create_object_info_with_encrypt(const InstanceInfoPB& instance, Obje
     std::string external_endpoint = obj->has_external_endpoint() ? obj->external_endpoint() : "";
     std::string region = obj->has_region() ? obj->region() : "";
 
-    // ATTN: prefix may be empty
-    if (plain_ak.empty() || plain_sk.empty() || bucket.empty() || endpoint.empty() ||
-        region.empty() || !obj->has_provider() || external_endpoint.empty()) {
-        code = MetaServiceCode::INVALID_ARGUMENT;
-        msg = "s3 conf info err, please check it";
-        return;
-    }
-    EncryptionInfoPB encryption_info;
-    AkSkPair cipher_ak_sk_pair;
-    auto ret = encrypt_ak_sk_helper(plain_ak, plain_sk, &encryption_info, &cipher_ak_sk_pair, code,
-                                    msg);
-    TEST_SYNC_POINT_CALLBACK("create_object_info_with_encrypt", &ret, &code, &msg);
-    if (ret != 0) {
-        return;
+    if (obj->has_role_arn()) {
+        if (obj->role_arn().empty() || !obj->has_cred_provider_type() ||
+            obj->cred_provider_type() != CredProviderTypePB::INSTANCE_PROFILE ||
+            !obj->has_provider() || obj->provider() != ObjectStoreInfoPB::S3 || bucket.empty() ||
+            endpoint.empty() || region.empty()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "s3 conf info err with role_arn, please check it";
+            return;
+        }
+    } else {
+        // ATTN: prefix may be empty
+        if (plain_ak.empty() || plain_sk.empty() || bucket.empty() || endpoint.empty() ||
+            region.empty() || !obj->has_provider() || external_endpoint.empty()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "s3 conf info err, please check it";
+            return;
+        }
+
+        EncryptionInfoPB encryption_info;
+        AkSkPair cipher_ak_sk_pair;
+        auto ret = encrypt_ak_sk_helper(plain_ak, plain_sk, &encryption_info, &cipher_ak_sk_pair,
+                                        code, msg);
+        TEST_SYNC_POINT_CALLBACK("create_object_info_with_encrypt", &ret, &code, &msg);
+        if (ret != 0) {
+            return;
+        }
+        obj->set_ak(std::move(cipher_ak_sk_pair.first));
+        obj->set_sk(std::move(cipher_ak_sk_pair.second));
+        obj->mutable_encryption_info()->CopyFrom(encryption_info);
     }
 
-    obj->set_ak(std::move(cipher_ak_sk_pair.first));
-    obj->set_sk(std::move(cipher_ak_sk_pair.second));
-    obj->mutable_encryption_info()->CopyFrom(encryption_info);
     obj->set_bucket(bucket);
     obj->set_prefix(prefix);
     obj->set_endpoint(endpoint);
@@ -665,14 +933,6 @@ static int alter_s3_storage_vault(InstanceInfoPB& instance, std::unique_ptr<Tran
         return -1;
     }
 
-    if (obj_info.has_ak() ^ obj_info.has_sk()) {
-        code = MetaServiceCode::INVALID_ARGUMENT;
-        std::stringstream ss;
-        ss << "Accesskey and secretkey must be alter together";
-        msg = ss.str();
-        return -1;
-    }
-
     const auto& name = vault.name();
     // Here we try to get mutable iter since we might need to alter the vault name
     auto name_itr = std::find_if(instance.mutable_storage_vault_names()->begin(),
@@ -711,6 +971,8 @@ static int alter_s3_storage_vault(InstanceInfoPB& instance, std::unique_ptr<Tran
         return -1;
     }
 
+    auto origin_vault_info = new_vault.DebugString();
+
     if (vault.has_alter_name()) {
         if (!is_valid_storage_vault_name(vault.alter_name())) {
             code = MetaServiceCode::INVALID_ARGUMENT;
@@ -730,13 +992,26 @@ static int alter_s3_storage_vault(InstanceInfoPB& instance, std::unique_ptr<Tran
         new_vault.set_name(vault.alter_name());
         *name_itr = vault.alter_name();
     }
-    auto origin_vault_info = new_vault.DebugString();
 
-    // For ak or sk is not altered.
-    EncryptionInfoPB encryption_info = new_vault.obj_info().encryption_info();
-    AkSkPair new_ak_sk_pair {new_vault.obj_info().ak(), new_vault.obj_info().sk()};
+    if (obj_info.has_role_arn() && (obj_info.has_ak() || obj_info.has_sk())) {
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        msg = "invaild argument, both set ak/sk and role_arn is not allowed";
+        LOG(WARNING) << msg;
+        return -1;
+    }
+
+    if (obj_info.has_ak() ^ obj_info.has_sk()) {
+        code = MetaServiceCode::INVALID_ARGUMENT;
+        std::stringstream ss;
+        ss << "Accesskey and secretkey must be alter together";
+        msg = ss.str();
+        return -1;
+    }
 
     if (obj_info.has_ak()) {
+        EncryptionInfoPB encryption_info = new_vault.obj_info().encryption_info();
+        AkSkPair new_ak_sk_pair {new_vault.obj_info().ak(), new_vault.obj_info().sk()};
+
         // ak and sk must be altered together, there is check before.
         auto ret = encrypt_ak_sk_helper(obj_info.ak(), obj_info.sk(), &encryption_info,
                                         &new_ak_sk_pair, code, msg);
@@ -746,14 +1021,35 @@ static int alter_s3_storage_vault(InstanceInfoPB& instance, std::unique_ptr<Tran
             LOG(WARNING) << msg;
             return -1;
         }
+        new_vault.mutable_obj_info()->clear_role_arn();
+        new_vault.mutable_obj_info()->clear_external_id();
+        new_vault.mutable_obj_info()->clear_cred_provider_type();
+
+        new_vault.mutable_obj_info()->set_ak(new_ak_sk_pair.first);
+        new_vault.mutable_obj_info()->set_sk(new_ak_sk_pair.second);
+        new_vault.mutable_obj_info()->mutable_encryption_info()->CopyFrom(encryption_info);
     }
 
-    new_vault.mutable_obj_info()->set_ak(new_ak_sk_pair.first);
-    new_vault.mutable_obj_info()->set_sk(new_ak_sk_pair.second);
-    new_vault.mutable_obj_info()->mutable_encryption_info()->CopyFrom(encryption_info);
+    if (obj_info.has_role_arn()) {
+        new_vault.mutable_obj_info()->clear_ak();
+        new_vault.mutable_obj_info()->clear_sk();
+        new_vault.mutable_obj_info()->clear_encryption_info();
+
+        new_vault.mutable_obj_info()->set_role_arn(obj_info.role_arn());
+        new_vault.mutable_obj_info()->set_cred_provider_type(CredProviderTypePB::INSTANCE_PROFILE);
+        if (obj_info.has_external_id()) {
+            new_vault.mutable_obj_info()->set_external_id(obj_info.external_id());
+        }
+    }
+
     if (obj_info.has_use_path_style()) {
         new_vault.mutable_obj_info()->set_use_path_style(obj_info.use_path_style());
     }
+
+    auto now_time = std::chrono::system_clock::now();
+    uint64_t time =
+            std::chrono::duration_cast<std::chrono::seconds>(now_time.time_since_epoch()).count();
+    new_vault.mutable_obj_info()->set_mtime(time);
 
     auto new_vault_info = new_vault.DebugString();
     val = new_vault.SerializeAsString();
@@ -765,7 +1061,8 @@ static int alter_s3_storage_vault(InstanceInfoPB& instance, std::unique_ptr<Tran
 
     txn->put(vault_key, val);
     LOG(INFO) << "put vault_id=" << vault_id << ", vault_key=" << hex(vault_key)
-              << ", origin vault=" << origin_vault_info << ", new vault=" << new_vault_info;
+              << ", origin vault=" << encryt_sk(hide_ak(origin_vault_info))
+              << ", new vault=" << encryt_sk(hide_ak(new_vault_info));
 
     DCHECK_EQ(new_vault.id(), vault_id);
     response->set_storage_vault_id(new_vault.id());
@@ -781,6 +1078,9 @@ struct ObjectStorageDesc {
     std::string& external_endpoint;
     std::string& region;
     bool& use_path_style;
+
+    std::string& role_arn;
+    std::string& external_id;
 };
 
 static int extract_object_storage_info(const AlterObjStoreInfoRequest* request,
@@ -793,39 +1093,54 @@ static int extract_object_storage_info(const AlterObjStoreInfoRequest* request,
         msg = "s3 obj info err " + proto_to_json(*request);
         return -1;
     }
-    auto& [ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style] = obj_desc;
+
     const auto& obj = request->has_obj() ? request->obj() : request->vault().obj_info();
-    // Prepare data
-    if (!obj.has_ak() || !obj.has_sk()) {
-        code = MetaServiceCode::INVALID_ARGUMENT;
-        msg = "s3 obj info err " + proto_to_json(*request);
-        return -1;
-    }
 
-    std::string plain_ak = obj.has_ak() ? obj.ak() : "";
-    std::string plain_sk = obj.has_sk() ? obj.sk() : "";
-
-    auto ret = encrypt_ak_sk_helper(plain_ak, plain_sk, &encryption_info, &cipher_ak_sk_pair, code,
-                                    msg);
-    if (ret != 0) {
-        return -1;
-    }
-    TEST_SYNC_POINT_CALLBACK("extract_object_storage_info:get_aksk_pair", &cipher_ak_sk_pair);
-
-    ak = cipher_ak_sk_pair.first;
-    sk = cipher_ak_sk_pair.second;
-    bucket = obj.has_bucket() ? obj.bucket() : "";
-    prefix = obj.has_prefix() ? obj.prefix() : "";
-    endpoint = obj.has_endpoint() ? obj.endpoint() : "";
-    external_endpoint = obj.has_external_endpoint() ? obj.external_endpoint() : "";
-    region = obj.has_region() ? obj.region() : "";
-    use_path_style = obj.use_path_style();
     //  obj size > 1k, refuse
     if (obj.ByteSizeLong() > 1024) {
         code = MetaServiceCode::INVALID_ARGUMENT;
         msg = "s3 obj info greater than 1k " + proto_to_json(*request);
         return -1;
     };
+
+    auto& [ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style, role_arn,
+           external_id] = obj_desc;
+
+    if (!obj.has_role_arn()) {
+        if (!obj.has_ak() || !obj.has_sk()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "s3 obj info err " + proto_to_json(*request);
+            LOG(INFO) << msg;
+            return -1;
+        }
+
+        std::string plain_ak = obj.has_ak() ? obj.ak() : "";
+        std::string plain_sk = obj.has_sk() ? obj.sk() : "";
+        auto ret = encrypt_ak_sk_helper(plain_ak, plain_sk, &encryption_info, &cipher_ak_sk_pair,
+                                        code, msg);
+        if (ret != 0) {
+            return -1;
+        }
+
+        ak = cipher_ak_sk_pair.first;
+        sk = cipher_ak_sk_pair.second;
+    } else {
+        if (obj.has_ak() || obj.has_sk()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = "invaild argument, both set ak/sk and role_arn is not allowed";
+            return -1;
+        }
+
+        role_arn = obj.has_role_arn() ? obj.role_arn() : "";
+        external_id = obj.has_external_id() ? obj.external_id() : "";
+    }
+    TEST_SYNC_POINT_CALLBACK("extract_object_storage_info:get_aksk_pair", &cipher_ak_sk_pair);
+    bucket = obj.has_bucket() ? obj.bucket() : "";
+    prefix = obj.has_prefix() ? obj.prefix() : "";
+    endpoint = obj.has_endpoint() ? obj.endpoint() : "";
+    external_endpoint = obj.has_external_endpoint() ? obj.external_endpoint() : "";
+    region = obj.has_region() ? obj.region() : "";
+    use_path_style = obj.use_path_style();
     return 0;
 }
 
@@ -835,7 +1150,8 @@ static ObjectStoreInfoPB object_info_pb_factory(ObjectStorageDesc& obj_desc,
                                                 EncryptionInfoPB& encryption_info,
                                                 AkSkPair& cipher_ak_sk_pair) {
     ObjectStoreInfoPB last_item;
-    auto& [ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style] = obj_desc;
+    auto& [ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style, role_arn,
+           external_id] = obj_desc;
     auto now_time = std::chrono::system_clock::now();
     uint64_t time =
             std::chrono::duration_cast<std::chrono::seconds>(now_time.time_since_epoch()).count();
@@ -845,9 +1161,16 @@ static ObjectStoreInfoPB object_info_pb_factory(ObjectStorageDesc& obj_desc,
     if (obj.has_user_id()) {
         last_item.set_user_id(obj.user_id());
     }
-    last_item.set_ak(std::move(cipher_ak_sk_pair.first));
-    last_item.set_sk(std::move(cipher_ak_sk_pair.second));
-    last_item.mutable_encryption_info()->CopyFrom(encryption_info);
+
+    if (!obj.has_role_arn()) {
+        last_item.set_ak(std::move(cipher_ak_sk_pair.first));
+        last_item.set_sk(std::move(cipher_ak_sk_pair.second));
+        last_item.mutable_encryption_info()->CopyFrom(encryption_info);
+    } else {
+        last_item.set_role_arn(role_arn);
+        last_item.set_external_id(external_id);
+        last_item.set_cred_provider_type(CredProviderTypePB::INSTANCE_PROFILE);
+    }
     last_item.set_bucket(bucket);
     // format prefix, such as `/aa/bb/`, `aa/bb//`, `//aa/bb`, `  /aa/bb` -> `aa/bb`
     trim(prefix);
@@ -858,6 +1181,7 @@ static ObjectStoreInfoPB object_info_pb_factory(ObjectStorageDesc& obj_desc,
     last_item.set_provider(obj.provider());
     last_item.set_sse_enabled(instance.sse_enabled());
     last_item.set_use_path_style(use_path_style);
+
     return last_item;
 }
 
@@ -865,16 +1189,19 @@ void MetaServiceImpl::alter_storage_vault(google::protobuf::RpcController* contr
                                           const AlterObjStoreInfoRequest* request,
                                           AlterObjStoreInfoResponse* response,
                                           ::google::protobuf::Closure* done) {
-    std::string ak, sk, bucket, prefix, endpoint, external_endpoint, region;
+    std::string ak, sk, bucket, prefix, endpoint, external_endpoint, region, role_arn, external_id;
     bool use_path_style;
     EncryptionInfoPB encryption_info;
     AkSkPair cipher_ak_sk_pair;
-    RPC_PREPROCESS(alter_storage_vault);
+    RPC_PREPROCESS(alter_storage_vault, get, put, del);
     switch (request->op()) {
     case AlterObjStoreInfoRequest::ADD_S3_VAULT:
     case AlterObjStoreInfoRequest::DROP_S3_VAULT: {
-        auto tmp_desc = ObjectStorageDesc {
-                ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style};
+        auto tmp_desc = ObjectStorageDesc {ak,       sk,
+                                           bucket,   prefix,
+                                           endpoint, external_endpoint,
+                                           region,   use_path_style,
+                                           role_arn, external_id};
         if (0 != extract_object_storage_info(request, code, msg, tmp_desc, encryption_info,
                                              cipher_ak_sk_pair)) {
             return;
@@ -945,7 +1272,6 @@ void MetaServiceImpl::alter_storage_vault(google::protobuf::RpcController* contr
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -995,10 +1321,21 @@ void MetaServiceImpl::alter_storage_vault(google::protobuf::RpcController* contr
             return;
         }
         // ATTN: prefix may be empty
-        if (ak.empty() || sk.empty() || bucket.empty() || endpoint.empty() || region.empty()) {
+        if (((ak.empty() || sk.empty()) && role_arn.empty()) || bucket.empty() ||
+            endpoint.empty() || region.empty()) {
             code = MetaServiceCode::INVALID_ARGUMENT;
             msg = "s3 conf info err, please check it";
             return;
+        }
+
+        if (!role_arn.empty()) {
+            if (!obj.has_cred_provider_type() ||
+                obj.cred_provider_type() != CredProviderTypePB::INSTANCE_PROFILE ||
+                !obj.has_provider() || obj.provider() != ObjectStoreInfoPB::S3) {
+                code = MetaServiceCode::INVALID_ARGUMENT;
+                msg = "s3 conf info err with role_arn, please check it";
+                return;
+            }
         }
 
         auto& objs = instance.obj_info();
@@ -1013,8 +1350,11 @@ void MetaServiceImpl::alter_storage_vault(google::protobuf::RpcController* contr
             }
         }
         // calc id
-        auto tmp_tuple = ObjectStorageDesc {
-                ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style};
+        auto tmp_tuple = ObjectStorageDesc {ak,       sk,
+                                            bucket,   prefix,
+                                            endpoint, external_endpoint,
+                                            region,   use_path_style,
+                                            role_arn, external_id};
         ObjectStoreInfoPB last_item = object_info_pb_factory(tmp_tuple, obj, instance,
                                                              encryption_info, cipher_ak_sk_pair);
         if (instance.storage_vault_names().end() !=
@@ -1142,6 +1482,7 @@ void MetaServiceImpl::alter_storage_vault(google::protobuf::RpcController* contr
         return;
     }
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(key, val);
     LOG(INFO) << "put instance_id=" << instance_id << " instance_key=" << hex(key);
     err = txn->commit();
@@ -1156,17 +1497,21 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
                                            const AlterObjStoreInfoRequest* request,
                                            AlterObjStoreInfoResponse* response,
                                            ::google::protobuf::Closure* done) {
-    std::string ak, sk, bucket, prefix, endpoint, external_endpoint, region;
+    std::string ak, sk, bucket, prefix, endpoint, external_endpoint, region, role_arn, external_id;
     bool use_path_style;
     EncryptionInfoPB encryption_info;
     AkSkPair cipher_ak_sk_pair;
-    RPC_PREPROCESS(alter_obj_store_info);
+    RPC_PREPROCESS(alter_obj_store_info, get, put);
     switch (request->op()) {
     case AlterObjStoreInfoRequest::ADD_OBJ_INFO:
     case AlterObjStoreInfoRequest::LEGACY_UPDATE_AK_SK:
+    case AlterObjStoreInfoRequest::ALTER_OBJ_INFO:
     case AlterObjStoreInfoRequest::UPDATE_AK_SK: {
-        auto tmp_desc = ObjectStorageDesc {
-                ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style};
+        auto tmp_desc = ObjectStorageDesc {ak,       sk,
+                                           bucket,   prefix,
+                                           endpoint, external_endpoint,
+                                           region,   use_path_style,
+                                           role_arn, external_id};
         if (0 != extract_object_storage_info(request, code, msg, tmp_desc, encryption_info,
                                              cipher_ak_sk_pair)) {
             return;
@@ -1206,7 +1551,6 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -1238,7 +1582,8 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
     }
 
     switch (request->op()) {
-    case AlterObjStoreInfoRequest::LEGACY_UPDATE_AK_SK: {
+    case AlterObjStoreInfoRequest::LEGACY_UPDATE_AK_SK:
+    case AlterObjStoreInfoRequest::ALTER_OBJ_INFO: {
         // get id
         std::string id = request->obj().has_id() ? request->obj().id() : "0";
         int idx = std::stoi(id);
@@ -1252,20 +1597,55 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
                 const_cast<std::decay_t<decltype(instance.obj_info())>&>(instance.obj_info());
         for (auto& it : obj_info) {
             if (std::stoi(it.id()) == idx) {
-                if (it.ak() == ak && it.sk() == sk) {
-                    // not change, just return ok
-                    code = MetaServiceCode::OK;
-                    msg = "";
-                    return;
+                if (role_arn.empty()) {
+                    if (it.ak() == ak && it.sk() == sk) {
+                        // not change, just return ok
+                        code = MetaServiceCode::OK;
+                        msg = "ak/sk not changed";
+                        return;
+                    }
+                    it.clear_role_arn();
+                    it.clear_external_id();
+                    it.clear_cred_provider_type();
+
+                    it.set_ak(ak);
+                    it.set_sk(sk);
+                    it.mutable_encryption_info()->CopyFrom(encryption_info);
+                } else {
+                    if (!ak.empty() || !sk.empty()) {
+                        code = MetaServiceCode::INVALID_ARGUMENT;
+                        msg = "invaild argument, both set ak/sk and role_arn is not allowed";
+                        LOG(INFO) << msg;
+                        return;
+                    }
+
+                    if (it.provider() != ObjectStoreInfoPB::S3) {
+                        code = MetaServiceCode::INVALID_ARGUMENT;
+                        msg = "role_arn is only supported for s3 provider";
+                        LOG(INFO) << msg << " provider=" << it.provider();
+                        return;
+                    }
+
+                    if (it.role_arn() == role_arn && it.external_id() == external_id) {
+                        // not change, just return ok
+                        code = MetaServiceCode::OK;
+                        msg = "ak/sk not changed";
+                        return;
+                    }
+                    it.clear_ak();
+                    it.clear_sk();
+                    it.clear_encryption_info();
+
+                    it.set_role_arn(role_arn);
+                    it.set_external_id(external_id);
+                    it.set_cred_provider_type(CredProviderTypePB::INSTANCE_PROFILE);
                 }
+
                 auto now_time = std::chrono::system_clock::now();
                 uint64_t time = std::chrono::duration_cast<std::chrono::seconds>(
                                         now_time.time_since_epoch())
                                         .count();
                 it.set_mtime(time);
-                it.set_ak(ak);
-                it.set_sk(sk);
-                it.mutable_encryption_info()->CopyFrom(encryption_info);
             }
         }
     } break;
@@ -1287,8 +1667,8 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
             return;
         }
         // ATTN: prefix may be empty
-        if (ak.empty() || sk.empty() || bucket.empty() || endpoint.empty() || region.empty() ||
-            prefix.empty()) {
+        if (((ak.empty() || sk.empty()) && role_arn.empty()) || bucket.empty() ||
+            endpoint.empty() || region.empty() || prefix.empty()) {
             code = MetaServiceCode::INVALID_ARGUMENT;
             msg = "s3 conf info err, please check it";
             return;
@@ -1306,8 +1686,11 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
             }
         }
         // calc id
-        auto tmp_tuple = ObjectStorageDesc {
-                ak, sk, bucket, prefix, endpoint, external_endpoint, region, use_path_style};
+        auto tmp_tuple = ObjectStorageDesc {ak,       sk,
+                                            bucket,   prefix,
+                                            endpoint, external_endpoint,
+                                            region,   use_path_style,
+                                            role_arn, external_id};
         ObjectStoreInfoPB last_item = object_info_pb_factory(tmp_tuple, obj, instance,
                                                              encryption_info, cipher_ak_sk_pair);
         instance.add_obj_info()->CopyFrom(last_item);
@@ -1331,6 +1714,7 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
         return;
     }
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(key, val);
     LOG(INFO) << "put instance_id=" << instance_id << " instance_key=" << hex(key);
     err = txn->commit();
@@ -1344,7 +1728,7 @@ void MetaServiceImpl::alter_obj_store_info(google::protobuf::RpcController* cont
 void MetaServiceImpl::update_ak_sk(google::protobuf::RpcController* controller,
                                    const UpdateAkSkRequest* request, UpdateAkSkResponse* response,
                                    ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(update_ak_sk);
+    RPC_PREPROCESS(update_ak_sk, get, put);
     instance_id = request->has_instance_id() ? request->instance_id() : "";
     if (instance_id.empty()) {
         msg = "instance id not set";
@@ -1363,7 +1747,6 @@ void MetaServiceImpl::update_ak_sk(google::protobuf::RpcController* controller,
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -1400,119 +1783,8 @@ void MetaServiceImpl::update_ak_sk(google::protobuf::RpcController* controller,
 
     std::stringstream update_record;
 
-    // if has ram_user, encrypt and save it
-    if (request->has_ram_user()) {
-        if (request->ram_user().user_id().empty() || request->ram_user().ak().empty() ||
-            request->ram_user().sk().empty()) {
-            code = MetaServiceCode::INVALID_ARGUMENT;
-            msg = "ram user info err " + proto_to_json(*request);
-            return;
-        }
-        if (!instance.has_ram_user()) {
-            code = MetaServiceCode::INVALID_ARGUMENT;
-            msg = "instance doesn't have ram user info";
-            return;
-        }
-        auto& ram_user = request->ram_user();
-        EncryptionInfoPB encryption_info;
-        AkSkPair cipher_ak_sk_pair;
-        if (encrypt_ak_sk_helper(ram_user.ak(), ram_user.sk(), &encryption_info, &cipher_ak_sk_pair,
-                                 code, msg) != 0) {
-            return;
-        }
-        const auto& [ak, sk] = cipher_ak_sk_pair;
-        auto& instance_ram_user = *instance.mutable_ram_user();
-        if (ram_user.user_id() != instance_ram_user.user_id()) {
-            code = MetaServiceCode::INVALID_ARGUMENT;
-            msg = "ram user_id err";
-            return;
-        }
-        std::string old_ak = instance_ram_user.ak();
-        std::string old_sk = instance_ram_user.sk();
-        if (old_ak == ak && old_sk == sk) {
-            code = MetaServiceCode::INVALID_ARGUMENT;
-            msg = "ak sk eq original, please check it";
-            return;
-        }
-        instance_ram_user.set_ak(std::move(cipher_ak_sk_pair.first));
-        instance_ram_user.set_sk(std::move(cipher_ak_sk_pair.second));
-        instance_ram_user.mutable_encryption_info()->CopyFrom(encryption_info);
-        update_record << "update ram_user's ak sk, instance_id: " << instance_id
-                      << " user_id: " << ram_user.user_id() << " old:  cipher ak: " << old_ak
-                      << " cipher sk: " << old_sk << " new: cipher ak: " << ak
-                      << " cipher sk: " << sk;
-    }
-
-    bool has_found_alter_obj_info = false;
-    for (auto& alter_bucket_user : request->internal_bucket_user()) {
-        if (!alter_bucket_user.has_ak() || !alter_bucket_user.has_sk() ||
-            !alter_bucket_user.has_user_id()) {
-            code = MetaServiceCode::INVALID_ARGUMENT;
-            msg = "s3 bucket info err " + proto_to_json(*request);
-            return;
-        }
-        std::string user_id = alter_bucket_user.user_id();
-        EncryptionInfoPB encryption_info;
-        AkSkPair cipher_ak_sk_pair;
-        if (encrypt_ak_sk_helper(alter_bucket_user.ak(), alter_bucket_user.sk(), &encryption_info,
-                                 &cipher_ak_sk_pair, code, msg) != 0) {
-            return;
-        }
-        const auto& [ak, sk] = cipher_ak_sk_pair;
-        auto& obj_info =
-                const_cast<std::decay_t<decltype(instance.obj_info())>&>(instance.obj_info());
-        for (auto& it : obj_info) {
-            std::string old_ak = it.ak();
-            std::string old_sk = it.sk();
-            if (!it.has_user_id()) {
-                has_found_alter_obj_info = true;
-                // For compatibility, obj_info without a user_id only allow
-                // single internal_bucket_user to modify it.
-                if (request->internal_bucket_user_size() != 1) {
-                    code = MetaServiceCode::INVALID_ARGUMENT;
-                    msg = "fail to update old instance's obj_info, s3 obj info err " +
-                          proto_to_json(*request);
-                    return;
-                }
-                if (it.ak() == ak && it.sk() == sk) {
-                    code = MetaServiceCode::INVALID_ARGUMENT;
-                    msg = "ak sk eq original, please check it";
-                    return;
-                }
-                it.set_mtime(time);
-                it.set_user_id(user_id);
-                it.set_ak(ak);
-                it.set_sk(sk);
-                it.mutable_encryption_info()->CopyFrom(encryption_info);
-                update_record << "update obj_info's ak sk without user_id, instance_id: "
-                              << instance_id << " obj_info_id: " << it.id()
-                              << " new user_id: " << user_id << " old:  cipher ak: " << old_ak
-                              << " cipher sk: " << old_sk << " new:  cipher ak: " << ak
-                              << " cipher sk: " << sk;
-                continue;
-            }
-            if (it.user_id() == user_id) {
-                has_found_alter_obj_info = true;
-                if (it.ak() == ak && it.sk() == sk) {
-                    code = MetaServiceCode::INVALID_ARGUMENT;
-                    msg = "ak sk eq original, please check it";
-                    return;
-                }
-                it.set_mtime(time);
-                it.set_ak(ak);
-                it.set_sk(sk);
-                it.mutable_encryption_info()->CopyFrom(encryption_info);
-                update_record << "update obj_info's ak sk, instance_id: " << instance_id
-                              << " obj_info_id: " << it.id() << " user_id: " << user_id
-                              << " old:  cipher ak: " << old_ak << " cipher sk: " << old_sk
-                              << " new:  cipher ak: " << ak << " cipher sk: " << sk;
-            }
-        }
-    }
-
-    if (!request->internal_bucket_user().empty() && !has_found_alter_obj_info) {
-        code = MetaServiceCode::INVALID_ARGUMENT;
-        msg = "fail to find the alter obj info";
+    // Update instance using helper function
+    if (update_instance_ak_sk(instance, request, time, code, msg, update_record) != 0) {
         return;
     }
 
@@ -1527,22 +1799,113 @@ void MetaServiceImpl::update_ak_sk(google::protobuf::RpcController* controller,
         return;
     }
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(key, val);
     LOG(INFO) << "put instance_id=" << instance_id << " instance_key=" << hex(key);
+
+    // Commit root instance first to avoid transaction timeout
     err = txn->commit();
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::COMMIT>(err);
-        msg = fmt::format("failed to commit kv txn, err={}", err);
+        msg = fmt::format("failed to commit root instance kv txn, err={}", err);
         LOG(WARNING) << msg;
+        return;
     }
+
     LOG(INFO) << update_record.str();
+    async_notify_refresh_instance(txn_kv_, instance_id, true);
+
+    // Cascade update to derived instances using separate transactions
+    // update_ak_sk is idempotent, so it's safe to use independent transactions
+    if (!(instance.snapshot_switch_status() == SNAPSHOT_SWITCH_ON)) {
+        LOG(INFO) << "snapshot disabled for instance_id=" << instance_id
+                  << ", skip cascade updating derived instances";
+        return;
+    }
+
+    std::vector<std::string> cascade_instance_ids;
+    if (find_cascade_instances(txn_kv_.get(), instance_id, &cascade_instance_ids) != 0) {
+        LOG(WARNING) << "failed to find derived instances for cascade update, instance_id="
+                     << instance_id << ", root instance already updated successfully";
+        return;
+    }
+
+    std::string cascade_ids_str;
+    for (size_t i = 0; i < cascade_instance_ids.size(); ++i) {
+        if (i > 0) cascade_ids_str += ", ";
+        cascade_ids_str += cascade_instance_ids[i];
+    }
+    LOG(INFO) << "Found " << cascade_instance_ids.size()
+              << " derived instances to cascade update: [" << cascade_ids_str << "]";
+
+    for (const auto& cascade_id : cascade_instance_ids) {
+        // Use a separate transaction for each derived instance
+        std::unique_ptr<Transaction> cascade_txn;
+        TxnErrorCode cascade_err = txn_kv_->create_txn(&cascade_txn);
+        if (cascade_err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to create txn for derived instance, instance_id=" << cascade_id
+                         << " err=" << cascade_err;
+            continue;
+        }
+
+        InstanceKeyInfo cascade_key_info {cascade_id};
+        std::string cascade_key;
+        std::string cascade_val;
+        instance_key(cascade_key_info, &cascade_key);
+
+        cascade_err = cascade_txn->get(cascade_key, &cascade_val);
+        if (cascade_err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to get derived instance, instance_id=" << cascade_id
+                         << " err=" << cascade_err;
+            continue;
+        }
+
+        InstanceInfoPB cascade_instance;
+        if (!cascade_instance.ParseFromString(cascade_val)) {
+            LOG(WARNING) << "failed to parse InstanceInfoPB for derived instance_id=" << cascade_id;
+            continue;
+        }
+
+        // Update the cascade instance using helper function
+        std::stringstream cascade_update_record;
+        MetaServiceCode cascade_code = MetaServiceCode::OK;
+        std::string cascade_msg;
+        if (update_instance_ak_sk(cascade_instance, request, time, cascade_code, cascade_msg,
+                                  cascade_update_record) != 0) {
+            LOG(WARNING) << "failed to update derived instance, instance_id=" << cascade_id
+                         << " msg=" << cascade_msg;
+            continue;
+        }
+
+        cascade_val = cascade_instance.SerializeAsString();
+        if (cascade_val.empty()) {
+            LOG(WARNING) << "failed to serialize derived instance, instance_id=" << cascade_id;
+            continue;
+        }
+
+        cascade_txn->put(cascade_key, cascade_val);
+
+        cascade_err = cascade_txn->commit();
+        if (cascade_err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to commit derived instance txn, instance_id=" << cascade_id
+                         << " err=" << cascade_err;
+            continue;
+        }
+
+        async_notify_refresh_instance(txn_kv_, cascade_id, true);
+        LOG(INFO) << "cascade update for instance_id=" << cascade_id << " "
+                  << cascade_update_record.str();
+    }
 }
 
 void MetaServiceImpl::create_instance(google::protobuf::RpcController* controller,
                                       const CreateInstanceRequest* request,
                                       CreateInstanceResponse* response,
                                       ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(create_instance);
+    TEST_SYNC_POINT_CALLBACK("create_instance_sk_request",
+                             const_cast<CreateInstanceRequest**>(&request));
+    RPC_PREPROCESS(create_instance, get, put);
+    TEST_SYNC_POINT_RETURN_WITH_VOID("create_instance_sk_request_return");
     if (request->has_ram_user()) {
         auto& ram_user = request->ram_user();
         std::string ram_user_id = ram_user.has_user_id() ? ram_user.user_id() : "";
@@ -1587,6 +1950,15 @@ void MetaServiceImpl::create_instance(google::protobuf::RpcController* controlle
         new_ram_user.mutable_encryption_info()->CopyFrom(encryption_info);
         instance.mutable_ram_user()->CopyFrom(new_ram_user);
     }
+    if (config::enable_multi_version_status) {
+        instance.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_READ_WRITE);
+        instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_OFF);
+        if (config::enable_cluster_snapshot) {
+            instance.set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+            instance.set_snapshot_interval_seconds(config::snapshot_min_interval_seconds);
+            instance.set_max_reserved_snapshot(1);
+        }
+    }
 
     if (instance.instance_id().empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -1594,7 +1966,6 @@ void MetaServiceImpl::create_instance(google::protobuf::RpcController* controlle
         return;
     }
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -1621,6 +1992,10 @@ void MetaServiceImpl::create_instance(google::protobuf::RpcController* controlle
         return;
     }
 
+    for (auto& obj_info : *instance.mutable_obj_info()) {
+        obj_info.set_ak(hide_access_key(obj_info.ak()));
+    }
+
     LOG(INFO) << "xxx instance json=" << proto_to_json(instance);
 
     // Check existence before proceeding
@@ -1637,6 +2012,7 @@ void MetaServiceImpl::create_instance(google::protobuf::RpcController* controlle
         return;
     }
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(key, val);
     LOG(INFO) << "put instance_id=" << request->instance_id() << " instance_key=" << hex(key);
     err = txn->commit();
@@ -1645,6 +2021,129 @@ void MetaServiceImpl::create_instance(google::protobuf::RpcController* controlle
         msg = fmt::format("failed to commit kv txn, err={}", err);
         LOG(WARNING) << msg;
     }
+
+    async_notify_refresh_instance(
+            txn_kv_, request->instance_id(), /*include_self=*/true,
+            [instance_id = request->instance_id()](const KVStats& stats) {
+                if (config::use_detailed_metrics && !instance_id.empty()) {
+                    g_bvar_rpc_kv_create_instance_get_bytes.put({instance_id}, stats.get_bytes);
+                    g_bvar_rpc_kv_create_instance_get_counter.put({instance_id}, stats.get_counter);
+                }
+            });
+}
+
+std::pair<MetaServiceCode, std::string> handle_snapshot_switch(const std::string& instance_id,
+                                                               const std::string& value,
+                                                               InstanceInfoPB* instance) {
+    const std::string& property_name =
+            AlterInstanceRequest::SnapshotProperty_Name(AlterInstanceRequest::ENABLE_SNAPSHOT);
+    if (value != "true" && value != "false") {
+        return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                              "Invalid value for " + property_name + " property: " + value +
+                                      ", expected 'true' or 'false'" +
+                                      ", instance_id: " + instance_id);
+    }
+
+    // Check if snapshot is not ready (UNSUPPORTED state)
+    if (!instance->has_snapshot_switch_status() ||
+        instance->snapshot_switch_status() == SNAPSHOT_SWITCH_DISABLED) {
+        return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                              "Snapshot is not ready, instance_id: " + instance_id);
+    } else if (value == "false" && instance->snapshot_switch_status() == SNAPSHOT_SWITCH_OFF) {
+        return std::make_pair(
+                MetaServiceCode::INVALID_ARGUMENT,
+                "Snapshot is already set to SNAPSHOT_SWITCH_OFF, instance_id: " + instance_id);
+    } else if (value == "true" && instance->multi_version_status() != MULTI_VERSION_READ_WRITE) {
+        // If the multi_version_status is not READ_WRITE, cannot enable snapshot because the
+        // operation logs will be recycled directly since min_versionstamp is not set when multi
+        // version status is WRITE_ONLY
+        std::string url =
+                "${MS_ENDPOINT}/MetaService/http/"
+                "set_multi_version_status?multi_version_status=MULTI_VERSION_READ_WRITE";
+        return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                              fmt::format("Cannot enable snapshot when multi_version_status is not "
+                                          "MULTI_VERSION_READ_WRITE. Consider enabling "
+                                          "MULTI_VERSION_READ_WRITE status by curl {}",
+                                          instance_id));
+    } else if (value == "true") {
+        instance->set_snapshot_switch_status(SNAPSHOT_SWITCH_ON);
+
+        // Set default values when first enabling snapshot
+        if (!instance->has_snapshot_interval_seconds() ||
+            instance->snapshot_interval_seconds() == 0) {
+            instance->set_snapshot_interval_seconds(config::snapshot_min_interval_seconds);
+            LOG(INFO) << "Set default snapshot_interval_seconds to "
+                      << config::snapshot_min_interval_seconds << " for instance " << instance_id;
+        }
+        if (!instance->has_max_reserved_snapshot()) {
+            // Disable auto snapshot by default
+            instance->set_max_reserved_snapshot(0);
+            LOG(INFO) << "Set default max_reserved_snapshots to 0 for instance " << instance_id;
+        }
+    } else {
+        instance->set_snapshot_switch_status(SNAPSHOT_SWITCH_OFF);
+    }
+
+    LOG(INFO) << "Set snapshot " + property_name + " to " + value + " for instance " + instance_id;
+
+    return std::make_pair(MetaServiceCode::OK, "");
+}
+
+std::pair<MetaServiceCode, std::string> handle_max_reserved_snapshots(
+        const std::string& instance_id, const std::string& value, InstanceInfoPB* instance) {
+    const std::string& property_name = AlterInstanceRequest::SnapshotProperty_Name(
+            AlterInstanceRequest::MAX_RESERVED_SNAPSHOTS);
+
+    int max_snapshots;
+    try {
+        max_snapshots = std::stoi(value);
+        if (max_snapshots < 0) {
+            return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                                  property_name + " must be non-negative, got: " + value);
+        }
+        if (max_snapshots > config::snapshot_max_reserved_num) {
+            return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                                  property_name + " too large, maximum is " +
+                                          std::to_string(config::snapshot_max_reserved_num) +
+                                          ", got: " + value);
+        }
+    } catch (const std::exception& e) {
+        return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                              "Invalid numeric value for max_reserved_snapshots: " + value);
+    }
+
+    instance->set_max_reserved_snapshot(max_snapshots);
+
+    LOG(INFO) << "Set " + property_name + " to " + value + " for instance " + instance_id;
+
+    return std::make_pair(MetaServiceCode::OK, "");
+}
+
+std::pair<MetaServiceCode, std::string> handle_snapshot_intervals(const std::string& instance_id,
+                                                                  const std::string& value,
+                                                                  InstanceInfoPB* instance) {
+    const std::string& property_name = AlterInstanceRequest::SnapshotProperty_Name(
+            AlterInstanceRequest::SNAPSHOT_INTERVAL_SECONDS);
+
+    int intervals;
+    try {
+        intervals = std::stoi(value);
+        if (intervals < config::snapshot_min_interval_seconds) {
+            return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                                  property_name + " too small, minimum is " +
+                                          std::to_string(config::snapshot_min_interval_seconds) +
+                                          " seconds, got: " + value);
+        }
+    } catch (const std::exception& e) {
+        return std::make_pair(MetaServiceCode::INVALID_ARGUMENT,
+                              "Invalid numeric value for " + property_name + ": " + value);
+    }
+
+    instance->set_snapshot_interval_seconds(intervals);
+
+    LOG(INFO) << "Set " + property_name + " to " + value + " seconds for instance " + instance_id;
+
+    return std::make_pair(MetaServiceCode::OK, "");
 }
 
 void MetaServiceImpl::alter_instance(google::protobuf::RpcController* controller,
@@ -1660,17 +2159,16 @@ void MetaServiceImpl::alter_instance(google::protobuf::RpcController* controller
     std::string msg = "OK";
     [[maybe_unused]] std::stringstream ss;
     std::string instance_id = request->has_instance_id() ? request->instance_id() : "";
-    std::unique_ptr<int, std::function<void(int*)>> defer_status(
-            (int*)0x01, [&code, &msg, &response, &ctrl, &closure_guard, &sw, &instance_id](int*) {
-                response->mutable_status()->set_code(code);
-                response->mutable_status()->set_msg(msg);
-                LOG(INFO) << (code == MetaServiceCode::OK ? "succ to " : "failed to ")
-                          << __PRETTY_FUNCTION__ << " " << ctrl->remote_side() << " " << msg;
-                closure_guard.reset(nullptr);
-                if (config::use_detailed_metrics && !instance_id.empty()) {
-                    g_bvar_ms_alter_instance.put(instance_id, sw.elapsed_us());
-                }
-            });
+    DORIS_CLOUD_DEFER {
+        response->mutable_status()->set_code(code);
+        response->mutable_status()->set_msg(msg);
+        LOG(INFO) << (code == MetaServiceCode::OK ? "succ to " : "failed to ")
+                  << __PRETTY_FUNCTION__ << " " << ctrl->remote_side() << " " << msg;
+        closure_guard.reset(nullptr);
+        if (config::use_detailed_metrics && !instance_id.empty()) {
+            g_bvar_ms_alter_instance.put(instance_id, sw.elapsed_us());
+        }
+    };
 
     std::pair<MetaServiceCode, std::string> ret;
     switch (request->op()) {
@@ -1837,6 +2335,75 @@ void MetaServiceImpl::alter_instance(google::protobuf::RpcController* controller
             return std::make_pair(MetaServiceCode::OK, ret);
         });
     } break;
+    /**
+     * Handle SET_SNAPSHOT_PROPERTY operation - configures snapshot-related properties for an instance.
+     *
+     * Supported property keys and their expected values:
+     * - "ENABLE_SNAPSHOT": "true" | "false"
+     *   Controls whether snapshot functionality is enabled for the instance
+     *
+     * - "MAX_RESERVED_SNAPSHOTS": numeric string (0-config::snapshot_max_reserved_num)
+     *   Sets the maximum number of snapshots to retain for the instance
+     *
+     * - "SNAPSHOT_INTERVAL_SECONDS": numeric string (config::snapshot_min_interval_seconds-max)
+     *   Sets the snapshot creation interval in seconds (minimum controlled by config)
+     *
+     * Each property is validated by its respective handler function which ensures
+     * the provided values conform to the expected format and constraints.
+     */
+    case AlterInstanceRequest::SET_SNAPSHOT_PROPERTY: {
+        ret = alter_instance(request, [&request, &instance_id](InstanceInfoPB* instance) {
+            std::string msg;
+            auto properties = request->properties();
+            if (properties.empty()) {
+                msg = "snapshot properties is empty, instance_id = " + request->instance_id();
+                LOG(WARNING) << msg;
+                return std::make_pair(MetaServiceCode::INVALID_ARGUMENT, msg);
+            }
+            for (const auto& property : properties) {
+                std::string key = property.first;
+                std::string value = property.second;
+                AlterInstanceRequest::SnapshotProperty snapshot_property =
+                        AlterInstanceRequest::UNKNOWN_PROPERTY;
+                if (!AlterInstanceRequest_SnapshotProperty_Parse(key, &snapshot_property) ||
+                    snapshot_property == AlterInstanceRequest::UNKNOWN_PROPERTY) {
+                    msg = "unknown snapshot property: " + key;
+                    LOG(WARNING) << "alter instance failed: " << msg
+                                 << ", instance_id = " << instance_id;
+                    return std::make_pair(MetaServiceCode::INVALID_ARGUMENT, msg);
+                }
+
+                std::pair<MetaServiceCode, std::string> result;
+
+                if (snapshot_property == AlterInstanceRequest::ENABLE_SNAPSHOT) {
+                    result = handle_snapshot_switch(request->instance_id(), value, instance);
+                } else if (snapshot_property == AlterInstanceRequest::MAX_RESERVED_SNAPSHOTS) {
+                    result = handle_max_reserved_snapshots(request->instance_id(), value, instance);
+                } else if (snapshot_property == AlterInstanceRequest::SNAPSHOT_INTERVAL_SECONDS) {
+                    result = handle_snapshot_intervals(request->instance_id(), value, instance);
+                } else {
+                    msg = "unsupported property: " + key;
+                    LOG(WARNING) << "alter instance failed: " << msg
+                                 << ", instance_id = " << instance_id;
+                    return std::make_pair(MetaServiceCode::INVALID_ARGUMENT, msg);
+                }
+
+                if (result.first != MetaServiceCode::OK) {
+                    return result;
+                }
+            }
+
+            std::string ret = instance->SerializeAsString();
+            if (ret.empty()) {
+                msg = "failed to serialize";
+                LOG(WARNING) << msg;
+                return std::make_pair(MetaServiceCode::PROTOBUF_SERIALIZE_ERR, msg);
+            }
+            LOG(INFO) << "put instance_id=" << request->instance_id()
+                      << "set instance snapshot property json=" << proto_to_json(*instance);
+            return std::make_pair(MetaServiceCode::OK, ret);
+        });
+    } break;
     default: {
         ss << "invalid request op, op=" << request->op();
         ret = std::make_pair(MetaServiceCode::INVALID_ARGUMENT, ss.str());
@@ -1847,20 +2414,15 @@ void MetaServiceImpl::alter_instance(google::protobuf::RpcController* controller
 
     if (request->op() == AlterInstanceRequest::REFRESH) return;
 
-    auto f = new std::function<void()>([instance_id = request->instance_id(), txn_kv = txn_kv_] {
-        notify_refresh_instance(txn_kv, instance_id);
-    });
-    bthread_t bid;
-    if (bthread_start_background(&bid, nullptr, run_bthread_work, f) != 0) {
-        LOG(WARNING) << "notify refresh instance inplace, instance_id=" << request->instance_id();
-        run_bthread_work(f);
-    }
+    async_notify_refresh_instance(txn_kv_, request->instance_id(), /*include_self=*/false);
 }
 
 void MetaServiceImpl::get_instance(google::protobuf::RpcController* controller,
                                    const GetInstanceRequest* request, GetInstanceResponse* response,
                                    ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_instance);
+    RPC_PREPROCESS(get_instance, get);
+    TEST_SYNC_POINT_CALLBACK("get_instance_sk_response", &response);
+    TEST_SYNC_POINT_RETURN_WITH_VOID("get_instance_sk_response_return");
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -1880,7 +2442,6 @@ void MetaServiceImpl::get_instance(google::protobuf::RpcController* controller,
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -1959,6 +2520,7 @@ std::pair<MetaServiceCode, std::string> MetaServiceImpl::alter_instance(
         return r;
     }
     val = r.second;
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(key, val);
     err = txn->commit();
     if (err != TxnErrorCode::TXN_OK) {
@@ -1970,13 +2532,441 @@ std::pair<MetaServiceCode, std::string> MetaServiceImpl::alter_instance(
     return std::make_pair(code, msg);
 }
 
+void handle_add_cluster(const std::string& instance_id, const ClusterInfo& cluster,
+                        std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                        MetaServiceCode& code) {
+    auto r = resource_mgr->add_cluster(instance_id, cluster);
+    code = r.first;
+    msg = r.second;
+}
+
+void handle_drop_cluster(const std::string& instance_id, const ClusterInfo& cluster,
+                         std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                         MetaServiceCode& code) {
+    auto r = resource_mgr->drop_cluster(instance_id, cluster);
+    code = r.first;
+    msg = r.second;
+}
+
+void handle_update_cluster_mySQL_username(const std::string& instance_id,
+                                          const ClusterInfo& cluster,
+                                          std::shared_ptr<ResourceManager> resource_mgr,
+                                          std::string& msg, MetaServiceCode& code) {
+    msg = resource_mgr->update_cluster(
+            instance_id, cluster,
+            [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
+            [&](ClusterPB& c, std::vector<ClusterPB>&) {
+                auto& mysql_user_names = cluster.cluster.mysql_user_name();
+                c.mutable_mysql_user_name()->CopyFrom(mysql_user_names);
+                return "";
+            });
+}
+
+void handle_add_node(const std::string& instance_id, const AlterClusterRequest* request,
+                     std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                     MetaServiceCode& code) {
+    resource_mgr->check_cluster_params_valid(request->cluster(), &msg, false, false);
+    if (!msg.empty()) {
+        LOG(WARNING) << msg;
+        return;
+    }
+    std::vector<NodeInfo> to_add;
+    std::vector<NodeInfo> to_del;
+    for (auto& n : request->cluster().nodes()) {
+        NodeInfo node;
+        node.instance_id = request->instance_id();
+        node.node_info = n;
+        node.cluster_id = request->cluster().cluster_id();
+        node.cluster_name = request->cluster().cluster_name();
+        node.role = (request->cluster().type() == ClusterPB::SQL
+                             ? Role::SQL_SERVER
+                             : (request->cluster().type() == ClusterPB::COMPUTE ? Role::COMPUTE_NODE
+                                                                                : Role::UNDEFINED));
+        node.node_info.set_status(NodeStatusPB::NODE_STATUS_RUNNING);
+        to_add.emplace_back(std::move(node));
+    }
+    msg = resource_mgr->modify_nodes(instance_id, to_add, to_del);
+}
+
+void handle_drop_node(const std::string& instance_id, const AlterClusterRequest* request,
+                      std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                      MetaServiceCode& code) {
+    resource_mgr->check_cluster_params_valid(request->cluster(), &msg, false, false);
+    if (!msg.empty()) {
+        LOG(WARNING) << msg;
+        return;
+    }
+    std::vector<NodeInfo> to_add;
+    std::vector<NodeInfo> to_del;
+    for (auto& n : request->cluster().nodes()) {
+        NodeInfo node;
+        node.instance_id = request->instance_id();
+        node.node_info = n;
+        node.cluster_id = request->cluster().cluster_id();
+        node.cluster_name = request->cluster().cluster_name();
+        node.role = (request->cluster().type() == ClusterPB::SQL
+                             ? Role::SQL_SERVER
+                             : (request->cluster().type() == ClusterPB::COMPUTE ? Role::COMPUTE_NODE
+                                                                                : Role::UNDEFINED));
+        to_del.emplace_back(std::move(node));
+    }
+    msg = resource_mgr->modify_nodes(instance_id, to_add, to_del);
+}
+
+void handle_decommission_node(const std::string& instance_id, const AlterClusterRequest* request,
+                              std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                              MetaServiceCode& code) {
+    resource_mgr->check_cluster_params_valid(request->cluster(), &msg, false, false);
+    if (msg != "") {
+        LOG(WARNING) << msg;
+        return;
+    }
+
+    std::string be_unique_id = (request->cluster().nodes())[0].cloud_unique_id();
+    std::vector<NodeInfo> nodes;
+    std::string err = resource_mgr->get_node(be_unique_id, &nodes);
+    if (!err.empty()) {
+        LOG(INFO) << "failed to check instance info, err=" << err;
+        msg = err;
+        return;
+    }
+
+    std::vector<NodeInfo> decomission_nodes;
+    for (auto& node : nodes) {
+        for (auto req_node : request->cluster().nodes()) {
+            bool ip_processed = false;
+            if (node.node_info.has_ip() && req_node.has_ip()) {
+                std::string endpoint =
+                        node.node_info.ip() + ":" + std::to_string(node.node_info.heartbeat_port());
+                std::string req_endpoint =
+                        req_node.ip() + ":" + std::to_string(req_node.heartbeat_port());
+                if (endpoint == req_endpoint) {
+                    decomission_nodes.push_back(node);
+                    node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONING);
+                }
+                ip_processed = true;
+            }
+
+            if (!ip_processed && node.node_info.has_host() && req_node.has_host()) {
+                std::string endpoint = node.node_info.host() + ":" +
+                                       std::to_string(node.node_info.heartbeat_port());
+                std::string req_endpoint =
+                        req_node.host() + ":" + std::to_string(req_node.heartbeat_port());
+                if (endpoint == req_endpoint) {
+                    decomission_nodes.push_back(node);
+                    node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONING);
+                }
+            }
+        }
+    }
+
+    {
+        std::vector<NodeInfo> to_add;
+        std::vector<NodeInfo>& to_del = decomission_nodes;
+        msg = resource_mgr->modify_nodes(instance_id, to_add, to_del);
+    }
+    {
+        std::vector<NodeInfo>& to_add = decomission_nodes;
+        std::vector<NodeInfo> to_del;
+        for (auto& node : to_add) {
+            node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONING);
+            LOG(INFO) << "decomission node, "
+                      << "size: " << to_add.size() << " " << node.node_info.DebugString() << " "
+                      << node.cluster_id << " " << node.cluster_name;
+        }
+        msg = resource_mgr->modify_nodes(instance_id, to_add, to_del);
+    }
+}
+
+void handle_notify_decommissioned(const std::string& instance_id,
+                                  const AlterClusterRequest* request,
+                                  std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                                  MetaServiceCode& code) {
+    resource_mgr->check_cluster_params_valid(request->cluster(), &msg, false, false);
+    if (msg != "") {
+        LOG(WARNING) << msg;
+        return;
+    }
+
+    std::string be_unique_id = (request->cluster().nodes())[0].cloud_unique_id();
+    std::vector<NodeInfo> nodes;
+    std::string err = resource_mgr->get_node(be_unique_id, &nodes);
+    if (!err.empty()) {
+        LOG(INFO) << "failed to check instance info, err=" << err;
+        msg = err;
+        return;
+    }
+
+    std::vector<NodeInfo> decomission_nodes;
+    for (auto& node : nodes) {
+        for (auto req_node : request->cluster().nodes()) {
+            bool ip_processed = false;
+            if (node.node_info.has_ip() && req_node.has_ip()) {
+                std::string endpoint =
+                        node.node_info.ip() + ":" + std::to_string(node.node_info.heartbeat_port());
+                std::string req_endpoint =
+                        req_node.ip() + ":" + std::to_string(req_node.heartbeat_port());
+                if (endpoint == req_endpoint) {
+                    decomission_nodes.push_back(node);
+                }
+                ip_processed = true;
+            }
+
+            if (!ip_processed && node.node_info.has_host() && req_node.has_host()) {
+                std::string endpoint = node.node_info.host() + ":" +
+                                       std::to_string(node.node_info.heartbeat_port());
+                std::string req_endpoint =
+                        req_node.host() + ":" + std::to_string(req_node.heartbeat_port());
+                if (endpoint == req_endpoint) {
+                    decomission_nodes.push_back(node);
+                }
+            }
+        }
+    }
+
+    {
+        std::vector<NodeInfo> to_add;
+        std::vector<NodeInfo>& to_del = decomission_nodes;
+        msg = resource_mgr->modify_nodes(instance_id, to_add, to_del);
+    }
+    {
+        std::vector<NodeInfo>& to_add = decomission_nodes;
+        std::vector<NodeInfo> to_del;
+        for (auto& node : to_add) {
+            node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONED);
+            LOG(INFO) << "notify node decomissioned, "
+                      << " size: " << to_add.size() << " " << node.node_info.DebugString() << " "
+                      << node.cluster_id << " " << node.cluster_name;
+        }
+        msg = resource_mgr->modify_nodes(instance_id, to_add, to_del);
+    }
+}
+
+void handle_rename_cluster(const std::string& instance_id, const ClusterInfo& cluster,
+                           std::shared_ptr<ResourceManager> resource_mgr, bool replace,
+                           std::string& msg, MetaServiceCode& code) {
+    msg = resource_mgr->update_cluster(
+            instance_id, cluster,
+            [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
+            [&](ClusterPB& c, std::vector<ClusterPB>& clusters_in_instance) {
+                std::string msg;
+                std::stringstream ss;
+                std::set<std::string> cluster_names;
+                for (auto cluster_in_instance : clusters_in_instance) {
+                    cluster_names.emplace(cluster_in_instance.cluster_name());
+                }
+                auto it = cluster_names.find(cluster.cluster.cluster_name());
+                LOG(INFO) << "cluster.cluster.cluster_name(): " << cluster.cluster.cluster_name();
+                for (auto itt : cluster_names) {
+                    LOG(INFO) << "instance's cluster name : " << itt;
+                }
+                if (it != cluster_names.end()) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    ss << "failed to rename cluster, a cluster with the same name already exists "
+                          "in this instance "
+                       << proto_to_json(c);
+                    msg = ss.str();
+                    return msg;
+                }
+                if (c.cluster_name() == cluster.cluster.cluster_name()) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    ss << "failed to rename cluster, name eq original name, original cluster is "
+                       << proto_to_json(c);
+                    msg = ss.str();
+                    return msg;
+                }
+                c.set_cluster_name(cluster.cluster.cluster_name());
+                return msg;
+            },
+            replace);
+}
+
+void handle_update_cluster_endpoint(const std::string& instance_id, const ClusterInfo& cluster,
+                                    std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                                    MetaServiceCode& code) {
+    msg = resource_mgr->update_cluster(
+            instance_id, cluster,
+            [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
+            [&](ClusterPB& c, std::vector<ClusterPB>&) {
+                std::string msg;
+                std::stringstream ss;
+                if (!cluster.cluster.has_private_endpoint() ||
+                    cluster.cluster.private_endpoint().empty()) {
+                    code = MetaServiceCode::CLUSTER_ENDPOINT_MISSING;
+                    ss << "missing private endpoint";
+                    msg = ss.str();
+                    return msg;
+                }
+                c.set_public_endpoint(cluster.cluster.public_endpoint());
+                c.set_private_endpoint(cluster.cluster.private_endpoint());
+                return msg;
+            });
+}
+
+void handle_set_cluster_status(const std::string& instance_id, const ClusterInfo& cluster,
+                               std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                               MetaServiceCode& code) {
+    msg = resource_mgr->update_cluster(
+            instance_id, cluster,
+            [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
+            [&](ClusterPB& c, std::vector<ClusterPB>&) {
+                std::string msg;
+                std::stringstream ss;
+                if (ClusterPB::COMPUTE != c.type()) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    ss << "just support set COMPUTE cluster status";
+                    msg = ss.str();
+                    return msg;
+                }
+                if (c.cluster_status() == cluster.cluster.cluster_status()) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    ss << "failed to set cluster status, status eq original status, original "
+                          "cluster is "
+                       << print_cluster_status(c.cluster_status());
+                    msg = ss.str();
+                    return msg;
+                }
+                // status from -> to
+                std::set<std::pair<cloud::ClusterStatus, cloud::ClusterStatus>>
+                        can_work_directed_edges {
+                                {ClusterStatus::UNKNOWN, ClusterStatus::NORMAL},
+                                {ClusterStatus::NORMAL, ClusterStatus::SUSPENDED},
+                                {ClusterStatus::SUSPENDED, ClusterStatus::TO_RESUME},
+                                {ClusterStatus::TO_RESUME, ClusterStatus::NORMAL},
+                                {ClusterStatus::SUSPENDED, ClusterStatus::NORMAL},
+                                {ClusterStatus::NORMAL, ClusterStatus::MANUAL_SHUTDOWN},
+                                {ClusterStatus::MANUAL_SHUTDOWN, ClusterStatus::NORMAL},
+                        };
+                auto from = c.cluster_status();
+                auto to = cluster.cluster.cluster_status();
+                if (can_work_directed_edges.count({from, to}) == 0) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    ss << "failed to set cluster status, original cluster is "
+                       << print_cluster_status(from) << " and want set "
+                       << print_cluster_status(to);
+                    msg = ss.str();
+                    return msg;
+                }
+                c.set_cluster_status(cluster.cluster.cluster_status());
+                return msg;
+            });
+}
+
+void handle_alter_vcluster_info(const std::string& instance_id, const ClusterInfo& cluster,
+                                std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                                MetaServiceCode& code) {
+    msg = resource_mgr->update_cluster(
+            instance_id, cluster,
+            [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
+            [&](ClusterPB& c, std::vector<ClusterPB>& clusters_in_instance) {
+                std::string msg;
+                // Clear existing cluster names and set new ones if provided
+                for (auto it = clusters_in_instance.begin(); it != clusters_in_instance.end();) {
+                    if (c.cluster_name() == it->cluster_name()) {
+                        it = clusters_in_instance.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                if (cluster.cluster.cluster_names_size() > 0) {
+                    c.clear_cluster_names(); // Clear existing cluster names
+                    for (const auto& name : cluster.cluster.cluster_names()) {
+                        auto [ret_code, msg] =
+                                resource_mgr->validate_sub_clusters({name}, clusters_in_instance);
+                        if (ret_code != MetaServiceCode::OK) {
+                            LOG(WARNING) << msg;
+                            return msg;
+                        }
+                        c.add_cluster_names(name); // Add each new name
+                    }
+                }
+
+                // Check and set cluster policy if provided
+                if (cluster.cluster.has_cluster_policy()) {
+                    const auto& policy = cluster.cluster.cluster_policy();
+                    if (policy.has_active_cluster_name()) {
+                        auto [ret_code, msg] = resource_mgr->validate_sub_clusters(
+                                {policy.active_cluster_name()}, clusters_in_instance);
+                        if (ret_code != MetaServiceCode::OK) {
+                            LOG(WARNING) << msg;
+                            return msg;
+                        }
+                        c.mutable_cluster_policy()->set_active_cluster_name(
+                                policy.active_cluster_name());
+                    }
+
+                    for (const auto& standby_name : policy.standby_cluster_names()) {
+                        auto [ret_code, msg] = resource_mgr->validate_sub_clusters(
+                                {standby_name}, clusters_in_instance);
+                        if (ret_code != MetaServiceCode::OK) {
+                            LOG(WARNING) << msg;
+                            return msg;
+                        }
+                        c.mutable_cluster_policy()->clear_standby_cluster_names();
+                        c.mutable_cluster_policy()->add_standby_cluster_names(standby_name);
+                        // current just support one stadby;
+                        break;
+                    }
+
+                    if (policy.has_type()) {
+                        c.mutable_cluster_policy()->set_type(policy.type());
+                    }
+
+                    if (policy.has_failover_failure_threshold()) {
+                        c.mutable_cluster_policy()->set_failover_failure_threshold(
+                                policy.failover_failure_threshold());
+                    }
+
+                    if (policy.has_unhealthy_node_threshold_percent()) {
+                        c.mutable_cluster_policy()->set_unhealthy_node_threshold_percent(
+                                policy.unhealthy_node_threshold_percent());
+                    }
+
+                    if (!policy.cache_warmup_jobids().empty()) {
+                        c.mutable_cluster_policy()->clear_cache_warmup_jobids();
+                    }
+
+                    for (const auto& warmup_jobid : policy.cache_warmup_jobids()) {
+                        c.mutable_cluster_policy()->add_cache_warmup_jobids(warmup_jobid);
+                    }
+                }
+
+                // Validate the virtual cluster after alterations
+                if (!resource_mgr->validate_virtual_cluster(c, &msg)) {
+                    return msg; // Return validation error
+                }
+                return msg; // Return success or empty message
+            });
+}
+
+void handle_alter_properties(const std::string& instance_id, const ClusterInfo& cluster,
+                             std::shared_ptr<ResourceManager> resource_mgr, std::string& msg,
+                             MetaServiceCode& code) {
+    msg = resource_mgr->update_cluster(
+            instance_id, cluster,
+            [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
+            [&](ClusterPB& c, std::vector<ClusterPB>&) {
+                std::string msg;
+                std::stringstream ss;
+                if (ClusterPB::COMPUTE != c.type()) {
+                    code = MetaServiceCode::INVALID_ARGUMENT;
+                    ss << "just support set COMPUTE cluster status";
+                    msg = ss.str();
+                    return msg;
+                }
+                *c.mutable_properties() = cluster.cluster.properties();
+                return msg;
+            });
+}
+
 void MetaServiceImpl::alter_cluster(google::protobuf::RpcController* controller,
                                     const AlterClusterRequest* request,
                                     AlterClusterResponse* response,
                                     ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(alter_cluster);
+    RPC_PREPROCESS(alter_cluster, get);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     instance_id = request->has_instance_id() ? request->instance_id() : "";
+
     if (!cloud_unique_id.empty() && instance_id.empty()) {
         auto [is_degraded_format, id] =
                 ResourceManager::get_instance_id_by_cloud_unique_id(cloud_unique_id);
@@ -2014,195 +3004,27 @@ void MetaServiceImpl::alter_cluster(google::protobuf::RpcController* controller,
     cluster.cluster.CopyFrom(request->cluster());
 
     switch (request->op()) {
-    case AlterClusterRequest::ADD_CLUSTER: {
-        auto r = resource_mgr_->add_cluster(instance_id, cluster);
-        code = r.first;
-        msg = r.second;
-    } break;
-    case AlterClusterRequest::DROP_CLUSTER: {
-        auto r = resource_mgr_->drop_cluster(instance_id, cluster);
-        code = r.first;
-        msg = r.second;
-    } break;
-    case AlterClusterRequest::UPDATE_CLUSTER_MYSQL_USER_NAME: {
-        msg = resource_mgr_->update_cluster(
-                instance_id, cluster,
-                [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
-                [&](ClusterPB& c, std::set<std::string>&) {
-                    auto& mysql_user_names = cluster.cluster.mysql_user_name();
-                    c.mutable_mysql_user_name()->CopyFrom(mysql_user_names);
-                    return "";
-                });
-    } break;
-    case AlterClusterRequest::ADD_NODE: {
-        resource_mgr_->check_cluster_params_valid(request->cluster(), &msg, false);
-        if (msg != "") {
-            LOG(WARNING) << msg;
-            break;
-        }
-        std::vector<NodeInfo> to_add;
-        std::vector<NodeInfo> to_del;
-        for (auto& n : request->cluster().nodes()) {
-            NodeInfo node;
-            node.instance_id = request->instance_id();
-            node.node_info = n;
-            node.cluster_id = request->cluster().cluster_id();
-            node.cluster_name = request->cluster().cluster_name();
-            node.role =
-                    (request->cluster().type() == ClusterPB::SQL
-                             ? Role::SQL_SERVER
-                             : (request->cluster().type() == ClusterPB::COMPUTE ? Role::COMPUTE_NODE
-                                                                                : Role::UNDEFINED));
-            node.node_info.set_status(NodeStatusPB::NODE_STATUS_RUNNING);
-            to_add.emplace_back(std::move(node));
-        }
-        msg = resource_mgr_->modify_nodes(instance_id, to_add, to_del);
-    } break;
-    case AlterClusterRequest::DROP_NODE: {
-        resource_mgr_->check_cluster_params_valid(request->cluster(), &msg, false);
-        if (msg != "") {
-            LOG(WARNING) << msg;
-            break;
-        }
-        std::vector<NodeInfo> to_add;
-        std::vector<NodeInfo> to_del;
-        for (auto& n : request->cluster().nodes()) {
-            NodeInfo node;
-            node.instance_id = request->instance_id();
-            node.node_info = n;
-            node.cluster_id = request->cluster().cluster_id();
-            node.cluster_name = request->cluster().cluster_name();
-            node.role =
-                    (request->cluster().type() == ClusterPB::SQL
-                             ? Role::SQL_SERVER
-                             : (request->cluster().type() == ClusterPB::COMPUTE ? Role::COMPUTE_NODE
-                                                                                : Role::UNDEFINED));
-            to_del.emplace_back(std::move(node));
-        }
-        msg = resource_mgr_->modify_nodes(instance_id, to_add, to_del);
-    } break;
-    case AlterClusterRequest::DECOMMISSION_NODE: {
-        resource_mgr_->check_cluster_params_valid(request->cluster(), &msg, false);
-        if (msg != "") {
-            LOG(WARNING) << msg;
-            break;
-        }
-
-        std::string be_unique_id = (request->cluster().nodes())[0].cloud_unique_id();
-        std::vector<NodeInfo> nodes;
-        std::string err = resource_mgr_->get_node(be_unique_id, &nodes);
-        if (!err.empty()) {
-            LOG(INFO) << "failed to check instance info, err=" << err;
-            msg = err;
-            break;
-        }
-
-        std::vector<NodeInfo> decomission_nodes;
-        for (auto& node : nodes) {
-            for (auto req_node : request->cluster().nodes()) {
-                bool ip_processed = false;
-                if (node.node_info.has_ip() && req_node.has_ip()) {
-                    std::string endpoint = node.node_info.ip() + ":" +
-                                           std::to_string(node.node_info.heartbeat_port());
-                    std::string req_endpoint =
-                            req_node.ip() + ":" + std::to_string(req_node.heartbeat_port());
-                    if (endpoint == req_endpoint) {
-                        decomission_nodes.push_back(node);
-                        node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONING);
-                    }
-                    ip_processed = true;
-                }
-
-                if (!ip_processed && node.node_info.has_host() && req_node.has_host()) {
-                    std::string endpoint = node.node_info.host() + ":" +
-                                           std::to_string(node.node_info.heartbeat_port());
-                    std::string req_endpoint =
-                            req_node.host() + ":" + std::to_string(req_node.heartbeat_port());
-                    if (endpoint == req_endpoint) {
-                        decomission_nodes.push_back(node);
-                        node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONING);
-                    }
-                }
-            }
-        }
-
-        {
-            std::vector<NodeInfo> to_add;
-            std::vector<NodeInfo>& to_del = decomission_nodes;
-            msg = resource_mgr_->modify_nodes(instance_id, to_add, to_del);
-        }
-        {
-            std::vector<NodeInfo>& to_add = decomission_nodes;
-            std::vector<NodeInfo> to_del;
-            for (auto& node : to_add) {
-                node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONING);
-                LOG(INFO) << "decomission node, "
-                          << "size: " << to_add.size() << " " << node.node_info.DebugString() << " "
-                          << node.cluster_id << " " << node.cluster_name;
-            }
-            msg = resource_mgr_->modify_nodes(instance_id, to_add, to_del);
-        }
-    } break;
-    case AlterClusterRequest::NOTIFY_DECOMMISSIONED: {
-        resource_mgr_->check_cluster_params_valid(request->cluster(), &msg, false);
-        if (msg != "") {
-            LOG(WARNING) << msg;
-            break;
-        }
-
-        std::string be_unique_id = (request->cluster().nodes())[0].cloud_unique_id();
-        std::vector<NodeInfo> nodes;
-        std::string err = resource_mgr_->get_node(be_unique_id, &nodes);
-        if (!err.empty()) {
-            LOG(INFO) << "failed to check instance info, err=" << err;
-            msg = err;
-            break;
-        }
-
-        std::vector<NodeInfo> decomission_nodes;
-        for (auto& node : nodes) {
-            for (auto req_node : request->cluster().nodes()) {
-                bool ip_processed = false;
-                if (node.node_info.has_ip() && req_node.has_ip()) {
-                    std::string endpoint = node.node_info.ip() + ":" +
-                                           std::to_string(node.node_info.heartbeat_port());
-                    std::string req_endpoint =
-                            req_node.ip() + ":" + std::to_string(req_node.heartbeat_port());
-                    if (endpoint == req_endpoint) {
-                        decomission_nodes.push_back(node);
-                    }
-                    ip_processed = true;
-                }
-
-                if (!ip_processed && node.node_info.has_host() && req_node.has_host()) {
-                    std::string endpoint = node.node_info.host() + ":" +
-                                           std::to_string(node.node_info.heartbeat_port());
-                    std::string req_endpoint =
-                            req_node.host() + ":" + std::to_string(req_node.heartbeat_port());
-                    if (endpoint == req_endpoint) {
-                        decomission_nodes.push_back(node);
-                    }
-                }
-            }
-        }
-
-        {
-            std::vector<NodeInfo> to_add;
-            std::vector<NodeInfo>& to_del = decomission_nodes;
-            msg = resource_mgr_->modify_nodes(instance_id, to_add, to_del);
-        }
-        {
-            std::vector<NodeInfo>& to_add = decomission_nodes;
-            std::vector<NodeInfo> to_del;
-            for (auto& node : to_add) {
-                node.node_info.set_status(NodeStatusPB::NODE_STATUS_DECOMMISSIONED);
-                LOG(INFO) << "notify node decomissioned, "
-                          << " size: " << to_add.size() << " " << node.node_info.DebugString()
-                          << " " << node.cluster_id << " " << node.cluster_name;
-            }
-            msg = resource_mgr_->modify_nodes(instance_id, to_add, to_del);
-        }
-    } break;
+    case AlterClusterRequest::ADD_CLUSTER:
+        handle_add_cluster(instance_id, cluster, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::DROP_CLUSTER:
+        handle_drop_cluster(instance_id, cluster, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::UPDATE_CLUSTER_MYSQL_USER_NAME:
+        handle_update_cluster_mySQL_username(instance_id, cluster, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::ADD_NODE:
+        handle_add_node(instance_id, request, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::DROP_NODE:
+        handle_drop_node(instance_id, request, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::DECOMMISSION_NODE:
+        handle_decommission_node(instance_id, request, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::NOTIFY_DECOMMISSIONED:
+        handle_notify_decommissioned(instance_id, request, resource_mgr(), msg, code);
+        break;
     case AlterClusterRequest::RENAME_CLUSTER: {
         // SQL mode, cluster cluster name eq empty cluster name, need drop empty cluster first.
         // but in http api, cloud control will drop empty cluster
@@ -2210,108 +3032,31 @@ void MetaServiceImpl::alter_cluster(google::protobuf::RpcController* controller,
                 request->has_replace_if_existing_empty_target_cluster()
                         ? request->replace_if_existing_empty_target_cluster()
                         : false;
-
-        msg = resource_mgr_->update_cluster(
-                instance_id, cluster,
-                [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
-                [&](ClusterPB& c, std::set<std::string>& cluster_names) {
-                    std::string msg;
-                    auto it = cluster_names.find(cluster.cluster.cluster_name());
-                    LOG(INFO) << "cluster.cluster.cluster_name(): "
-                              << cluster.cluster.cluster_name();
-                    for (auto itt : cluster_names) {
-                        LOG(INFO) << "instance's cluster name : " << itt;
-                    }
-                    if (it != cluster_names.end()) {
-                        code = MetaServiceCode::INVALID_ARGUMENT;
-                        ss << "failed to rename cluster, a cluster with the same name already "
-                              "exists in this instance "
-                           << proto_to_json(c);
-                        msg = ss.str();
-                        return msg;
-                    }
-                    if (c.cluster_name() == cluster.cluster.cluster_name()) {
-                        code = MetaServiceCode::INVALID_ARGUMENT;
-                        ss << "failed to rename cluster, name eq original name, original cluster "
-                              "is "
-                           << proto_to_json(c);
-                        msg = ss.str();
-                        return msg;
-                    }
-                    c.set_cluster_name(cluster.cluster.cluster_name());
-                    return msg;
-                },
-                replace_if_existing_empty_target_cluster);
-    } break;
-    case AlterClusterRequest::UPDATE_CLUSTER_ENDPOINT: {
-        msg = resource_mgr_->update_cluster(
-                instance_id, cluster,
-                [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
-                [&](ClusterPB& c, std::set<std::string>&) {
-                    std::string msg;
-                    if (!cluster.cluster.has_private_endpoint() ||
-                        cluster.cluster.private_endpoint().empty()) {
-                        code = MetaServiceCode::CLUSTER_ENDPOINT_MISSING;
-                        ss << "missing private endpoint";
-                        msg = ss.str();
-                        return msg;
-                    }
-
-                    c.set_public_endpoint(cluster.cluster.public_endpoint());
-                    c.set_private_endpoint(cluster.cluster.private_endpoint());
-
-                    return msg;
-                });
-    } break;
-    case AlterClusterRequest::SET_CLUSTER_STATUS: {
-        msg = resource_mgr_->update_cluster(
-                instance_id, cluster,
-                [&](const ClusterPB& i) { return i.cluster_id() == cluster.cluster.cluster_id(); },
-                [&](ClusterPB& c, std::set<std::string>&) {
-                    std::string msg;
-                    if (c.cluster_status() == request->cluster().cluster_status()) {
-                        code = MetaServiceCode::INVALID_ARGUMENT;
-                        ss << "failed to set cluster status, status eq original status, original "
-                              "cluster is "
-                           << print_cluster_status(c.cluster_status());
-                        msg = ss.str();
-                        return msg;
-                    }
-                    // status from -> to
-                    std::set<std::pair<cloud::ClusterStatus, cloud::ClusterStatus>>
-                            can_work_directed_edges {
-                                    {ClusterStatus::UNKNOWN, ClusterStatus::NORMAL},
-                                    {ClusterStatus::NORMAL, ClusterStatus::SUSPENDED},
-                                    {ClusterStatus::SUSPENDED, ClusterStatus::TO_RESUME},
-                                    {ClusterStatus::TO_RESUME, ClusterStatus::NORMAL},
-                                    {ClusterStatus::SUSPENDED, ClusterStatus::NORMAL},
-                                    {ClusterStatus::NORMAL, ClusterStatus::MANUAL_SHUTDOWN},
-                                    {ClusterStatus::MANUAL_SHUTDOWN, ClusterStatus::NORMAL},
-                            };
-                    auto from = c.cluster_status();
-                    auto to = request->cluster().cluster_status();
-                    if (can_work_directed_edges.count({from, to}) == 0) {
-                        // can't find a directed edge in set, so refuse it
-                        code = MetaServiceCode::INVALID_ARGUMENT;
-                        ss << "failed to set cluster status, original cluster is "
-                           << print_cluster_status(from) << " and want set "
-                           << print_cluster_status(to);
-                        msg = ss.str();
-                        return msg;
-                    }
-                    c.set_cluster_status(request->cluster().cluster_status());
-                    return msg;
-                });
-    } break;
-    default: {
+        handle_rename_cluster(instance_id, cluster, resource_mgr(),
+                              replace_if_existing_empty_target_cluster, msg, code);
+        break;
+    }
+    case AlterClusterRequest::UPDATE_CLUSTER_ENDPOINT:
+        handle_update_cluster_endpoint(instance_id, cluster, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::SET_CLUSTER_STATUS:
+        handle_set_cluster_status(instance_id, cluster, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::ALTER_VCLUSTER_INFO:
+        handle_alter_vcluster_info(instance_id, cluster, resource_mgr(), msg, code);
+        break;
+    case AlterClusterRequest::ALTER_PROPERTIES:
+        handle_alter_properties(instance_id, cluster, resource_mgr(), msg, code);
+        break;
+    default:
         code = MetaServiceCode::INVALID_ARGUMENT;
         ss << "invalid request op, op=" << request->op();
         msg = ss.str();
         return;
     }
-    }
+
     if (!msg.empty() && code == MetaServiceCode::OK) {
-        code = MetaServiceCode::UNDEFINED_ERR;
+        code = MetaServiceCode::INVALID_ARGUMENT;
     }
 
     // ugly but easy to repair
@@ -2324,20 +3069,20 @@ void MetaServiceImpl::alter_cluster(google::protobuf::RpcController* controller,
 
     if (code != MetaServiceCode::OK) return;
 
-    auto f = new std::function<void()>([instance_id = request->instance_id(), txn_kv = txn_kv_] {
-        notify_refresh_instance(txn_kv, instance_id);
-    });
-    bthread_t bid;
-    if (bthread_start_background(&bid, nullptr, run_bthread_work, f) != 0) {
-        LOG(WARNING) << "notify refresh instance inplace, instance_id=" << request->instance_id();
-        run_bthread_work(f);
-    }
-} // alter cluster
+    async_notify_refresh_instance(
+            txn_kv_, request->instance_id(), /*include_self=*/false,
+            [instance_id = request->instance_id()](const KVStats& stats) {
+                if (config::use_detailed_metrics && !instance_id.empty()) {
+                    g_bvar_rpc_kv_alter_cluster_get_bytes.put({instance_id}, stats.get_bytes);
+                    g_bvar_rpc_kv_alter_cluster_get_counter.put({instance_id}, stats.get_counter);
+                }
+            });
+}
 
 void MetaServiceImpl::get_cluster(google::protobuf::RpcController* controller,
                                   const GetClusterRequest* request, GetClusterResponse* response,
                                   ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_cluster);
+    RPC_PREPROCESS(get_cluster, get, put);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     std::string cluster_id = request->has_cluster_id() ? request->cluster_id() : "";
     std::string cluster_name = request->has_cluster_name() ? request->cluster_name() : "";
@@ -2391,7 +3136,6 @@ void MetaServiceImpl::get_cluster(google::protobuf::RpcController* controller,
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -2482,7 +3226,9 @@ void MetaServiceImpl::get_cluster(google::protobuf::RpcController* controller,
 void MetaServiceImpl::create_stage(::google::protobuf::RpcController* controller,
                                    const CreateStageRequest* request, CreateStageResponse* response,
                                    ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(create_stage);
+    TEST_SYNC_POINT_CALLBACK("create_stage_sk_request", const_cast<CreateStageRequest**>(&request));
+    RPC_PREPROCESS(create_stage, get, put);
+    TEST_SYNC_POINT_RETURN_WITH_VOID("create_stage_sk_request_return");
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -2539,7 +3285,6 @@ void MetaServiceImpl::create_stage(::google::protobuf::RpcController* controller
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -2655,6 +3400,7 @@ void MetaServiceImpl::create_stage(::google::protobuf::RpcController* controller
         return;
     }
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(key, val);
     LOG(INFO) << "put instance_id=" << instance_id << " instance_key=" << hex(key)
               << " json=" << proto_to_json(instance);
@@ -2669,7 +3415,7 @@ void MetaServiceImpl::create_stage(::google::protobuf::RpcController* controller
 void MetaServiceImpl::get_stage(google::protobuf::RpcController* controller,
                                 const GetStageRequest* request, GetStageResponse* response,
                                 ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_stage);
+    RPC_PREPROCESS(get_stage, get);
     TEST_SYNC_POINT_CALLBACK("stage_sk_response", &response);
     TEST_SYNC_POINT_RETURN_WITH_VOID("stage_sk_response_return");
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
@@ -2699,7 +3445,6 @@ void MetaServiceImpl::get_stage(google::protobuf::RpcController* controller,
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -2919,18 +3664,16 @@ void MetaServiceImpl::drop_stage(google::protobuf::RpcController* controller,
     std::string msg = "OK";
     std::string instance_id;
     bool drop_request = false;
-    std::unique_ptr<int, std::function<void(int*)>> defer_status(
-            (int*)0x01, [&ret, &code, &msg, &response, &ctrl, &closure_guard, &sw, &instance_id,
-                         &drop_request](int*) {
-                response->mutable_status()->set_code(code);
-                response->mutable_status()->set_msg(msg);
-                LOG(INFO) << (ret == 0 ? "succ to " : "failed to ") << __PRETTY_FUNCTION__ << " "
-                          << ctrl->remote_side() << " " << msg;
-                closure_guard.reset(nullptr);
-                if (config::use_detailed_metrics && !instance_id.empty() && !drop_request) {
-                    g_bvar_ms_drop_stage.put(instance_id, sw.elapsed_us());
-                }
-            });
+    DORIS_CLOUD_DEFER {
+        response->mutable_status()->set_code(code);
+        response->mutable_status()->set_msg(msg);
+        LOG(INFO) << (ret == 0 ? "succ to " : "failed to ") << __PRETTY_FUNCTION__ << " "
+                  << ctrl->remote_side() << " " << msg;
+        closure_guard.reset(nullptr);
+        if (config::use_detailed_metrics && !instance_id.empty() && !drop_request) {
+            g_bvar_ms_drop_stage.put(instance_id, sw.elapsed_us());
+        }
+    };
 
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
@@ -3048,6 +3791,7 @@ void MetaServiceImpl::drop_stage(google::protobuf::RpcController* controller,
         txn->put(key1, val1);
     }
 
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     err = txn->commit();
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::COMMIT>(err);
@@ -3059,7 +3803,7 @@ void MetaServiceImpl::drop_stage(google::protobuf::RpcController* controller,
 void MetaServiceImpl::get_iam(google::protobuf::RpcController* controller,
                               const GetIamRequest* request, GetIamResponse* response,
                               ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_iam);
+    RPC_PREPROCESS(get_iam, get);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -3081,7 +3825,6 @@ void MetaServiceImpl::get_iam(google::protobuf::RpcController* controller,
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3156,7 +3899,7 @@ void MetaServiceImpl::get_iam(google::protobuf::RpcController* controller,
 void MetaServiceImpl::alter_iam(google::protobuf::RpcController* controller,
                                 const AlterIamRequest* request, AlterIamResponse* response,
                                 ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(alter_iam);
+    RPC_PREPROCESS(alter_iam, get, put);
     std::string arn_id = request->has_account_id() ? request->account_id() : "";
     std::string arn_ak = request->has_ak() ? request->ak() : "";
     std::string arn_sk = request->has_sk() ? request->sk() : "";
@@ -3165,12 +3908,13 @@ void MetaServiceImpl::alter_iam(google::protobuf::RpcController* controller,
         msg = "invalid argument";
         return;
     }
-
     RPC_RATE_LIMIT(alter_iam)
+
+    // for metric, give it a common instance id
+    instance_id = "alter_iam_instance";
 
     std::string key = system_meta_service_arn_info_key();
     std::string val;
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3246,7 +3990,7 @@ void MetaServiceImpl::alter_ram_user(google::protobuf::RpcController* controller
                                      const AlterRamUserRequest* request,
                                      AlterRamUserResponse* response,
                                      ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(alter_ram_user);
+    RPC_PREPROCESS(alter_ram_user, get, put);
     instance_id = request->has_instance_id() ? request->instance_id() : "";
     if (instance_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -3266,7 +4010,6 @@ void MetaServiceImpl::alter_ram_user(google::protobuf::RpcController* controller
     std::string val;
     instance_key(key_info, &key);
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3316,6 +4059,7 @@ void MetaServiceImpl::alter_ram_user(google::protobuf::RpcController* controller
         code = MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
         return;
     }
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
     txn->put(key, val);
     LOG(INFO) << "put instance_id=" << instance_id << " instance_key=" << hex(key);
     err = txn->commit();
@@ -3329,7 +4073,7 @@ void MetaServiceImpl::alter_ram_user(google::protobuf::RpcController* controller
 void MetaServiceImpl::begin_copy(google::protobuf::RpcController* controller,
                                  const BeginCopyRequest* request, BeginCopyResponse* response,
                                  ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(begin_copy);
+    RPC_PREPROCESS(begin_copy, get, put);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -3345,7 +4089,6 @@ void MetaServiceImpl::begin_copy(google::protobuf::RpcController* controller,
         return;
     }
     RPC_RATE_LIMIT(begin_copy)
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3446,7 +4189,7 @@ void MetaServiceImpl::begin_copy(google::protobuf::RpcController* controller,
 void MetaServiceImpl::finish_copy(google::protobuf::RpcController* controller,
                                   const FinishCopyRequest* request, FinishCopyResponse* response,
                                   ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(finish_copy);
+    RPC_PREPROCESS(finish_copy, get, put, del);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -3463,7 +4206,6 @@ void MetaServiceImpl::finish_copy(google::protobuf::RpcController* controller,
     }
     RPC_RATE_LIMIT(finish_copy)
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3551,7 +4293,7 @@ void MetaServiceImpl::finish_copy(google::protobuf::RpcController* controller,
 void MetaServiceImpl::get_copy_job(google::protobuf::RpcController* controller,
                                    const GetCopyJobRequest* request, GetCopyJobResponse* response,
                                    ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_copy_job);
+    RPC_PREPROCESS(get_copy_job, get);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -3567,7 +4309,6 @@ void MetaServiceImpl::get_copy_job(google::protobuf::RpcController* controller,
         return;
     }
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3603,7 +4344,7 @@ void MetaServiceImpl::get_copy_files(google::protobuf::RpcController* controller
                                      const GetCopyFilesRequest* request,
                                      GetCopyFilesResponse* response,
                                      ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_copy_files);
+    RPC_PREPROCESS(get_copy_files, get);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -3620,7 +4361,6 @@ void MetaServiceImpl::get_copy_files(google::protobuf::RpcController* controller
     }
     RPC_RATE_LIMIT(get_copy_files)
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3667,7 +4407,7 @@ void MetaServiceImpl::filter_copy_files(google::protobuf::RpcController* control
                                         const FilterCopyFilesRequest* request,
                                         FilterCopyFilesResponse* response,
                                         ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(filter_copy_files);
+    RPC_PREPROCESS(filter_copy_files, get);
     std::string cloud_unique_id = request->has_cloud_unique_id() ? request->cloud_unique_id() : "";
     if (cloud_unique_id.empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
@@ -3684,7 +4424,6 @@ void MetaServiceImpl::filter_copy_files(google::protobuf::RpcController* control
     }
     RPC_RATE_LIMIT(filter_copy_files)
 
-    std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
         code = cast_as<ErrCategory::CREATE>(err);
@@ -3719,7 +4458,7 @@ void MetaServiceImpl::get_cluster_status(google::protobuf::RpcController* contro
                                          const GetClusterStatusRequest* request,
                                          GetClusterStatusResponse* response,
                                          ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_cluster_status);
+    RPC_PREPROCESS(get_cluster_status, get);
     if (request->instance_ids().empty() && request->cloud_unique_ids().empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
         msg = "cloud_unique_ids or instance_ids must be given, instance_ids.size: " +
@@ -3769,6 +4508,13 @@ void MetaServiceImpl::get_cluster_status(google::protobuf::RpcController* contro
             LOG(WARNING) << "failed to create txn err=" << err;
             return;
         }
+        DORIS_CLOUD_DEFER {
+            if (config::use_detailed_metrics && txn != nullptr) {
+                g_bvar_rpc_kv_get_cluster_status_get_bytes.put({instance_id}, txn->get_bytes());
+                g_bvar_rpc_kv_get_cluster_status_get_counter.put({instance_id},
+                                                                 txn->num_get_keys());
+            }
+        };
         err = txn->get(key, &val);
         LOG(INFO) << "get instance_key=" << hex(key);
 
@@ -3776,7 +4522,6 @@ void MetaServiceImpl::get_cluster_status(google::protobuf::RpcController* contro
             LOG(WARNING) << "failed to get instance, instance_id=" << instance_id << " err=" << err;
             return;
         }
-
         InstanceInfoPB instance;
         if (!instance.ParseFromString(val)) {
             LOG(WARNING) << "failed to parse InstanceInfoPB";
@@ -3813,8 +4558,15 @@ void MetaServiceImpl::get_cluster_status(google::protobuf::RpcController* contro
     msg = proto_to_json(*response);
 }
 
-void notify_refresh_instance(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id) {
-    LOG(INFO) << "begin notify_refresh_instance";
+void notify_refresh_instance(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id,
+                             KVStats* stats, bool include_self) {
+    if (!config::enable_notify_instance_update) {
+        LOG(INFO) << "notify_refresh_instance is disabled";
+        return;
+    }
+
+    LOG(INFO) << "begin notify_refresh_instance, include_self=" << include_self;
+    TEST_SYNC_POINT_RETURN_WITH_VOID("notify_refresh_instance_return");
     std::unique_ptr<Transaction> txn;
     TxnErrorCode err = txn_kv->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
@@ -3824,10 +4576,16 @@ void notify_refresh_instance(std::shared_ptr<TxnKv> txn_kv, const std::string& i
     std::string key = system_meta_service_registry_key();
     std::string val;
     err = txn->get(key, &val);
+    if (stats) {
+        stats->get_counter++;
+    }
     if (err != TxnErrorCode::TXN_OK) {
         LOG(WARNING) << "failed to get server registry"
                      << " err=" << err;
         return;
+    }
+    if (stats) {
+        stats->get_bytes += val.size() + key.size();
     }
     std::string self_endpoint =
             config::hostname.empty() ? get_local_ip(config::priority_networks) : config::hostname;
@@ -3852,7 +4610,7 @@ void notify_refresh_instance(std::shared_ptr<TxnKv> txn_kv, const std::string& i
         } else {
             endpoint = fmt::format("{}:{}", e.ip(), e.port());
         }
-        if (endpoint == self_endpoint) continue;
+        if (endpoint == self_endpoint && !include_self) continue;
 
         // Prepare stub
         std::shared_ptr<MetaService_Stub> stub;

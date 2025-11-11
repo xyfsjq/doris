@@ -24,7 +24,9 @@ import org.apache.doris.qe.ConnectProcessor;
 import org.apache.doris.service.arrowflight.results.FlightSqlChannel;
 import org.apache.doris.thrift.TResultSinkType;
 import org.apache.doris.thrift.TStatusCode;
+import org.apache.doris.thrift.TUniqueId;
 
+import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -39,7 +41,7 @@ public class FlightSqlConnectContext extends ConnectContext {
         this.peerIdentity = peerIdentity;
         mysqlChannel = null; // Use of MysqlChannel is not expected
         flightSqlChannel = new FlightSqlChannel();
-        setResultSinkType(TResultSinkType.ARROW_FLIGHT_PROTOCAL);
+        setResultSinkType(TResultSinkType.ARROW_FLIGHT_PROTOCOL);
         init();
     }
 
@@ -63,7 +65,7 @@ public class FlightSqlConnectContext extends ConnectContext {
         if (flightSqlChannel != null) {
             flightSqlChannel.close();
         }
-        connectScheduler.unregisterConnection(this);
+        connectScheduler.getFlightSqlConnectPoolMgr().unregisterConnection(this);
     }
 
     // kill operation with no protect.
@@ -72,12 +74,21 @@ public class FlightSqlConnectContext extends ConnectContext {
         LOG.warn("kill query from {}, kill flight sql connection: {}", getRemoteHostPortString(), killConnection);
 
         if (killConnection) {
-            isKilled = true;
-            // Close channel and break connection with client.
-            closeChannel();
+            killConnection();
         }
         // Now, cancel running query.
         cancelQuery(new Status(TStatusCode.CANCELLED, "arrow flight query killed by user"));
+    }
+
+    @Override
+    public void setQueryId(TUniqueId queryId) {
+        if (this.queryId != null) {
+            this.lastQueryId = this.queryId.deepCopy();
+        }
+        this.queryId = queryId;
+        if (connectScheduler != null && !Strings.isNullOrEmpty(traceId)) {
+            connectScheduler.getFlightSqlConnectPoolMgr().putTraceId2QueryId(traceId, queryId);
+        }
     }
 
     @Override

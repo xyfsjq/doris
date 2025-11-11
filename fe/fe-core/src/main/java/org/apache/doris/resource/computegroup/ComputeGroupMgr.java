@@ -17,12 +17,18 @@
 
 package org.apache.doris.resource.computegroup;
 
+import org.apache.doris.catalog.Env;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.Pair;
+import org.apache.doris.common.UserException;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.resource.Tag;
+import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.collect.Sets;
+import org.apache.commons.lang3.StringUtils;
 
 import java.util.Set;
 
@@ -34,11 +40,35 @@ public class ComputeGroupMgr {
         this.systemInfoService = systemInfoService;
     }
 
-    public ComputeGroup getComputeGroupByName(String name) {
-        if (Config.isCloudMode()) {
-            return new CloudComputeGroup("", name, (CloudSystemInfoService) systemInfoService);
+    public static String computeGroupNotFoundPromptMsg(String physicalClusterName) {
+        StringBuilder sb = new StringBuilder();
+        Pair<String, String> computeGroupInfos = ConnectContext.computeGroupFromHintMsg();
+        sb.append(" Unable to find the compute group: ");
+        sb.append("<");
+        if (physicalClusterName == null) {
+            sb.append(computeGroupInfos.first);
         } else {
-            return new ComputeGroup("", name, systemInfoService);
+            sb.append(physicalClusterName);
+        }
+        sb.append(">");
+        sb.append(". Please check if the compute group has been deleted. how this compute group is selected: ");
+        sb.append(computeGroupInfos.second);
+        return sb.toString();
+    }
+
+    public ComputeGroup getComputeGroupByName(String name) throws UserException {
+        if (Config.isCloudMode()) {
+            CloudSystemInfoService cloudSystemInfoService = (CloudSystemInfoService) systemInfoService;
+            String physicalClusterName = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
+                    .getPhysicalCluster(name);
+            String clusterId = cloudSystemInfoService.getCloudClusterIdByName(physicalClusterName);
+            if (StringUtils.isEmpty(clusterId)) {
+                String computeGroupHints = ComputeGroupMgr.computeGroupNotFoundPromptMsg(physicalClusterName);
+                throw new UserException(computeGroupHints);
+            }
+            return new CloudComputeGroup(clusterId, physicalClusterName, cloudSystemInfoService);
+        } else {
+            return new ComputeGroup(name, name, systemInfoService);
         }
     }
 
@@ -47,13 +77,21 @@ public class ComputeGroupMgr {
         for (Tag tag : rgTags) {
             tagStrSet.add(tag.value);
         }
-        return new MergedComputeGroup(tagStrSet, systemInfoService);
+        return new MergedComputeGroup(String.join(",", tagStrSet), tagStrSet, systemInfoService);
     }
 
     // to be compatible with resource tag's logic, if root/admin user not specify a resource tag,
     // which means return all backends.
     public ComputeGroup getAllBackendComputeGroup() {
         return new AllBackendComputeGroup(systemInfoService);
+    }
+
+    public Set<String> getAllComputeGroupIds() {
+        Set<String> ret = Sets.newHashSet();
+        for (Backend backend : systemInfoService.getAllClusterBackendsNoException().values()) {
+            ret.add(backend.getComputeGroup());
+        }
+        return ret;
     }
 
 }

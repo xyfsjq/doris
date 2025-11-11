@@ -87,7 +87,8 @@ void VRuntimeFilterWrapper::close(VExprContext* context,
     _impl->close(context, scope);
 }
 
-Status VRuntimeFilterWrapper::execute(VExprContext* context, Block* block, int* result_column_id) {
+Status VRuntimeFilterWrapper::execute(VExprContext* context, Block* block,
+                                      int* result_column_id) const {
     DCHECK(_open_finished || _getting_const_col);
     if (_judge_counter.fetch_sub(1) == 0) {
         reset_judge_selectivity();
@@ -104,7 +105,7 @@ Status VRuntimeFilterWrapper::execute(VExprContext* context, Block* block, int* 
             _impl->set_getting_const_col(true);
         }
         ColumnNumbers args;
-        RETURN_IF_ERROR(_impl->execute_runtime_fitler(context, block, result_column_id, args));
+        RETURN_IF_ERROR(_impl->execute_runtime_filter(context, block, result_column_id, args));
         if (_getting_const_col) {
             _impl->set_getting_const_col(false);
         }
@@ -114,7 +115,8 @@ Status VRuntimeFilterWrapper::execute(VExprContext* context, Block* block, int* 
         // bloom filter will handle null aware inside itself
         if (_null_aware && TExprNodeType::BLOOM_PRED != node_type()) {
             DCHECK_GE(args.size(), 1);
-            change_null_to_true(result_column.column, block->get_by_position(args[0]).column);
+            change_null_to_true(result_column.column->assume_mutable(),
+                                block->get_by_position(args[0]).column);
         }
 
         return Status::OK();

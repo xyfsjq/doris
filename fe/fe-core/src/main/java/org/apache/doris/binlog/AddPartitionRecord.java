@@ -86,14 +86,18 @@ public class AddPartitionRecord {
             sb.append(", ");
             sb.append(range.upperEndpoint().toSql());
             sb.append(") (\"version_info\" = \"");
-            sb.append(partition.getVisibleVersion());
+            sb.append(partition.getCachedVisibleVersion());
             sb.append("\");");
         } else if (!this.listPartitionItem.equals(ListPartitionItem.DUMMY_ITEM)) {
             // list
-            sb.append("VALUES IN ");
-            sb.append(((ListPartitionItem) listPartitionItem).toSql());
+            String partitionSql = ((ListPartitionItem) listPartitionItem).toSql();
+            // the partition may default partition
+            if (!partitionSql.isEmpty()) {
+                sb.append("VALUES IN ");
+                sb.append(partitionSql);
+            }
             sb.append(" (\"version_info\" = \"");
-            sb.append(partition.getVisibleVersion());
+            sb.append(partition.getCachedVisibleVersion());
             sb.append("\");");
         } else {
             // unpartitioned.

@@ -31,6 +31,7 @@
 #include "common/logging.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 using namespace ErrorCode;
 
 std::string StreamLoadContext::to_json() const {
@@ -82,7 +83,7 @@ std::string StreamLoadContext::to_json() const {
     if (status.ok()) {
         writer.String("OK");
     } else {
-        writer.String(status.to_string().c_str());
+        writer.String(status.to_string_no_stack().c_str());
     }
     // number_load_rows
     writer.Key("NumberTotalRows");
@@ -106,9 +107,9 @@ std::string StreamLoadContext::to_json() const {
     writer.Key("ReadDataTimeMs");
     writer.Int64(read_data_cost_nanos / 1000000);
     writer.Key("WriteDataTimeMs");
-    writer.Int(write_data_cost_nanos / 1000000);
+    writer.Int64(write_data_cost_nanos / 1000000);
     writer.Key("ReceiveDataTimeMs");
-    writer.Int((receive_and_read_data_cost_nanos - read_data_cost_nanos) / 1000000);
+    writer.Int64((receive_and_read_data_cost_nanos - read_data_cost_nanos) / 1000000);
     if (!group_commit) {
         writer.Key("CommitAndPublishTimeMs");
         writer.Int64(commit_and_publish_txn_cost_nanos / 1000000);
@@ -117,6 +118,10 @@ std::string StreamLoadContext::to_json() const {
     if (!error_url.empty()) {
         writer.Key("ErrorURL");
         writer.String(error_url.c_str());
+    }
+    if (!first_error_msg.empty()) {
+        writer.Key("FirstErrorMsg");
+        writer.String(first_error_msg.c_str());
     }
     writer.EndObject();
     return s.GetString();
@@ -133,37 +138,40 @@ std::string StreamLoadContext::prepare_stream_load_record(const std::string& str
     rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
 
     rapidjson::Value cluster_value(rapidjson::kStringType);
-    cluster_value.SetString(auth.cluster.c_str(), auth.cluster.size());
+    cluster_value.SetString(auth.cluster.c_str(),
+                            static_cast<rapidjson::SizeType>(auth.cluster.size()));
     if (!cluster_value.IsNull()) {
         document.AddMember("cluster", cluster_value, allocator);
     }
 
     rapidjson::Value db_value(rapidjson::kStringType);
-    db_value.SetString(db.c_str(), db.size());
+    db_value.SetString(db.c_str(), static_cast<rapidjson::SizeType>(db.size()));
     if (!db_value.IsNull()) {
         document.AddMember("Db", db_value, allocator);
     }
 
     rapidjson::Value table_value(rapidjson::kStringType);
-    table_value.SetString(table.c_str(), table.size());
+    table_value.SetString(table.c_str(), static_cast<rapidjson::SizeType>(table.size()));
     if (!table_value.IsNull()) {
         document.AddMember("Table", table_value, allocator);
     }
 
     rapidjson::Value user_value(rapidjson::kStringType);
-    user_value.SetString(auth.user.c_str(), auth.user.size());
+    user_value.SetString(auth.user.c_str(), static_cast<rapidjson::SizeType>(auth.user.size()));
     if (!user_value.IsNull()) {
         document.AddMember("User", user_value, allocator);
     }
 
     rapidjson::Value client_ip_value(rapidjson::kStringType);
-    client_ip_value.SetString(auth.user_ip.c_str(), auth.user_ip.size());
+    client_ip_value.SetString(auth.user_ip.c_str(),
+                              static_cast<rapidjson::SizeType>(auth.user_ip.size()));
     if (!client_ip_value.IsNull()) {
         document.AddMember("ClientIp", client_ip_value, allocator);
     }
 
     rapidjson::Value comment_value(rapidjson::kStringType);
-    comment_value.SetString(load_comment.c_str(), load_comment.size());
+    comment_value.SetString(load_comment.c_str(),
+                            static_cast<rapidjson::SizeType>(load_comment.size()));
     if (!comment_value.IsNull()) {
         document.AddMember("Comment", comment_value, allocator);
     }
@@ -284,6 +292,15 @@ void StreamLoadContext::parse_stream_load_record(const std::string& stream_load_
         ss << ", Comment: " << comment_value.GetString();
     }
 
+    if (document.HasMember("FirstErrorMsg")) {
+        const rapidjson::Value& first_error_msg = document["FirstErrorMsg"];
+        stream_load_item.__set_first_error_msg(first_error_msg.GetString());
+        ss << ", FirstErrorMsg: " << first_error_msg.GetString();
+    } else {
+        stream_load_item.__set_first_error_msg("N/A");
+        ss << ", FirstErrorMsg: N/A";
+    }
+
     VLOG(1) << "parse json from rocksdb. " << ss.str();
 }
 
@@ -323,7 +340,7 @@ std::string StreamLoadContext::to_json_for_mini_load() const {
     if (status.ok() || show_ok) {
         writer.String("OK");
     } else {
-        writer.String(status.to_string().c_str());
+        writer.String(status.to_string_no_stack().c_str());
     }
     writer.EndObject();
     return s.GetString();
@@ -353,10 +370,9 @@ std::string StreamLoadContext::brief(bool detail) const {
 }
 
 bool StreamLoadContext::is_mow_table() const {
-    return (put_result.__isset.params && put_result.params.__isset.is_mow_table &&
-            put_result.params.is_mow_table) ||
-           (put_result.__isset.pipeline_params && put_result.pipeline_params.__isset.is_mow_table &&
-            put_result.pipeline_params.is_mow_table);
+    return put_result.__isset.pipeline_params && put_result.pipeline_params.__isset.is_mow_table &&
+           put_result.pipeline_params.is_mow_table;
 }
 
+#include "common/compile_check_end.h"
 } // namespace doris

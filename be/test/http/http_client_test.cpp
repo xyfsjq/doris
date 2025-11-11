@@ -17,6 +17,7 @@
 
 #include "http/http_client.h"
 
+#include <absl/strings/str_split.h>
 #include <fcntl.h>
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
@@ -112,7 +113,7 @@ public:
             do_dir_response(req->param("dir"), req, true);
         } else {
             std::vector<std::string> acquire_files =
-                    strings::Split(req->get_request_body(), "\n", strings::SkipWhitespace());
+                    absl::StrSplit(req->get_request_body(), "\n", absl::SkipWhitespace());
             HttpChannel::send_files(req, req->param("dir"), acquire_files);
         }
     }
@@ -391,7 +392,7 @@ TEST_F(HttpClientTest, enable_http_auth) {
         st = client.execute(&response);
         EXPECT_TRUE(st.ok());
         std::cout << "response = " << response << "\n";
-        EXPECT_TRUE(response.find("To Be Added") != std::string::npos);
+        EXPECT_TRUE(response.find("Server is not ready") != std::string::npos);
     }
 
     {
@@ -422,7 +423,7 @@ TEST_F(HttpClientTest, enable_http_auth) {
         st = client.execute(&response);
         EXPECT_TRUE(st.ok());
         std::cout << "response = " << response << "\n";
-        EXPECT_TRUE(response.find("To Be Added") != std::string::npos);
+        EXPECT_TRUE(response.find("Server is not ready") != std::string::npos);
     }
 
     {

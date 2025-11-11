@@ -21,6 +21,7 @@ import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ScalarType;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.common.util.Util;
@@ -50,7 +51,6 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.commons.lang3.StringUtils;
 
 import java.util.Optional;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @Log4j2
@@ -68,7 +68,9 @@ public class InsertTask extends AbstractTask {
             new Column("FinishTime", ScalarType.createStringType()),
             new Column("TrackingUrl", ScalarType.createStringType()),
             new Column("LoadStatistic", ScalarType.createStringType()),
-            new Column("User", ScalarType.createStringType()));
+            new Column("User", ScalarType.createStringType()),
+            new Column("FirstErrorMsg", ScalarType.createStringType()),
+            new Column("RunningOffset", ScalarType.createStringType()));
 
     public static final ImmutableMap<String, Integer> COLUMN_TO_INDEX;
 
@@ -96,6 +98,8 @@ public class InsertTask extends AbstractTask {
     private FailMsg failMsg;
     @Getter
     private String trackingUrl;
+    @Getter
+    private String firstErrorMsg;
 
     @Getter
     @Setter
@@ -146,23 +150,33 @@ public class InsertTask extends AbstractTask {
         this.loadStatistic = statistic;
     }
 
+    public static ConnectContext makeConnectContext(UserIdentity userIdentity, String currentDb) {
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(Env.getCurrentEnv());
+        ctx.setCurrentUserIdentity(userIdentity);
+        ctx.getState().reset();
+        ctx.getState().setInternal(true);
+        ctx.getState().setNereids(true);
+        ctx.setThreadLocalInfo();
+        TUniqueId queryId = generateQueryId();
+        ctx.setQueryId(queryId);
+        if (StringUtils.isNotEmpty(currentDb)) {
+            ctx.setDatabase(currentDb);
+        }
+        return ctx;
+    }
+
+    public static StmtExecutor makeStmtExecutor(ConnectContext ctx) {
+        return new StmtExecutor(ctx, (String) null);
+    }
+
     @Override
     public void before() throws JobException {
         if (isCanceled.get()) {
             throw new JobException("Export executor has been canceled, task id: {}", getTaskId());
         }
-        ctx = new ConnectContext();
-        ctx.setEnv(Env.getCurrentEnv());
-        ctx.setQualifiedUser(userIdentity.getQualifiedUser());
-        ctx.setCurrentUserIdentity(userIdentity);
-        ctx.getState().reset();
-        ctx.setThreadLocalInfo();
-        if (StringUtils.isNotEmpty(currentDb)) {
-            ctx.setDatabase(currentDb);
-        }
-        TUniqueId queryId = generateQueryId(UUID.randomUUID().toString());
+        ctx = makeConnectContext(userIdentity, currentDb);
         StatementContext statementContext = new StatementContext();
-        ctx.setQueryId(queryId);
         ctx.setStatementContext(statementContext);
         if (StringUtils.isNotEmpty(sql)) {
             NereidsParser parser = new NereidsParser();
@@ -186,11 +200,6 @@ public class InsertTask extends AbstractTask {
         if (null != ctx) {
             ctx = null;
         }
-    }
-
-    protected TUniqueId generateQueryId(String taskIdString) {
-        UUID taskId = UUID.fromString(taskIdString);
-        return new TUniqueId(taskId.getMostSignificantBits(), taskId.getLeastSignificantBits());
     }
 
     @Override
@@ -268,6 +277,8 @@ public class InsertTask extends AbstractTask {
         } else {
             trow.addToColumnValue(new TCell().setStringVal(userIdentity.getQualifiedUser()));
         }
+        trow.addToColumnValue(new TCell().setStringVal(firstErrorMsg == null ? "" : firstErrorMsg));
+        trow.addToColumnValue(new TCell().setStringVal(FeConstants.null_string));
         return trow;
     }
 
@@ -288,6 +299,8 @@ public class InsertTask extends AbstractTask {
         trow.addToColumnValue(new TCell().setStringVal(""));
         trow.addToColumnValue(new TCell().setStringVal(""));
         trow.addToColumnValue(new TCell().setStringVal(userIdentity.getQualifiedUser()));
+        trow.addToColumnValue(new TCell().setStringVal(""));
+        trow.addToColumnValue(new TCell().setStringVal(""));
         return trow;
     }
 

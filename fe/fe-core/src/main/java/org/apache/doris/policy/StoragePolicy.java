@@ -26,7 +26,7 @@ import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.util.TimeUtils;
-import org.apache.doris.datasource.property.constants.S3Properties;
+import org.apache.doris.datasource.property.storage.S3Properties;
 import org.apache.doris.qe.ShowResultSetMetaData;
 
 import com.google.common.base.Strings;
@@ -346,10 +346,10 @@ public class StoragePolicy extends Policy {
             }
         }
 
-        if (cooldownTtlMs > 0 && cooldownTimestampMs > 0) {
+        if (cooldownTtlMs >= 0 && cooldownTimestampMs >= 0) {
             throw new AnalysisException(COOLDOWN_DATETIME + " and " + COOLDOWN_TTL + " can't be set together.");
         }
-        if (cooldownTtlMs <= 0 && cooldownTimestampMs <= 0) {
+        if (cooldownTtlMs < 0 && cooldownTimestampMs < 0) {
             throw new AnalysisException(COOLDOWN_DATETIME + " or " + COOLDOWN_TTL + " must be set");
         }
 

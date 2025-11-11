@@ -19,6 +19,7 @@
 
 #include <gen_cpp/cloud.pb.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -59,7 +60,10 @@ CloudSchemaChangeJob::CloudSchemaChangeJob(CloudStorageEngine& cloud_storage_eng
                                            std::string job_id, int64_t expiration)
         : _cloud_storage_engine(cloud_storage_engine),
           _job_id(std::move(job_id)),
-          _expiration(expiration) {}
+          _expiration(expiration) {
+    _initiator = boost::uuids::hash_value(UUIDGenerator::instance()->next_uuid()) &
+                 std::numeric_limits<int64_t>::max();
+}
 
 CloudSchemaChangeJob::~CloudSchemaChangeJob() = default;
 
@@ -79,6 +83,14 @@ Status CloudSchemaChangeJob::process_alter_tablet(const TAlterTabletReqV2& reque
     static constexpr long TRY_LOCK_TIMEOUT = 30;
     std::unique_lock schema_change_lock(_base_tablet->get_schema_change_lock(), std::defer_lock);
     bool owns_lock = schema_change_lock.try_lock_for(std::chrono::seconds(TRY_LOCK_TIMEOUT));
+
+    _new_tablet->set_alter_failed(false);
+    Defer defer([this] {
+        // if tablet state is not TABLET_RUNNING when return, indicates that alter has failed.
+        if (_new_tablet->tablet_state() != TABLET_RUNNING) {
+            _new_tablet->set_alter_failed(true);
+        }
+    });
 
     if (!owns_lock) {
         LOG(WARNING) << "Failed to obtain schema change lock, there might be inverted index being "
@@ -127,12 +139,22 @@ Status CloudSchemaChangeJob::process_alter_tablet(const TAlterTabletReqV2& reque
         }
         return st;
     }
+    DBUG_EXECUTE_IF("CloudSchemaChangeJob::process_alter_tablet.alter_fail", {
+        auto res =
+                Status::InternalError("inject alter tablet failed. base_tablet={}, new_tablet={}",
+                                      request.base_tablet_id, request.new_tablet_id);
+        LOG(WARNING) << "inject error. res=" << res;
+        return res;
+    });
     if (request.alter_version > 1) {
         // [0-1] is a placeholder rowset, no need to convert
         RETURN_IF_ERROR(_base_tablet->capture_rs_readers({2, start_resp.alter_version()},
-                                                         &rs_splits, false));
+                                                         &rs_splits,
+                                                         {.skip_missing_versions = false,
+                                                          .enable_prefer_cached_rowset = false,
+                                                          .query_freshness_tolerance_ms = -1}));
     }
-    Defer defer {[&]() {
+    Defer defer2 {[&]() {
         _new_tablet->set_alter_version(-1);
         _base_tablet->set_alter_version(-1);
     }};
@@ -177,7 +199,7 @@ Status CloudSchemaChangeJob::process_alter_tablet(const TAlterTabletReqV2& reque
     reader_context.sequence_id_idx = reader_context.tablet_schema->sequence_col_idx();
     reader_context.is_unique = _base_tablet->keys_type() == UNIQUE_KEYS;
     reader_context.batch_size = ALTER_TABLE_BATCH_SIZE;
-    reader_context.delete_bitmap = &_base_tablet->tablet_meta()->delete_bitmap();
+    reader_context.delete_bitmap = _base_tablet->tablet_meta()->delete_bitmap_ptr();
     reader_context.version = Version(0, start_resp.alter_version());
     std::vector<uint32_t> cluster_key_idxes;
     if (!_base_tablet_schema->cluster_key_uids().empty()) {
@@ -303,7 +325,7 @@ Status CloudSchemaChangeJob::_convert_historical_rowsets(const SchemaChangeParam
 
         RowsetMetaSharedPtr existed_rs_meta;
         auto st = _cloud_storage_engine.meta_mgr().prepare_rowset(*rowset_writer->rowset_meta(),
-                                                                  &existed_rs_meta);
+                                                                  _job_id, &existed_rs_meta);
         if (!st.ok()) {
             if (st.is<ALREADY_EXIST>()) {
                 LOG(INFO) << "Rowset " << rs_reader->version() << " has already existed in tablet "
@@ -338,7 +360,7 @@ Status CloudSchemaChangeJob::_convert_historical_rowsets(const SchemaChangeParam
                                          st.to_string());
         }
 
-        st = _cloud_storage_engine.meta_mgr().commit_rowset(*rowset_writer->rowset_meta(),
+        st = _cloud_storage_engine.meta_mgr().commit_rowset(*rowset_writer->rowset_meta(), _job_id,
                                                             &existed_rs_meta);
         if (!st.ok()) {
             if (st.is<ALREADY_EXIST>()) {
@@ -398,16 +420,15 @@ Status CloudSchemaChangeJob::_convert_historical_rowsets(const SchemaChangeParam
     }};
     if (_new_tablet->enable_unique_key_merge_on_write()) {
         has_stop_token = true;
-        int64_t initiator = boost::uuids::hash_value(UUIDGenerator::instance()->next_uuid()) &
-                            std::numeric_limits<int64_t>::max();
         // If there are historical versions of rowsets, we need to recalculate their delete
         // bitmaps, otherwise we will miss the delete bitmaps of incremental rowsets
         int64_t start_calc_delete_bitmap_version =
                 // [0-1] is a placeholder rowset, start from 2.
                 already_exist_any_version ? 2 : sc_job->alter_version() + 1;
         RETURN_IF_ERROR(_process_delete_bitmap(sc_job->alter_version(),
-                                               start_calc_delete_bitmap_version, initiator));
-        sc_job->set_delete_bitmap_lock_initiator(initiator);
+                                               start_calc_delete_bitmap_version, _initiator,
+                                               sc_params.vault_id));
+        sc_job->set_delete_bitmap_lock_initiator(_initiator);
     }
 
     cloud::FinishTabletJobResponse finish_resp;
@@ -457,7 +478,8 @@ Status CloudSchemaChangeJob::_convert_historical_rowsets(const SchemaChangeParam
 
 Status CloudSchemaChangeJob::_process_delete_bitmap(int64_t alter_version,
                                                     int64_t start_calc_delete_bitmap_version,
-                                                    int64_t initiator) {
+                                                    int64_t initiator,
+                                                    const std::string& vault_id) {
     LOG_INFO("process mow table")
             .tag("new_tablet_id", _new_tablet->tablet_id())
             .tag("out_rowset_size", _output_rowsets.size())
@@ -466,30 +488,42 @@ Status CloudSchemaChangeJob::_process_delete_bitmap(int64_t alter_version,
     RETURN_IF_ERROR(_cloud_storage_engine.register_compaction_stop_token(_new_tablet, initiator));
     TabletMetaSharedPtr tmp_meta = std::make_shared<TabletMeta>(*(_new_tablet->tablet_meta()));
     tmp_meta->delete_bitmap().delete_bitmap.clear();
+    // Keep only version [0-1] rowset, other rowsets will be added in _output_rowsets
+    auto& rs_metas = tmp_meta->all_mutable_rs_metas();
+    for (auto it = rs_metas.begin(); it != rs_metas.end();) {
+        const auto& rs_meta = it->second;
+        if (rs_meta->version().first == 0 && rs_meta->version().second == 1) {
+            ++it;
+        } else {
+            it = rs_metas.erase(it);
+        }
+    }
+
     std::shared_ptr<CloudTablet> tmp_tablet =
             std::make_shared<CloudTablet>(_cloud_storage_engine, tmp_meta);
     {
         std::unique_lock wlock(tmp_tablet->get_header_lock());
         tmp_tablet->add_rowsets(_output_rowsets, true, wlock);
+        // Set alter version to let the tmp_tablet can fill hole rowset greater than alter_version
+        tmp_tablet->set_alter_version(alter_version);
     }
 
     // step 1, process incremental rowset without delete bitmap update lock
-    std::vector<RowsetSharedPtr> incremental_rowsets;
     RETURN_IF_ERROR(_cloud_storage_engine.meta_mgr().sync_tablet_rowsets(tmp_tablet.get()));
     int64_t max_version = tmp_tablet->max_version().second;
     LOG(INFO) << "alter table for mow table, calculate delete bitmap of "
               << "incremental rowsets without lock, version: " << start_calc_delete_bitmap_version
               << "-" << max_version << " new_table_id: " << _new_tablet->tablet_id();
     if (max_version >= start_calc_delete_bitmap_version) {
-        RETURN_IF_ERROR(tmp_tablet->capture_consistent_rowsets_unlocked(
-                {start_calc_delete_bitmap_version, max_version}, &incremental_rowsets));
+        auto ret = DORIS_TRY(tmp_tablet->capture_consistent_rowsets_unlocked(
+                {start_calc_delete_bitmap_version, max_version}, CaptureRowsetOps {}));
         DBUG_EXECUTE_IF("CloudSchemaChangeJob::_process_delete_bitmap.after.capture_without_lock",
                         DBUG_BLOCK);
         {
             std::unique_lock wlock(tmp_tablet->get_header_lock());
             tmp_tablet->add_rowsets(_output_rowsets, true, wlock);
         }
-        for (auto rowset : incremental_rowsets) {
+        for (auto rowset : ret.rowsets) {
             RETURN_IF_ERROR(CloudTablet::update_delete_bitmap_without_lock(tmp_tablet, rowset));
         }
     }
@@ -505,15 +539,14 @@ Status CloudSchemaChangeJob::_process_delete_bitmap(int64_t alter_version,
     LOG(INFO) << "alter table for mow table, calculate delete bitmap of "
               << "incremental rowsets with lock, version: " << max_version + 1 << "-"
               << new_max_version << " new_tablet_id: " << _new_tablet->tablet_id();
-    std::vector<RowsetSharedPtr> new_incremental_rowsets;
     if (new_max_version > max_version) {
-        RETURN_IF_ERROR(tmp_tablet->capture_consistent_rowsets_unlocked(
-                {max_version + 1, new_max_version}, &new_incremental_rowsets));
+        auto ret = DORIS_TRY(tmp_tablet->capture_consistent_rowsets_unlocked(
+                {max_version + 1, new_max_version}, CaptureRowsetOps {}));
         {
             std::unique_lock wlock(tmp_tablet->get_header_lock());
             tmp_tablet->add_rowsets(_output_rowsets, true, wlock);
         }
-        for (auto rowset : new_incremental_rowsets) {
+        for (auto rowset : ret.rowsets) {
             RETURN_IF_ERROR(CloudTablet::update_delete_bitmap_without_lock(tmp_tablet, rowset));
         }
     }
@@ -531,16 +564,26 @@ Status CloudSchemaChangeJob::_process_delete_bitmap(int64_t alter_version,
     });
 
     auto& delete_bitmap = tmp_tablet->tablet_meta()->delete_bitmap();
-
+    auto storage_resource = _cloud_storage_engine.get_storage_resource(vault_id);
     // step4, store delete bitmap
     RETURN_IF_ERROR(_cloud_storage_engine.meta_mgr().update_delete_bitmap(
-            *_new_tablet, SCHEMA_CHANGE_DELETE_BITMAP_LOCK_ID, initiator, &delete_bitmap));
+            *_new_tablet, SCHEMA_CHANGE_DELETE_BITMAP_LOCK_ID, initiator, &delete_bitmap,
+            &delete_bitmap, "", storage_resource, config::delete_bitmap_store_write_version));
 
     _new_tablet->tablet_meta()->delete_bitmap() = delete_bitmap;
     return Status::OK();
 }
 
-void CloudSchemaChangeJob::clean_up_on_failed() {
+void CloudSchemaChangeJob::clean_up_on_failure() {
+    if (_new_tablet == nullptr) {
+        return;
+    }
+    if (_new_tablet->keys_type() == KeysType::UNIQUE_KEYS &&
+        _new_tablet->enable_unique_key_merge_on_write()) {
+        _cloud_storage_engine.meta_mgr().remove_delete_bitmap_update_lock(
+                _new_tablet->table_id(), SCHEMA_CHANGE_DELETE_BITMAP_LOCK_ID, _initiator,
+                _new_tablet->tablet_id());
+    }
     for (const auto& output_rs : _output_rowsets) {
         if (output_rs.use_count() > 2) {
             LOG(WARNING) << "Rowset " << output_rs->rowset_id().to_string() << " has "

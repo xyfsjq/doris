@@ -29,7 +29,6 @@
 #include "common/logging.h"
 #include "common/status.h"
 #include "exec/tablet_info.h"
-#include "gutil/strings/numbers.h"
 #include "io/fs/file_writer.h" // IWYU pragma: keep
 #include "olap/memtable.h"
 #include "olap/memtable_flush_executor.h"
@@ -47,6 +46,8 @@
 #include "vec/core/block.h"
 
 namespace doris {
+bvar::Adder<uint64_t> g_flush_cuz_rowscnt_oveflow("flush_cuz_rowscnt_oveflow");
+
 using namespace ErrorCode;
 
 MemTableWriter::MemTableWriter(const WriteRequest& req) : _req(req) {}
@@ -104,6 +105,15 @@ Status MemTableWriter::write(const vectorized::Block* block,
                                              _req.tablet_id, _req.load_id.hi(), _req.load_id.lo());
     }
 
+    // Flush and reset memtable if it is raw rows great than int32_t.
+    int64_t raw_rows = _mem_table->raw_rows();
+    DBUG_EXECUTE_IF("MemTableWriter.too_many_raws",
+                    { raw_rows = std::numeric_limits<int32_t>::max(); });
+    if (raw_rows + row_idxs.size() > std::numeric_limits<int32_t>::max()) {
+        g_flush_cuz_rowscnt_oveflow << 1;
+        RETURN_IF_ERROR(_flush_memtable());
+    }
+
     _total_received_rows += row_idxs.size();
     auto st = _mem_table->insert(block, row_idxs);
 
@@ -128,13 +138,18 @@ Status MemTableWriter::write(const vectorized::Block* block,
         _mem_table->shrink_memtable_by_agg();
     }
     if (UNLIKELY(_mem_table->need_flush())) {
-        auto s = _flush_memtable_async();
-        _reset_mem_table();
-        if (UNLIKELY(!s.ok())) {
-            return s;
-        }
+        RETURN_IF_ERROR(_flush_memtable());
     }
 
+    return Status::OK();
+}
+
+Status MemTableWriter::_flush_memtable() {
+    auto s = _flush_memtable_async();
+    _reset_mem_table();
+    if (UNLIKELY(!s.ok())) {
+        return s;
+    }
     return Status::OK();
 }
 
@@ -160,7 +175,7 @@ Status MemTableWriter::flush_async() {
     // 1. call by local, from `VTabletWriterV2::_write_memtable`.
     // 2. call by remote, from `LoadChannelMgr::_get_load_channel`.
     // 3. call by daemon thread, from `handle_paused_queries` -> `flush_workload_group_memtables`.
-    SCOPED_SWITCH_RESOURCE_CONTEXT(_resource_ctx);
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_resource_ctx->memory_context()->mem_tracker());
     if (!_is_init || _is_closed) {
         // This writer is uninitialized or closed before flushing, do nothing.
         // We return OK instead of NOT_INITIALIZED or ALREADY_CLOSED.
@@ -202,7 +217,7 @@ void MemTableWriter::_reset_mem_table() {
     {
         std::lock_guard<std::mutex> l(_mem_table_ptr_lock);
         _mem_table.reset(new MemTable(_req.tablet_id, _tablet_schema, _req.slots, _req.tuple_desc,
-                                      _unique_key_mow, _partial_update_info.get()));
+                                      _unique_key_mow, _partial_update_info.get(), _resource_ctx));
     }
 
     _segment_num++;
@@ -226,7 +241,7 @@ Status MemTableWriter::close() {
 
     auto s = _flush_memtable_async();
     {
-        std::lock_guard<std::mutex> l(_mem_table_ptr_lock);
+        std::lock_guard<std::mutex> lm(_mem_table_ptr_lock);
         _mem_table.reset();
     }
     _is_closed = true;
@@ -267,13 +282,12 @@ Status MemTableWriter::_do_close_wait() {
         return Status::InternalError("rows number written by delta writer dosen't match");
     }
 
-    // const FlushStatistic& stat = _flush_token->get_stats();
     // print slow log if wait more than 1s
-    /*if (_wait_flush_timer->elapsed_time() > 1000UL * 1000 * 1000) {
-        LOG(INFO) << "close delta writer for tablet: " << req.tablet_id
+    if (_wait_flush_time_ns > 1000UL * 1000 * 1000) {
+        LOG(INFO) << "close delta writer for tablet: " << _req.tablet_id
                   << ", load id: " << print_id(_req.load_id) << ", wait close for "
-                  << _wait_flush_timer->elapsed_time() << "(ns), stats: " << stat;
-    }*/
+                  << _wait_flush_time_ns << "(ns), stats: " << _flush_token->get_stats();
+    }
 
     return Status::OK();
 }
@@ -325,7 +339,7 @@ Status MemTableWriter::cancel_with_status(const Status& st) {
         return Status::OK();
     }
     {
-        std::lock_guard<std::mutex> l(_mem_table_ptr_lock);
+        std::lock_guard<std::mutex> lm(_mem_table_ptr_lock);
         _mem_table.reset();
     }
     if (_flush_token != nullptr) {

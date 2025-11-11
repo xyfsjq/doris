@@ -27,7 +27,6 @@
 
 #include "common/object_pool.h"
 #include "pipeline/pipeline_task.h"
-#include "runtime/fragment_mgr.h"
 #include "testutil/mock/mock_runtime_state.h"
 #include "util/runtime_profile.h"
 #include "vec/spill/spill_stream_manager.h"
@@ -76,40 +75,18 @@ public:
     }
 };
 
-class MockFragmentManager : public FragmentMgr {
-public:
-    MockFragmentManager(Status& status_, ExecEnv* exec_env)
-            : FragmentMgr(exec_env), status(status_) {}
-    void cancel_query(const TUniqueId query_id, const Status reason) override { status = reason; }
-
-private:
-    Status& status;
-};
-
 class SpillableDebugPointHelper {
 public:
     SpillableDebugPointHelper(const std::string name)
-            : _enable_debug_points(config::enable_debug_points),
-              _fragment_mgr(ExecEnv::GetInstance()->_fragment_mgr) {
+            : _enable_debug_points(config::enable_debug_points) {
         config::enable_debug_points = true;
-        ExecEnv::GetInstance()->_fragment_mgr =
-                new MockFragmentManager(_spill_status, ExecEnv::GetInstance());
         DebugPoints::instance()->add(name);
     }
 
-    ~SpillableDebugPointHelper() {
-        config::enable_debug_points = _enable_debug_points;
-        ExecEnv::GetInstance()->_fragment_mgr->stop();
-        SAFE_DELETE(ExecEnv::GetInstance()->_fragment_mgr);
-        ExecEnv::GetInstance()->_fragment_mgr = _fragment_mgr;
-    }
-
-    const Status& get_spill_status() const { return _spill_status; }
+    ~SpillableDebugPointHelper() { config::enable_debug_points = _enable_debug_points; }
 
 private:
-    Status _spill_status;
     const bool _enable_debug_points;
-    FragmentMgr* const _fragment_mgr;
 };
 
 class SpillableOperatorTestHelper {
@@ -124,7 +101,10 @@ public:
     std::unique_ptr<MockRuntimeState> runtime_state;
     std::unique_ptr<ObjectPool> obj_pool;
     std::shared_ptr<QueryContext> query_ctx;
-    std::shared_ptr<RuntimeProfile> runtime_profile;
+    std::unique_ptr<RuntimeProfile> operator_profile;
+    std::unique_ptr<RuntimeProfile> custom_profile;
+    std::unique_ptr<RuntimeProfile> common_profile;
+
     std::shared_ptr<PipelineTask> pipeline_task;
     DescriptorTbl* desc_tbl;
     static constexpr uint32_t TEST_PARTITION_COUNT = 8;

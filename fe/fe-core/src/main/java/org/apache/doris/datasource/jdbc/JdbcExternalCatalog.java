@@ -23,11 +23,13 @@ import org.apache.doris.catalog.JdbcResource;
 import org.apache.doris.catalog.JdbcTable;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.datasource.CatalogProperty;
 import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.datasource.ExternalDatabase;
+import org.apache.doris.datasource.ExternalFunctionRules;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.InitCatalogLog;
 import org.apache.doris.datasource.SessionContext;
@@ -39,6 +41,7 @@ import org.apache.doris.datasource.mapping.JdbcIdentifierMapping;
 import org.apache.doris.proto.InternalService;
 import org.apache.doris.proto.InternalService.PJdbcTestConnectionRequest;
 import org.apache.doris.proto.InternalService.PJdbcTestConnectionResult;
+import org.apache.doris.resource.computegroup.ComputeGroupMgr;
 import org.apache.doris.rpc.BackendServiceProxy;
 import org.apache.doris.rpc.RpcException;
 import org.apache.doris.system.Backend;
@@ -50,7 +53,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.protobuf.ByteString;
-import lombok.Getter;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -63,7 +65,6 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
-@Getter
 public class JdbcExternalCatalog extends ExternalCatalog {
     private static final Logger LOG = LogManager.getLogger(JdbcExternalCatalog.class);
 
@@ -77,6 +78,7 @@ public class JdbcExternalCatalog extends ExternalCatalog {
     // or Gson will throw exception with HikariCP
     private transient JdbcClient jdbcClient;
     private IdentifierMapping identifierMapping;
+    private ExternalFunctionRules functionRules;
 
     public JdbcExternalCatalog(long catalogId, String name, String resource, Map<String, String> props,
             String comment)
@@ -87,6 +89,10 @@ public class JdbcExternalCatalog extends ExternalCatalog {
                 (Env.isTableNamesCaseInsensitive() || Env.isStoredTableNamesLowerCase()),
                 Boolean.parseBoolean(getLowerCaseMetaNames()),
                 getMetaNamesMapping());
+    }
+
+    public JdbcClient getJdbcClient() {
+        return jdbcClient;
     }
 
     @Override
@@ -107,6 +113,9 @@ public class JdbcExternalCatalog extends ExternalCatalog {
                 getExcludeDatabaseMap());
         JdbcResource.checkConnectionPoolProperties(getConnectionPoolMinSize(), getConnectionPoolMaxSize(),
                 getConnectionPoolMaxWaitTime(), getConnectionPoolMaxLifeTime());
+
+        // check function rules
+        ExternalFunctionRules.check(catalogProperty.getProperties().getOrDefault(JdbcResource.FUNCTION_RULES, ""));
     }
 
     @Override
@@ -125,7 +134,7 @@ public class JdbcExternalCatalog extends ExternalCatalog {
     }
 
     @Override
-    public void resetToUninitialized(boolean invalidCache) {
+    public synchronized void resetToUninitialized(boolean invalidCache) {
         super.resetToUninitialized(invalidCache);
         this.identifierMapping = new JdbcIdentifierMapping(
                 (Env.isTableNamesCaseInsensitive() || Env.isStoredTableNamesLowerCase()),
@@ -157,6 +166,7 @@ public class JdbcExternalCatalog extends ExternalCatalog {
     }
 
     public String getDatabaseTypeName() {
+        makeSureInitialized();
         return jdbcClient.getDbType();
     }
 
@@ -221,6 +231,12 @@ public class JdbcExternalCatalog extends ExternalCatalog {
 
     @Override
     protected void initLocalObjectsImpl() {
+        jdbcClient = createJdbcClient();
+        this.functionRules = ExternalFunctionRules.create(jdbcClient.getDbType(),
+                catalogProperty.getOrDefault(JdbcResource.FUNCTION_RULES, ""));
+    }
+
+    private JdbcClient createJdbcClient() {
         JdbcClientConfig jdbcClientConfig = new JdbcClientConfig()
                 .setCatalog(this.name)
                 .setUser(getJdbcUser())
@@ -237,7 +253,7 @@ public class JdbcExternalCatalog extends ExternalCatalog {
                 .setConnectionPoolMaxWaitTime(getConnectionPoolMaxWaitTime())
                 .setConnectionPoolKeepAlive(isConnectionPoolKeepAlive());
 
-        jdbcClient = JdbcClient.createJdbcClient(jdbcClientConfig);
+        return JdbcClient.createJdbcClient(jdbcClientConfig);
     }
 
     @Override
@@ -337,16 +353,21 @@ public class JdbcExternalCatalog extends ExternalCatalog {
     }
 
     public void configureJdbcTable(JdbcTable jdbcTable, String tableName) {
+        makeSureInitialized();
+        setCommonJdbcTableProperties(jdbcTable, tableName, this.jdbcClient);
+    }
+
+    private void setCommonJdbcTableProperties(JdbcTable jdbcTable, String tableName, JdbcClient jdbcClient) {
         jdbcTable.setCatalogId(this.getId());
         jdbcTable.setExternalTableName(tableName);
-        jdbcTable.setJdbcTypeName(this.getDatabaseTypeName());
+        jdbcTable.setJdbcTypeName(jdbcClient.getDbType());
         jdbcTable.setJdbcUrl(this.getJdbcUrl());
         jdbcTable.setJdbcUser(this.getJdbcUser());
         jdbcTable.setJdbcPasswd(this.getJdbcPasswd());
         jdbcTable.setDriverClass(this.getDriverClass());
         jdbcTable.setDriverUrl(this.getDriverUrl());
         jdbcTable.setCheckSum(this.getCheckSum());
-        jdbcTable.setResourceName(this.getResource());
+        jdbcTable.setResourceName("");
         jdbcTable.setConnectionPoolMinSize(this.getConnectionPoolMinSize());
         jdbcTable.setConnectionPoolMaxSize(this.getConnectionPoolMaxSize());
         jdbcTable.setConnectionPoolMaxLifeTime(this.getConnectionPoolMaxLifeTime());
@@ -360,22 +381,23 @@ public class JdbcExternalCatalog extends ExternalCatalog {
             return;
         }
         if (isTestConnection()) {
+            JdbcClient testClient = null;
             try {
-                initLocalObjectsImpl();
-                testFeToJdbcConnection();
-                testBeToJdbcConnection();
+                testClient = createJdbcClient();
+                testFeToJdbcConnection(testClient);
+                testBeToJdbcConnection(testClient);
             } finally {
-                if (jdbcClient != null) {
-                    jdbcClient.closeClient();
-                    jdbcClient = null;
+                if (testClient != null) {
+                    testClient.closeClient();
+                    testClient = null;
                 }
             }
         }
     }
 
-    private void testFeToJdbcConnection() throws DdlException {
+    private void testFeToJdbcConnection(JdbcClient testClient) throws DdlException {
         try {
-            jdbcClient.testConnection();
+            testClient.testConnection();
         } catch (JdbcClientException e) {
             String errorMessage = "Test FE Connection to JDBC Failed: " + e.getMessage();
             LOG.warn(errorMessage, e);
@@ -383,7 +405,7 @@ public class JdbcExternalCatalog extends ExternalCatalog {
         }
     }
 
-    private void testBeToJdbcConnection() throws DdlException {
+    private void testBeToJdbcConnection(JdbcClient testClient) throws DdlException {
         Backend aliveBe = null;
         try {
             for (Backend be : Env.getCurrentSystemInfo().getAllBackendsByAllCluster().values()) {
@@ -395,15 +417,20 @@ public class JdbcExternalCatalog extends ExternalCatalog {
             throw new DdlException(e.getMessage());
         }
         if (aliveBe == null) {
-            throw new DdlException("Test BE Connection to JDBC Failed: No Alive backends");
+            String computeGroupHints = "";
+            if (Config.isCloudMode()) {
+                // null: computeGroupNotFoundPromptMsg select cluster for hint msg
+                computeGroupHints = ComputeGroupMgr.computeGroupNotFoundPromptMsg(null);
+            }
+            throw new DdlException("Test BE Connection to JDBC Failed: No Alive backends" + computeGroupHints);
         }
         TNetworkAddress address = new TNetworkAddress(aliveBe.getHost(), aliveBe.getBrpcPort());
         try {
-            JdbcTable jdbcTable = getTestConnectionJdbcTable();
+            JdbcTable testTable = getTestConnectionJdbcTable(testClient);
             PJdbcTestConnectionRequest request = InternalService.PJdbcTestConnectionRequest.newBuilder()
-                    .setJdbcTable(ByteString.copyFrom(new TSerializer().serialize(jdbcTable.toThrift())))
-                    .setJdbcTableType(jdbcTable.getJdbcTableType().getValue())
-                    .setQueryStr(jdbcClient.getTestQuery()).build();
+                    .setJdbcTable(ByteString.copyFrom(new TSerializer().serialize(testTable.toThrift())))
+                    .setJdbcTableType(testTable.getJdbcTableType().getValue())
+                    .setQueryStr(testClient.getTestQuery()).build();
             InternalService.PJdbcTestConnectionResult result = null;
             Future<PJdbcTestConnectionResult> future = BackendServiceProxy.getInstance()
                     .testJdbcConnection(address, request);
@@ -417,14 +444,21 @@ public class JdbcExternalCatalog extends ExternalCatalog {
         }
     }
 
-    private JdbcTable getTestConnectionJdbcTable() throws DdlException {
-        JdbcTable jdbcTable = new JdbcTable(0, "test_jdbc_connection", Lists.newArrayList(),
+    private JdbcTable getTestConnectionJdbcTable(JdbcClient testClient) throws DdlException {
+        JdbcTable testTable = new JdbcTable(0, "test_jdbc_connection", Lists.newArrayList(),
                 TableType.JDBC_EXTERNAL_TABLE);
-        this.configureJdbcTable(jdbcTable, "test_jdbc_connection");
-
+        setCommonJdbcTableProperties(testTable, "test_jdbc_connection", testClient);
         // Special checksum computation
-        jdbcTable.setCheckSum(JdbcResource.computeObjectChecksum(this.getDriverUrl()));
+        testTable.setCheckSum(JdbcResource.computeObjectChecksum(this.getDriverUrl()));
 
-        return jdbcTable;
+        return testTable;
+    }
+
+    public ExternalFunctionRules getFunctionRules() {
+        return functionRules;
+    }
+
+    public IdentifierMapping getIdentifierMapping() {
+        return identifierMapping;
     }
 }

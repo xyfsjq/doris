@@ -33,7 +33,9 @@ public class AutoBucketUtils {
     private static Logger logger = LogManager.getLogger(AutoBucketUtils.class);
 
     static final long SIZE_100MB = 100 * 1024 * 1024L;
+
     static final long SIZE_1GB = 1 * 1024 * 1024 * 1024L;
+
     static final long SIZE_1TB = 1024 * SIZE_1GB;
 
     private static int getBENum() {
@@ -55,7 +57,8 @@ public class AutoBucketUtils {
         return activeBENum;
     }
 
-    private static int getBucketsNumByBEDisks() {
+    // public for mock in test
+    public static int getBucketsNumByBEDisks() {
         SystemInfoService infoService = Env.getCurrentSystemInfo();
         ImmutableMap<Long, Backend> backends;
         try {
@@ -74,14 +77,14 @@ public class AutoBucketUtils {
             ImmutableMap<String, DiskInfo> disks = backend.getDisks();
             for (DiskInfo diskInfo : disks.values()) {
                 if (diskInfo.getState() == DiskState.ONLINE && diskInfo.hasPathHash()) {
-                    buckets += (diskInfo.getAvailableCapacityB() - 1) / (50 * SIZE_1GB) + 1;
+                    buckets += (int) ((diskInfo.getAvailableCapacityB() - 1) / (50 * SIZE_1GB) + 1);
                 }
             }
         }
         return buckets;
     }
 
-    private static int convertParitionSizeToBucketsNum(long partitionSize) {
+    private static int convertPartitionSizeToBucketsNum(long partitionSize) {
         partitionSize /= 5; // for compression 5:1
 
         // <= 100MB, 1 bucket
@@ -92,12 +95,21 @@ public class AutoBucketUtils {
         } else if (partitionSize <= SIZE_1GB) {
             return 2;
         } else {
-            return (int) ((partitionSize - 1) / SIZE_1GB + 1);
+            int partitionSizePerBucket = Config.autobucket_partition_size_per_bucket_gb;
+            if (partitionSizePerBucket <= 0) {
+                if (Config.isCloudMode()) {
+                    partitionSizePerBucket = 10;
+                } else {
+                    partitionSizePerBucket = 5;
+                }
+                logger.debug("autobucket_partition_size_per_bucket_gb <= 0, use adaptive {}", partitionSizePerBucket);
+            }
+            return (int) ((partitionSize - 1) / (partitionSizePerBucket * SIZE_1GB) + 1);
         }
     }
 
     public static int getBucketsNum(long partitionSize) {
-        int bucketsNumByPartitionSize = convertParitionSizeToBucketsNum(partitionSize);
+        int bucketsNumByPartitionSize = convertPartitionSizeToBucketsNum(partitionSize);
         int bucketsNumByBE = Config.isCloudMode() ? Integer.MAX_VALUE : getBucketsNumByBEDisks();
         int bucketsNum = Math.min(Config.autobucket_max_buckets, Math.min(bucketsNumByPartitionSize, bucketsNumByBE));
         int beNum = getBENum();

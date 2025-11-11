@@ -91,6 +91,7 @@ public:
                      const int64_t wait_for_worker, const uint64_t time_to_find_recvr);
 
     void add_block(Block* block, int sender_id, bool use_move);
+    std::string debug_string();
 
     MOCK_FUNCTION Status get_next(Block* block, bool* eos);
 
@@ -111,7 +112,7 @@ public:
     // Careful: stream sender will call this function for a local receiver,
     // accessing members of receiver that are allocated by Object pool
     // in this function is not safe.
-    bool exceeds_limit(size_t block_byte_size);
+    MOCK_FUNCTION bool exceeds_limit(size_t block_byte_size);
     bool queue_exceeds_limit(size_t byte_size) const;
     bool is_closed() const { return _is_closed; }
 
@@ -184,6 +185,7 @@ public:
     Status add_block(std::unique_ptr<PBlock> pblock, int be_number, int64_t packet_seq,
                      ::google::protobuf::Closure** done, const int64_t wait_for_worker,
                      const uint64_t time_to_find_recvr);
+    std::string debug_string();
 
     void add_block(Block* block, bool use_move);
 
@@ -269,7 +271,8 @@ protected:
                 DCHECK(_pblock);
                 SCOPED_RAW_TIMER(&_deserialize_time);
                 _block = Block::create_unique();
-                RETURN_IF_ERROR_OR_CATCH_EXCEPTION(_block->deserialize(*_pblock));
+                RETURN_IF_ERROR_OR_CATCH_EXCEPTION(
+                        _block->deserialize(*_pblock, &_decompress_bytes, &_decompress_time));
             }
             block.swap(_block);
             _block.reset();
@@ -278,6 +281,8 @@ protected:
 
         size_t block_byte_size() const { return _block_byte_size; }
         int64_t deserialize_time() const { return _deserialize_time; }
+        int64_t decompress_time() const { return _decompress_time; }
+        size_t decompress_bytes() const { return _decompress_bytes; }
         BlockItem() = default;
         BlockItem(BlockUPtr&& block, size_t block_byte_size)
                 : _block(std::move(block)), _block_byte_size(block_byte_size) {}
@@ -290,6 +295,8 @@ protected:
         std::unique_ptr<PBlock> _pblock;
         size_t _block_byte_size = 0;
         int64_t _deserialize_time = 0;
+        int64_t _decompress_time = 0;
+        size_t _decompress_bytes = 0;
     };
 
     std::list<BlockItem> _block_queue;

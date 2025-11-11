@@ -21,6 +21,7 @@ import org.apache.doris.analysis.DescriptorTable;
 import org.apache.doris.analysis.ExplainOptions;
 import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
@@ -30,6 +31,7 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.profile.SummaryProfile;
 import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.mysql.FieldInfo;
 import org.apache.doris.nereids.exceptions.AnalysisException;
@@ -50,9 +52,12 @@ import org.apache.doris.nereids.processor.post.PlanPostProcessors;
 import org.apache.doris.nereids.processor.pre.PlanPreprocessors;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.rules.exploration.mv.MaterializationContext;
+import org.apache.doris.nereids.rules.exploration.mv.MaterializedViewUtils;
+import org.apache.doris.nereids.rules.exploration.mv.PreMaterializedViewRewriter;
 import org.apache.doris.nereids.stats.StatsCalculator;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.trees.plans.AbstractPlan;
 import org.apache.doris.nereids.trees.plans.ComputeResultSet;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.algebra.CatalogRelation;
@@ -64,11 +69,13 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSqlCache;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalDictionarySink;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSqlCache;
 import org.apache.doris.nereids.trees.plans.physical.TopnFilter;
 import org.apache.doris.planner.PlanFragment;
+import org.apache.doris.planner.PlanNodeId;
 import org.apache.doris.planner.Planner;
 import org.apache.doris.planner.RuntimeFilter;
 import org.apache.doris.planner.ScanNode;
@@ -77,6 +84,7 @@ import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ResultSet;
 import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.VariableMgr;
+import org.apache.doris.statistics.util.StatisticsUtil;
 import org.apache.doris.thrift.TQueryCacheParam;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -91,7 +99,9 @@ import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -99,8 +109,10 @@ import java.util.function.Function;
  * Planner to do query plan in Nereids.
  */
 public class NereidsPlanner extends Planner {
+    // private static final AtomicInteger executeCount = new AtomicInteger(0);
     public static final Logger LOG = LogManager.getLogger(NereidsPlanner.class);
 
+    public static AtomicLong runningPlanNum = new AtomicLong(0L);
     protected Plan parsedPlan;
     protected Plan analyzedPlan;
     protected Plan rewrittenPlan;
@@ -144,6 +156,7 @@ public class NereidsPlanner extends Planner {
 
         PhysicalProperties requireProperties = buildInitRequireProperties();
         statementContext.getStopwatch().reset().start();
+        NereidsPlanner.runningPlanNum.incrementAndGet();
         try {
             boolean showPlanProcess = showPlanProcess(queryStmt.getExplainOptions());
             planWithLock(parsedPlan, requireProperties, explainLevel, showPlanProcess, plan -> {
@@ -155,6 +168,12 @@ public class NereidsPlanner extends Planner {
             });
         } finally {
             statementContext.getStopwatch().stop();
+            NereidsPlanner.runningPlanNum.decrementAndGet();
+        }
+
+        if (LOG.isDebugEnabled()) {
+            LOG.info(getExplainString(new ExplainOptions(ExplainLevel.SHAPE_PLAN, false)));
+            LOG.info(getExplainString(new ExplainOptions(ExplainLevel.DISTRIBUTED_PLAN, false)));
         }
     }
 
@@ -208,6 +227,23 @@ public class NereidsPlanner extends Planner {
                         logicalSqlCache.getCacheValues(), logicalSqlCache.getBackendAddress(),
                         logicalSqlCache.getPlanBody()
                 );
+                if (explainLevel != ExplainLevel.NONE) {
+                    this.cascadesContext = CascadesContext.initContext(
+                            statementContext, parsedPlan, PhysicalProperties.ANY);
+                    switch (explainLevel) {
+                        case OPTIMIZED_PLAN:
+                        case ALL_PLAN:
+                            cascadesContext.addPlanProcess(
+                                    new PlanProcess("ImplementSqlCache",
+                                            parsedPlan.treeString(false, parsedPlan),
+                                            physicalPlan.treeString(false, physicalPlan)
+                                    )
+                            );
+                            break;
+                        default: {
+                        }
+                    }
+                }
                 return physicalPlan;
             }
             if (explainLevel == ExplainLevel.PARSED_PLAN || explainLevel == ExplainLevel.ALL_PLAN) {
@@ -224,7 +260,6 @@ public class NereidsPlanner extends Planner {
             // collect table and lock them in the order of table id
             collectAndLockTable(showAnalyzeProcess(explainLevel, showPlanProcess));
             // after table collector, we should use a new context.
-            statementContext.loadSnapshots();
             Plan resultPlan = planWithoutLock(plan, requireProperties, explainLevel, showPlanProcess);
             lockCallback.accept(resultPlan);
             if (statementContext.getConnectContext().getExecutor() != null) {
@@ -245,7 +280,6 @@ public class NereidsPlanner extends Planner {
             boolean showPlanProcess) {
         // minidump of input must be serialized first, this process ensure minidump string not null
         try {
-
             MinidumpUtils.serializeInputsToDumpFile(plan, statementContext);
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -261,6 +295,8 @@ public class NereidsPlanner extends Planner {
 
         // rule-based optimize
         rewrite(showRewriteProcess(explainLevel, showPlanProcess));
+        // try to pre mv rewrite
+        preMaterializedViewRewrite();
         if (explainLevel == ExplainLevel.REWRITTEN_PLAN || explainLevel == ExplainLevel.ALL_PLAN) {
             rewrittenPlan = cascadesContext.getRewritePlan();
             if (explainLevel == ExplainLevel.REWRITTEN_PLAN) {
@@ -268,7 +304,7 @@ public class NereidsPlanner extends Planner {
             }
         }
 
-        optimize();
+        optimize(showPlanProcess);
         // print memo before choose plan.
         // if chooseNthPlan failed, we could get memo to debug
         if (cascadesContext.getConnectContext().getSessionVariable().dumpNereidsMemo) {
@@ -295,7 +331,6 @@ public class NereidsPlanner extends Planner {
         // serialize optimized plan to dumpfile, dumpfile do not have this part means optimize failed
         MinidumpUtils.serializeOutputToDumpFile(physicalPlan);
         NereidsTracer.output(statementContext.getConnectContext());
-
         return physicalPlan;
     }
 
@@ -304,39 +339,48 @@ public class NereidsPlanner extends Planner {
     }
 
     /**
-     * compute rf wait time according to max table row count, if wait time is not default value
-     *     olap:
-     *     row < 1G: 1 sec
-     *     1G <= row < 10G: 5 sec
-     *     10G < row: 20 sec
-     *     external:
-     *     row < 1G: 5 sec
-     *     1G <= row < 10G: 10 sec
-     *     10G < row: 50 sec
+     * config rf wait time if wait time is the same as default value
+     * 1. local mode, config according to max table row count
+     *     a. olap table:
+     *       row < 1G: 1 sec
+     *       1G <= row < 10G: 5 sec
+     *       10G < row: 20 sec
+     *     b. external table:
+     *       row < 1G: 5 sec
+     *       1G <= row < 10G: 10 sec
+     *       10G < row: 50 sec
+     * 2. cloud mode, config it as query time out
      */
-    private void setRuntimeFilterWaitTimeByTableRowCountAndType() {
-        if (ConnectContext.get() != null && ConnectContext.get().getSessionVariable().getRuntimeFilterWaitTimeMs()
-                != VariableMgr.getDefaultSessionVariable().getRuntimeFilterWaitTimeMs()) {
-            List<LogicalCatalogRelation> scans = cascadesContext.getRewritePlan()
-                    .collectToList(LogicalCatalogRelation.class::isInstance);
-            double maxRow = StatsCalculator.getMaxTableRowCount(scans, cascadesContext);
-            boolean hasExternalTable = scans.stream().anyMatch(scan -> !(scan instanceof LogicalOlapScan));
+    private void configRuntimeFilterWaitTime() {
+        if (ConnectContext.get() != null && ConnectContext.get().getSessionVariable() != null
+                && ConnectContext.get().getSessionVariable().getRuntimeFilterWaitTimeMs()
+                == VariableMgr.getDefaultSessionVariable().getRuntimeFilterWaitTimeMs()) {
             SessionVariable sessionVariable = ConnectContext.get().getSessionVariable();
-            if (hasExternalTable) {
-                if (maxRow < 1_000_000_000L) {
-                    sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "5000");
-                } else if (maxRow < 10_000_000_000L) {
-                    sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "20000");
-                } else {
-                    sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "50000");
-                }
+            if (Config.isCloudMode()) {
+                sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS,
+                        String.valueOf(Math.max(VariableMgr.getDefaultSessionVariable().getRuntimeFilterWaitTimeMs(),
+                                1000 * sessionVariable.getQueryTimeoutS())));
             } else {
-                if (maxRow < 1_000_000_000L) {
-                    sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "1000");
-                } else if (maxRow < 10_000_000_000L) {
-                    sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "5000");
+                List<LogicalCatalogRelation> scans = cascadesContext.getRewritePlan()
+                        .collectToList(LogicalCatalogRelation.class::isInstance);
+                double maxRow = StatsCalculator.getMaxTableRowCount(scans, cascadesContext);
+                boolean hasExternalTable = scans.stream().anyMatch(scan -> !(scan instanceof LogicalOlapScan));
+                if (hasExternalTable) {
+                    if (maxRow < 1_000_000_000L) {
+                        sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "5000");
+                    } else if (maxRow < 10_000_000_000L) {
+                        sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "20000");
+                    } else {
+                        sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "50000");
+                    }
                 } else {
-                    sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "20000");
+                    if (maxRow < 1_000_000_000L) {
+                        sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "1000");
+                    } else if (maxRow < 10_000_000_000L) {
+                        sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "5000");
+                    } else {
+                        sessionVariable.setVarOnce(SessionVariable.RUNTIME_FILTER_WAIT_TIME_MS, "20000");
+                    }
                 }
             }
         }
@@ -350,7 +394,7 @@ public class NereidsPlanner extends Planner {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Start collect and lock table");
         }
-        keepOrShowPlanProcess(showPlanProcess, () -> cascadesContext.newTableCollector().collect());
+        keepOrShowPlanProcess(showPlanProcess, () -> cascadesContext.newTableCollector(true).collect());
         statementContext.lock();
         cascadesContext.setCteContext(new CTEContext());
         NereidsTracer.logImportantTime("EndCollectAndLockTables");
@@ -358,7 +402,8 @@ public class NereidsPlanner extends Planner {
             LOG.debug("End collect and lock table");
         }
         if (statementContext.getConnectContext().getExecutor() != null) {
-            statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsLockTableFinishTime();
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsLockTableFinishTime(TimeUtils.getStartTimeMs());
         }
     }
 
@@ -367,15 +412,14 @@ public class NereidsPlanner extends Planner {
             LOG.debug("Start analyze plan");
         }
         keepOrShowPlanProcess(showPlanProcess, () -> cascadesContext.newAnalyzer().analyze());
-        this.statementContext.getPlannerHooks().forEach(hook -> hook.afterAnalyze(this));
         NereidsTracer.logImportantTime("EndAnalyzePlan");
         if (LOG.isDebugEnabled()) {
             LOG.debug("End analyze plan");
         }
 
         if (statementContext.getConnectContext().getExecutor() != null) {
-            statementContext.getConnectContext().getExecutor().getSummaryProfile().setQueryAnalysisFinishTime();
-            statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsAnalysisTime();
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsAnalysisTime(TimeUtils.getStartTimeMs());
         }
     }
 
@@ -386,18 +430,89 @@ public class NereidsPlanner extends Planner {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Start rewrite plan");
         }
-        keepOrShowPlanProcess(showPlanProcess, () -> Rewriter.getWholeTreeRewriter(cascadesContext).execute());
+        keepOrShowPlanProcess(showPlanProcess, () -> {
+            Rewriter.getWholeTreeRewriter(cascadesContext).execute();
+        });
         NereidsTracer.logImportantTime("EndRewritePlan");
         if (LOG.isDebugEnabled()) {
             LOG.debug("End rewrite plan");
         }
         if (statementContext.getConnectContext().getExecutor() != null) {
-            statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsRewriteTime();
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsRewriteTime(TimeUtils.getStartTimeMs());
+        }
+        statementContext.setNeedPreMvRewrite(PreMaterializedViewRewriter.needPreRewrite(cascadesContext));
+        // init materialization context for mv rewrite
+        cascadesContext.getStatementContext().getPlannerHooks().forEach(hook -> hook.afterRewrite(cascadesContext));
+    }
+
+    protected void preMaterializedViewRewrite() {
+        if (!cascadesContext.getStatementContext().isNeedPreMvRewrite()) {
+            return;
+        }
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Start pre rewrite plan by mv");
+        }
+        List<Plan> tmpPlansForMvRewrite = cascadesContext.getStatementContext().getTmpPlanForMvRewrite();
+        Plan originalPlan = cascadesContext.getRewritePlan();
+        List<Plan> plansWhichContainMv = new ArrayList<>();
+        // because tmpPlansForMvRewrite only one, so timeout is cumulative which is ok
+        for (Plan planForRewrite : tmpPlansForMvRewrite) {
+            SessionVariable sessionVariable = cascadesContext.getConnectContext()
+                    .getSessionVariable();
+            int timeoutSecond = sessionVariable.nereidsTimeoutSecond;
+            boolean enableTimeout = sessionVariable.enableNereidsTimeout;
+            try {
+                // set mv rewrite timeout
+                sessionVariable.nereidsTimeoutSecond = PreMaterializedViewRewriter.convertMillisToCeilingSeconds(
+                                sessionVariable.materializedViewRewriteDurationThresholdMs);
+                sessionVariable.enableNereidsTimeout = true;
+                // pre rewrite
+                Plan rewrittenPlan = MaterializedViewUtils.rewriteByRules(cascadesContext,
+                        PreMaterializedViewRewriter::rewrite, planForRewrite, planForRewrite, true);
+                Plan ruleOptimizedPlan = MaterializedViewUtils.rewriteByRules(cascadesContext,
+                        childOptContext -> {
+                            Rewriter.getWholeTreeRewriterWithoutCostBasedJobs(childOptContext).execute();
+                            return childOptContext.getRewritePlan();
+                        }, rewrittenPlan, planForRewrite, false);
+                if (ruleOptimizedPlan == null) {
+                    continue;
+                }
+                // after rbo, maybe the plan changed a lot, so we need to normalize it with original plan
+                Plan normalizedPlan = MaterializedViewUtils.normalizeSinkExpressions(
+                        ruleOptimizedPlan, originalPlan);
+                if (normalizedPlan != null) {
+                    plansWhichContainMv.add(normalizedPlan);
+                }
+            } catch (Exception e) {
+                LOG.error("pre mv rewrite in rbo rewrite fail, query id is {}",
+                        cascadesContext.getConnectContext().getQueryIdentifier(), e);
+
+            } finally {
+                sessionVariable.nereidsTimeoutSecond = timeoutSecond;
+                sessionVariable.enableNereidsTimeout = enableTimeout;
+            }
+        }
+        // clear the rewritten plans which are tmp optimized, should be filled by full optimize later
+        statementContext.getRewrittenPlansByMv().clear();
+        // if rule-based optimized, would not be rewritten by cbo, so clear materialized hooks
+        this.cascadesContext.getStatementContext().setPreMvRewritten(true);
+        if (plansWhichContainMv.isEmpty()) {
+            return;
+        }
+        plansWhichContainMv.forEach(statementContext::addRewrittenPlanByMv);
+        NereidsTracer.logImportantTime("EndPreRewritePlanByMv");
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("End pre rewrite plan by mv");
+        }
+        if (statementContext.getConnectContext().getExecutor() != null) {
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsPreRewriteByMvFinishTime(TimeUtils.getStartTimeMs());
         }
     }
 
-    // DependsRules: EnsureProjectOnTopJoin.class
-    protected void optimize() {
+    // DependsRules: AddProjectForJoin
+    protected void optimize(boolean showPlanProcess) {
         // if we cannot get table row count, skip join reorder
         // except:
         //   1. user set leading hint
@@ -410,17 +525,52 @@ public class NereidsPlanner extends Planner {
                     .disableJoinReorderIfStatsInvalid(scans, cascadesContext);
             disableJoinReorderReason.ifPresent(statementContext::setDisableJoinReorderReason);
         }
-        setRuntimeFilterWaitTimeByTableRowCountAndType();
+        configRuntimeFilterWaitTime();
         if (LOG.isDebugEnabled()) {
             LOG.debug("Start optimize plan");
         }
-        new Optimizer(cascadesContext).execute();
+        keepOrShowPlanProcess(showPlanProcess, () -> {
+            new Optimizer(cascadesContext).execute();
+        });
         NereidsTracer.logImportantTime("EndOptimizePlan");
         if (LOG.isDebugEnabled()) {
             LOG.debug("End optimize plan");
         }
         if (statementContext.getConnectContext().getExecutor() != null) {
-            statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsOptimizeTime();
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsOptimizeTime(TimeUtils.getStartTimeMs());
+        }
+    }
+
+    /**
+     * Collect plan info for hbo usage.
+     * @param queryId queryId
+     * @param root physical plan
+     * @param context PlanTranslatorContext
+     */
+    private void collectHboPlanInfo(String queryId, PhysicalPlan root, PlanTranslatorContext context) {
+        for (Object child : root.children()) {
+            collectHboPlanInfo(queryId, (PhysicalPlan) child, context);
+        }
+        if (root instanceof AbstractPlan) {
+            int nodeId = ((AbstractPlan) root).getId();
+            PlanNodeId planId = context.getNereidsIdToPlanNodeIdMap().get(nodeId);
+            if (planId != null) {
+                Map<Integer, PhysicalPlan> idToPlanMap = Env.getCurrentEnv().getHboPlanStatisticsManager()
+                        .getHboPlanInfoProvider().getIdToPlanMap(queryId);
+                if (idToPlanMap.isEmpty()) {
+                    Env.getCurrentEnv().getHboPlanStatisticsManager()
+                            .getHboPlanInfoProvider().putIdToPlanMap(queryId, idToPlanMap);
+                }
+                idToPlanMap.put(planId.asInt(), root);
+                Map<PhysicalPlan, Integer> planToIdMap = Env.getCurrentEnv().getHboPlanStatisticsManager()
+                                .getHboPlanInfoProvider().getPlanToIdMap(queryId);
+                if (planToIdMap.isEmpty()) {
+                    Env.getCurrentEnv().getHboPlanStatisticsManager()
+                            .getHboPlanInfoProvider().putPlanToIdMap(queryId, planToIdMap);
+                }
+                planToIdMap.put(root, planId.asInt());
+            }
         }
     }
 
@@ -432,9 +582,6 @@ public class NereidsPlanner extends Planner {
         PlanTranslatorContext planTranslatorContext = new PlanTranslatorContext(cascadesContext);
         PhysicalPlanTranslator physicalPlanTranslator = new PhysicalPlanTranslator(planTranslatorContext,
                 statementContext.getConnectContext().getStatsErrorEstimator());
-        if (statementContext.getConnectContext().getExecutor() != null) {
-            statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsTranslateTime();
-        }
         SessionVariable sessionVariable = cascadesContext.getConnectContext().getSessionVariable();
         if (sessionVariable.isEnableNereidsTrace()) {
             CounterEvent.clearCounter();
@@ -443,6 +590,14 @@ public class NereidsPlanner extends Planner {
             return;
         }
         PlanFragment root = physicalPlanTranslator.translatePlan(physicalPlan);
+        if (statementContext.getConnectContext().getExecutor() != null) {
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsTranslateTime(TimeUtils.getStartTimeMs());
+        }
+        String queryId = DebugUtil.printId(cascadesContext.getConnectContext().queryId());
+        if (StatisticsUtil.isEnableHboInfoCollection()) {
+            collectHboPlanInfo(queryId, physicalPlan, planTranslatorContext);
+        }
 
         scanNodeList.addAll(planTranslatorContext.getScanNodes());
         physicalRelations.addAll(planTranslatorContext.getPhysicalRelations());
@@ -450,7 +605,6 @@ public class NereidsPlanner extends Planner {
         fragments = new ArrayList<>(planTranslatorContext.getPlanFragments());
 
         boolean enableQueryCache = sessionVariable.getEnableQueryCache();
-        String queryId = DebugUtil.printId(cascadesContext.getConnectContext().queryId());
         for (int seq = 0; seq < fragments.size(); seq++) {
             PlanFragment fragment = fragments.get(seq);
             fragment.setFragmentSequenceNum(seq);
@@ -483,8 +637,8 @@ public class NereidsPlanner extends Planner {
             Optional<TableIf> table = Optional.empty();
             if (output instanceof SlotReference) {
                 SlotReference slotReference = (SlotReference) output;
-                column = slotReference.getColumn();
-                table = slotReference.getTable();
+                column = slotReference.getOneLevelColumn();
+                table = slotReference.getOneLevelTable();
             }
             columnLabels.add(output.getName());
             FieldInfo fieldInfo = new FieldInfo(
@@ -511,7 +665,7 @@ public class NereidsPlanner extends Planner {
 
         cascadesContext.releaseMemo();
 
-        // update scan nodes visible version at the end of plan phase.
+        // update scan nodes visible version at the end of plan phase for cloud mode.
         try {
             ScanNode.setVisibleVersionForOlapScanNodes(getScanNodes());
         } catch (UserException ue) {
@@ -520,7 +674,8 @@ public class NereidsPlanner extends Planner {
     }
 
     protected void distribute(PhysicalPlan physicalPlan, ExplainLevel explainLevel) {
-        boolean canUseNereidsDistributePlanner = SessionVariable.canUseNereidsDistributePlanner();
+        boolean canUseNereidsDistributePlanner = SessionVariable.canUseNereidsDistributePlanner()
+                || (physicalPlan instanceof PhysicalDictionarySink); // dic sink only supported in new Coordinator
         if ((!canUseNereidsDistributePlanner && explainLevel.isPlanLevel)) {
             return;
         } else if ((canUseNereidsDistributePlanner && explainLevel.isPlanLevel
@@ -529,12 +684,21 @@ public class NereidsPlanner extends Planner {
         }
 
         splitFragments(physicalPlan);
-        doDistribute(canUseNereidsDistributePlanner);
+        doDistribute(canUseNereidsDistributePlanner, explainLevel);
     }
 
-    protected void doDistribute(boolean canUseNereidsDistributePlanner) {
+    protected void doDistribute(boolean canUseNereidsDistributePlanner, ExplainLevel explainLevel) {
         if (!canUseNereidsDistributePlanner) {
             return;
+        }
+        switch (explainLevel) {
+            case NONE:
+            case ALL_PLAN:
+            case DISTRIBUTED_PLAN:
+                break;
+            default: {
+                return;
+            }
         }
 
         boolean notNeedBackend = false;
@@ -551,7 +715,8 @@ public class NereidsPlanner extends Planner {
 
         distributedPlans = new DistributePlanner(statementContext, fragments, notNeedBackend, false).plan();
         if (statementContext.getConnectContext().getExecutor() != null) {
-            statementContext.getConnectContext().getExecutor().getSummaryProfile().setNereidsDistributeTime();
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsDistributeTime(TimeUtils.getStartTimeMs());
         }
     }
 
@@ -577,7 +742,7 @@ public class NereidsPlanner extends Planner {
             cost = rootGroup.getLowestCostPlan(physicalProperties).orElseThrow(
                     () -> new AnalysisException("lowestCostPlans with physicalProperties("
                             + physicalProperties + ") doesn't exist in root group")).first.getValue();
-            return chooseBestPlan(rootGroup, physicalProperties);
+            return chooseBestPlan(rootGroup, physicalProperties, cascadesContext);
         }
         Memo memo = cascadesContext.getMemo();
 
@@ -586,7 +751,11 @@ public class NereidsPlanner extends Planner {
         return memo.unrank(idCost.first);
     }
 
-    private PhysicalPlan chooseBestPlan(Group rootGroup, PhysicalProperties physicalProperties)
+    /**
+     * Doc
+     */
+    public static PhysicalPlan chooseBestPlan(Group rootGroup, PhysicalProperties physicalProperties,
+            CascadesContext cascadesContext)
             throws AnalysisException {
         try {
             GroupExpression groupExpression = rootGroup.getLowestCostPlan(physicalProperties).orElseThrow(
@@ -602,7 +771,7 @@ public class NereidsPlanner extends Planner {
             List<PhysicalProperties> inputPropertiesList = groupExpression.getInputPropertiesList(physicalProperties);
             List<Plan> planChildren = Lists.newArrayList();
             for (int i = 0; i < groupExpression.arity(); i++) {
-                planChildren.add(chooseBestPlan(groupExpression.child(i), inputPropertiesList.get(i)));
+                planChildren.add(chooseBestPlan(groupExpression.child(i), inputPropertiesList.get(i), cascadesContext));
             }
 
             Plan plan = groupExpression.getPlan().withChildren(planChildren);
@@ -674,13 +843,16 @@ public class NereidsPlanner extends Planner {
 
     @Override
     public String getExplainString(ExplainOptions explainOptions) {
+        if (getConnectContext().getSessionVariable().enableExplainNone) {
+            return "";
+        }
         ExplainLevel explainLevel = getExplainLevel(explainOptions);
         String plan = "";
         String mvSummary = "";
         if ((this.getPhysicalPlan() != null || this.getOptimizedPlan() != null) && cascadesContext != null) {
             mvSummary = cascadesContext.getMaterializationContexts().isEmpty() ? "" :
                     "\n\n========== MATERIALIZATIONS ==========\n"
-                            + MaterializationContext.toSummaryString(cascadesContext.getMaterializationContexts(),
+                            + MaterializationContext.toSummaryString(cascadesContext,
                             this.getPhysicalPlan() == null ? this.getOptimizedPlan() : this.getPhysicalPlan());
         }
         switch (explainLevel) {
@@ -727,12 +899,15 @@ public class NereidsPlanner extends Planner {
                         + parsedPlan.treeString() + "\n\n"
                         + "========== LOCK TABLE "
                         + getTimeMetricString(SummaryProfile::getPrettyNereidsLockTableTime) + " ==========\n"
+                        + "\n\n"
                         + "========== ANALYZED PLAN "
                         + getTimeMetricString(SummaryProfile::getPrettyNereidsAnalysisTime) + " ==========\n"
                         + analyzedPlan.treeString() + "\n\n"
                         + "========== REWRITTEN PLAN "
                         + getTimeMetricString(SummaryProfile::getPrettyNereidsRewriteTime) + " ==========\n"
                         + rewrittenPlan.treeString() + "\n\n"
+                        + "========== PRE REWRITTEN BY MV "
+                        + getTimeMetricString(SummaryProfile::getPrettyNereidsPreRewriteByMvTime) + " ==========\n"
                         + "========== OPTIMIZED PLAN "
                         + getTimeMetricString(SummaryProfile::getPrettyNereidsOptimizeTime) + " ==========\n"
                         + optimizedPlan.treeString() + "\n\n";
@@ -757,7 +932,12 @@ public class NereidsPlanner extends Planner {
                     }
                 }
         }
-
+        if (ConnectContext.get() != null && cascadesContext != null
+                && cascadesContext.getGroupExpressionCount()
+                        > ConnectContext.get().getSessionVariable().memoMaxGroupExpressionSize) {
+            plan += "\n\n\n group expression count exceeds memo_max_group_expression_size("
+                    + ConnectContext.get().getSessionVariable().memoMaxGroupExpressionSize + ")\n";
+        }
         if (statementContext != null) {
             if (!statementContext.getHints().isEmpty()) {
                 String hint = getHintExplainString(statementContext.getHints());
@@ -779,7 +959,10 @@ public class NereidsPlanner extends Planner {
 
     @Override
     public List<RuntimeFilter> getRuntimeFilters() {
-        return cascadesContext.getRuntimeFilterContext().getLegacyFilters();
+        ArrayList<RuntimeFilter> runtimeFilters = new ArrayList<>();
+        runtimeFilters.addAll(cascadesContext.getRuntimeFilterContext().getLegacyFilters());
+        runtimeFilters.addAll(cascadesContext.getRuntimeFilterV2Context().getLegacyFilters());
+        return runtimeFilters;
     }
 
     @Override
@@ -826,14 +1009,18 @@ public class NereidsPlanner extends Planner {
     }
 
     public ConnectContext getConnectContext() {
-        return cascadesContext.getConnectContext();
+        return cascadesContext == null ? ConnectContext.get() : cascadesContext.getConnectContext();
+    }
+
+    public StatementContext getStatementContext() {
+        return statementContext;
     }
 
     public static PhysicalProperties buildInitRequireProperties() {
         return PhysicalProperties.GATHER;
     }
 
-    private ExplainLevel getExplainLevel(ExplainOptions explainOptions) {
+    protected ExplainLevel getExplainLevel(ExplainOptions explainOptions) {
         if (explainOptions == null) {
             return ExplainLevel.NONE;
         }

@@ -244,8 +244,19 @@ public class HyperGraphComparator {
     }
 
     private boolean compareNodeWithExpr(StructInfoNode query, StructInfoNode view) {
-        List<Set<Expression>> queryExprSetList = query.getExprSetList();
-        List<Set<Expression>> viewExprSetList = view.getExprSetList();
+        Pair<List<Set<Expression>>, List<Set<Expression>>> queryExprSetList = query.getExprSetList();
+        Pair<List<Set<Expression>>, List<Set<Expression>>> viewExprSetList = view.getExprSetList();
+        if (queryExprSetList == null || viewExprSetList == null) {
+            return false;
+        }
+        return compareNodeWithExpr(query, ExpressionPosition.NODE_COULD_MOVE,
+                queryExprSetList.key(), viewExprSetList.key())
+                && compareNodeWithExpr(query, ExpressionPosition.NODE_COULD_NOT_MOVE,
+                queryExprSetList.value(), viewExprSetList.value());
+    }
+
+    private boolean compareNodeWithExpr(StructInfoNode query, ExpressionPosition expressionPosition,
+            List<Set<Expression>> queryExprSetList, List<Set<Expression>> viewExprSetList) {
         if (queryExprSetList == null || viewExprSetList == null
                 || queryExprSetList.size() != viewExprSetList.size()) {
             return false;
@@ -256,8 +267,7 @@ public class HyperGraphComparator {
             Set<Expression> mappingQueryExprSet = new HashSet<>();
             for (Expression queryExpression : queryExpressions) {
                 Optional<Expression> mappingViewExprByQueryExpr = getMappingViewExprByQueryExpr(queryExpression, query,
-                        this.logicalCompatibilityContext,
-                        ExpressionPosition.NODE);
+                        this.logicalCompatibilityContext, expressionPosition);
                 if (!mappingViewExprByQueryExpr.isPresent()) {
                     return false;
                 }
@@ -406,13 +416,20 @@ public class HyperGraphComparator {
     }
 
     private Map<Edge, Edge> constructQueryToViewJoinMapWithExpr() {
-        Map<Expression, Edge> viewExprToEdge = getViewJoinEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .collect(ImmutableMap.toImmutableMap(p -> p.first, p -> p.second));
-        Map<Expression, Edge> queryExprToEdge = getQueryJoinEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .collect(ImmutableMap.toImmutableMap(p -> p.first, p -> p.second));
-
+        Map<Expression, Edge> viewExprToEdge = new HashMap<>();
+        List<JoinEdge> viewJoinEdges = getViewJoinEdges();
+        for (JoinEdge viewJoin : viewJoinEdges) {
+            for (Expression expression : viewJoin.getExpressions()) {
+                viewExprToEdge.put(expression, viewJoin);
+            }
+        }
+        Map<Expression, Edge> queryExprToEdge = new HashMap<>();
+        List<JoinEdge> queryJoinEdges = getQueryJoinEdges();
+        for (JoinEdge queryJoin : queryJoinEdges) {
+            for (Expression expression : queryJoin.getExpressions()) {
+                queryExprToEdge.put(expression, queryJoin);
+            }
+        }
         HashMap<Edge, Edge> edgeMap = new HashMap<>();
         for (Entry<Expression, Edge> entry : queryExprToEdge.entrySet()) {
             if (edgeMap.containsKey(entry.getValue())) {
@@ -444,15 +461,19 @@ public class HyperGraphComparator {
     //         +--LogicalOlapScan
     private Map<Edge, Edge> constructQueryToViewFilterMapWithExpr() {
         Multimap<Expression, Edge> viewExprToEdge = HashMultimap.create();
-        getViewFilterEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .forEach(pair -> viewExprToEdge.put(pair.key(), pair.value()));
-
+        List<FilterEdge> viewFilterEdges = getViewFilterEdges();
+        for (FilterEdge viewEdge : viewFilterEdges) {
+            for (Expression expression : viewEdge.getExpressions()) {
+                viewExprToEdge.put(expression, viewEdge);
+            }
+        }
         Multimap<Expression, Edge> queryExprToEdge = HashMultimap.create();
-        getQueryFilterEdges().stream()
-                .flatMap(e -> e.getExpressions().stream().map(expr -> Pair.of(expr, e)))
-                .forEach(pair -> queryExprToEdge.put(pair.key(), pair.value()));
-
+        List<FilterEdge> queryFilterEdges = getQueryFilterEdges();
+        for (FilterEdge queryEdge : queryFilterEdges) {
+            for (Expression expression : queryEdge.getExpressions()) {
+                queryExprToEdge.put(expression, queryEdge);
+            }
+        }
         HashMap<Edge, Edge> queryToViewEdgeMap = new HashMap<>();
         for (Entry<Expression, Collection<Edge>> entry : queryExprToEdge.asMap().entrySet()) {
             Expression queryExprViewBased = null;
@@ -608,9 +629,12 @@ public class HyperGraphComparator {
         } else if (ExpressionPosition.FILTER_EDGE.equals(expressionPosition)) {
             queryShuttledExpr = context.getQueryFilterShuttledExpr(queryExpression);
             viewExpressions = context.getViewFilterExprFromQuery(queryShuttledExpr);
+        } else if (ExpressionPosition.NODE_COULD_MOVE.equals(expressionPosition)) {
+            queryShuttledExpr = context.getQueryNodeShuttledCouldMoveExpr(queryExpression);
+            viewExpressions = context.getViewNodeCouldMoveExprFromQuery(queryShuttledExpr);
         } else {
-            queryShuttledExpr = context.getQueryNodeShuttledExpr(queryExpression);
-            viewExpressions = context.getViewNodeExprFromQuery(queryShuttledExpr);
+            queryShuttledExpr = context.getQueryNodeShuttledCouldNotMoveExpr(queryExpression);
+            viewExpressions = context.getViewNodeCouldNotMoveExprFromQuery(queryShuttledExpr);
         }
         if (viewExpressions.size() == 1) {
             return Optional.of(viewExpressions.iterator().next().key());

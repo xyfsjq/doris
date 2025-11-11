@@ -29,6 +29,8 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.Setter;
@@ -42,8 +44,6 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * used to set fe config.
@@ -94,7 +94,7 @@ public class SetConfigAction extends RestBaseController {
             try {
                 if (confValue != null && confValue.length == 1) {
                     try {
-                        Env.getCurrentEnv().setMutableConfigwithCallback(confKey, confValue[0]);
+                        Env.getCurrentEnv().setMutableConfigWithCallback(confKey, confValue[0]);
                     } catch (ConfigException e) {
                         throw new DdlException(e.getMessage());
                     }

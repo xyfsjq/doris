@@ -18,15 +18,13 @@
 package org.apache.doris.planner;
 
 import org.apache.doris.analysis.Expr;
-import org.apache.doris.analysis.NativeInsertStmt;
-import org.apache.doris.analysis.SelectStmt;
-import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.EnvFactory;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.TableIf.TableType;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -36,6 +34,8 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.load.NereidsStreamLoadPlanner;
+import org.apache.doris.nereids.load.NereidsStreamLoadTask;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.plans.commands.PrepareCommand;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
@@ -49,7 +49,6 @@ import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.rpc.BackendServiceProxy;
 import org.apache.doris.rpc.RpcException;
 import org.apache.doris.system.Backend;
-import org.apache.doris.task.StreamLoadTask;
 import org.apache.doris.thrift.TFileCompressType;
 import org.apache.doris.thrift.TFileFormatType;
 import org.apache.doris.thrift.TFileType;
@@ -67,6 +66,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.ProtocolStringList;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
@@ -123,8 +123,8 @@ public class GroupCommitPlanner {
                 .setMergeType(TMergeType.APPEND).setThriftRpcTimeoutMs(5000).setLoadId(queryId)
                 .setTrimDoubleQuotes(true).setGroupCommitMode(groupCommit)
                 .setStrictMode(ConnectContext.get().getSessionVariable().enableInsertStrict);
-        StreamLoadTask streamLoadTask = StreamLoadTask.fromTStreamLoadPutRequest(streamLoadPutRequest);
-        StreamLoadPlanner planner = new StreamLoadPlanner(db, table, streamLoadTask);
+        NereidsStreamLoadTask streamLoadTask = NereidsStreamLoadTask.fromTStreamLoadPutRequest(streamLoadPutRequest);
+        NereidsStreamLoadPlanner planner = new NereidsStreamLoadPlanner(db, table, streamLoadTask);
         // Will using load id as query id in fragment
         // TODO support pipeline
         TPipelineFragmentParams tRequest = planner.plan(streamLoadTask.getId());
@@ -168,27 +168,6 @@ public class GroupCommitPlanner {
 
     public long getBackendId() {
         return backendId;
-    }
-
-    public List<InternalService.PDataRow> getRows(NativeInsertStmt stmt) throws UserException {
-        List<InternalService.PDataRow> rows = new ArrayList<>();
-        SelectStmt selectStmt = (SelectStmt) (stmt.getQueryStmt());
-        if (selectStmt.getValueList() != null) {
-            for (List<Expr> row : selectStmt.getValueList().getRows()) {
-                rows.add(getOneRow(row));
-            }
-        } else {
-            List<Expr> exprList = new ArrayList<>();
-            for (Expr resultExpr : selectStmt.getResultExprs()) {
-                if (resultExpr instanceof SlotRef) {
-                    exprList.add(((SlotRef) resultExpr).getDesc().getSourceExprs().get(0));
-                } else {
-                    exprList.add(resultExpr);
-                }
-            }
-            rows.add(getOneRow(exprList));
-        }
-        return rows;
     }
 
     private static InternalService.PDataRow getOneRow(List<Expr> row) throws UserException {
@@ -288,6 +267,10 @@ public class GroupCommitPlanner {
         String errMsg = "group commit insert failed. db: " + db.getId() + ", table: " + table.getId()
                 + ", query: " + DebugUtil.printId(ctx.queryId()) + ", backend: " + backendId
                 + ", status: " + response.getStatus();
+        if (response.hasFirstErrorMsg()) {
+            errMsg += ", first_error_msg: "
+                + StringUtils.abbreviate(response.getFirstErrorMsg(), Config.first_error_msg_max_length);
+        }
         if (response.hasErrorUrl()) {
             errMsg += ", error url: " + response.getErrorUrl();
         }
@@ -301,6 +284,7 @@ public class GroupCommitPlanner {
         long loadedRows = response.getLoadedRows();
         long filteredRows = (int) response.getFilteredRows();
         String errorUrl = response.getErrorUrl();
+        String firstErrorMsg = response.getFirstErrorMsg();
         // the same as {@OlapInsertExecutor#setReturnInfo}
         // {'label':'my_label1', 'status':'visible', 'txnId':'123'}
         // {'label':'my_label1', 'status':'visible', 'txnId':'123' 'err':'error messages'}
@@ -313,6 +297,10 @@ public class GroupCommitPlanner {
         /*if (!Strings.isNullOrEmpty(errMsg)) {
             sb.append(", 'err':'").append(errMsg).append("'");
         }*/
+        if (!Strings.isNullOrEmpty(firstErrorMsg)) {
+            sb.append(", 'first_error_msg':'").append(
+                    StringUtils.abbreviate(firstErrorMsg, Config.first_error_msg_max_length)).append("'");
+        }
         if (!Strings.isNullOrEmpty(errorUrl)) {
             sb.append(", 'err_url':'").append(errorUrl).append("'");
         }

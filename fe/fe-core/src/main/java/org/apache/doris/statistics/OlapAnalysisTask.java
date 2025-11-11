@@ -17,7 +17,6 @@
 
 package org.apache.doris.statistics;
 
-import org.apache.doris.analysis.CreateMaterializedViewStmt;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.KeysType;
@@ -35,6 +34,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.qe.AutoCloseConnectContext;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.statistics.util.StatisticsUtil;
 
@@ -118,6 +118,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         Map<String, String> params = buildSqlParams();
         params.put("min", StatisticsUtil.quote(min));
         params.put("max", StatisticsUtil.quote(max));
+        params.put("hotValueCollectCount", String.valueOf(SessionVariable.getHotValueCollectCount()));
         long tableRowCount = info.indexId == -1
                 ? tbl.getRowCount()
                 : ((OlapTable) tbl).getRowCountForIndex(info.indexId, false);
@@ -136,13 +137,6 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
     }
 
     protected ResultRow collectMinMax() {
-        // Agg table value columns has no zone map.
-        // For these columns, skip collecting min and max value to avoid scan whole table.
-        if (((OlapTable) tbl).getKeysType().equals(KeysType.AGG_KEYS) && !col.isKey()) {
-            LOG.info("Aggregation table {} column {} is not a key column, skip collecting min and max.",
-                    tbl.getName(), col.getName());
-            return null;
-        }
         long startTime = System.currentTimeMillis();
         Map<String, String> params = buildSqlParams();
         StringSubstitutor stringSubstitutor = new StringSubstitutor(params);
@@ -171,7 +165,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
     protected Pair<List<Long>, Long> getSampleTablets() {
         long targetSampleRows = getSampleRows();
         OlapTable olapTable = (OlapTable) tbl;
-        boolean forPartitionColumn = tbl.isPartitionColumn(col.getName());
+        boolean forPartitionColumn = tbl.isPartitionColumn(col);
         long avgTargetRowsPerPartition = targetSampleRows / Math.max(olapTable.getPartitions().size(), 1);
         List<Long> sampleTabletIds = new ArrayList<>();
         long selectedRows = 0;
@@ -263,12 +257,21 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         params.put("rowCount", String.valueOf(tableRowCount));
         params.put("type", col.getType().toString());
         params.put("limit", "");
+        params.put("subStringColName", getStringTypeColName(col));
+
+        // For agg table and mor unique table, set PREAGGOPEN preAggHint.
+        if (((OlapTable) tbl).getKeysType().equals(KeysType.AGG_KEYS)
+                || ((OlapTable) tbl).getKeysType().equals(KeysType.UNIQUE_KEYS)
+                && !((OlapTable) tbl).isUniqKeyMergeOnWrite()) {
+            params.put("preAggHint", "/*+PREAGGOPEN*/");
+        }
 
         // If table row count is less than the target sample row count, simple scan the full table.
         if (tableRowCount <= targetSampleRows) {
             params.put("scaleFactor", "1");
             params.put("sampleHints", "");
             params.put("ndvFunction", "ROUND(NDV(`${colName}`) * ${scaleFactor})");
+            params.put("rowCount2", "(SELECT COUNT(1) FROM cte1 WHERE `${colName}` IS NOT NULL)");
             scanFullTable = true;
             return;
         }
@@ -299,6 +302,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         }
         // Set algorithm related params.
         if (useLinearAnalyzeTemplate()) {
+            params.put("rowCount2", "(SELECT COUNT(1) FROM cte1 WHERE `${colName}` IS NOT NULL)");
             // For single unique key, use count as ndv.
             if (isSingleUniqueKey()) {
                 params.put("ndvFunction", String.valueOf(tableRowCount));
@@ -308,7 +312,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         } else {
             params.put("ndvFunction", getNdvFunction(String.valueOf(tableRowCount)));
             params.put("dataSizeFunction", getDataSizeFunction(col, true));
-            params.put("subStringColName", getStringTypeColName(col));
+            params.put("rowCount2", "(SELECT SUM(`count`) FROM cte1 WHERE `col_value` IS NOT NULL)");
         }
     }
 
@@ -388,6 +392,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         params.put("colName", StatisticsUtil.escapeColumnName(String.valueOf(info.colName)));
         params.put("tblName", String.valueOf(tbl.getName()));
         params.put("index", getIndex());
+        params.put("preAggHint", "");
         return params;
     }
 
@@ -492,7 +497,7 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
             return false;
         }
         // Partition column need to scan tablets from all partitions.
-        return !tbl.isPartitionColumn(col.getName());
+        return !tbl.isPartitionColumn(col);
     }
 
     /**
@@ -520,12 +525,9 @@ public class OlapAnalysisTask extends BaseAnalysisTask {
         if (isSingleUniqueKey()) {
             return true;
         }
-        String columnName = col.getName();
-        if (columnName.startsWith(CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX)) {
-            columnName = columnName.substring(CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX.length());
-        }
         Set<String> distributionColumns = tbl.getDistributionColumnNames();
-        return distributionColumns.size() == 1 && distributionColumns.contains(columnName.toLowerCase());
+        return distributionColumns.size() == 1
+                && distributionColumns.contains(col.tryGetBaseColumnName().toLowerCase());
     }
 
     /**

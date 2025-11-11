@@ -58,6 +58,7 @@ using namespace doris::segment_v2;
 
 VMatchPredicate::VMatchPredicate(const TExprNode& node) : VExpr(node) {
     _inverted_index_ctx = std::make_shared<InvertedIndexCtx>();
+    _inverted_index_ctx->custom_analyzer = node.match_predicate.custom_analyzer;
     _inverted_index_ctx->parser_type =
             get_inverted_index_parser_type_from_string(node.match_predicate.parser_type);
     _inverted_index_ctx->parser_mode = node.match_predicate.parser_mode;
@@ -134,7 +135,7 @@ Status VMatchPredicate::evaluate_inverted_index(VExprContext* context, uint32_t 
     return _evaluate_inverted_index(context, _function, segment_num_rows);
 }
 
-Status VMatchPredicate::execute(VExprContext* context, Block* block, int* result_column_id) {
+Status VMatchPredicate::execute(VExprContext* context, Block* block, int* result_column_id) const {
     DCHECK(_open_finished || _getting_const_col);
     if (fast_execute(context, block, result_column_id)) {
         return Status::OK();
@@ -169,7 +170,7 @@ Status VMatchPredicate::execute(VExprContext* context, Block* block, int* result
     // prepare a column to save result
     block->insert({nullptr, _data_type, _expr_name});
     RETURN_IF_ERROR(_function->execute(context->fn_context(_fn_context_index), *block, arguments,
-                                       num_columns_without_result, block->rows(), false));
+                                       num_columns_without_result, block->rows()));
     *result_column_id = num_columns_without_result;
     return Status::OK();
 }

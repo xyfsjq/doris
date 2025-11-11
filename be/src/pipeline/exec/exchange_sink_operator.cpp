@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <string>
 
 #include "common/status.h"
 #include "exchange_sink_buffer.h"
@@ -53,37 +54,39 @@ Status ExchangeSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& inf
     SCOPED_TIMER(_init_timer);
     _sender_id = info.sender_id;
 
-    _bytes_sent_counter = ADD_COUNTER(_profile, "BytesSent", TUnit::BYTES);
-    _uncompressed_bytes_counter = ADD_COUNTER(_profile, "UncompressedRowBatchSize", TUnit::BYTES);
-    _local_sent_rows = ADD_COUNTER(_profile, "LocalSentRows", TUnit::UNIT);
-    _serialize_batch_timer = ADD_TIMER(_profile, "SerializeBatchTime");
-    _compress_timer = ADD_TIMER(_profile, "CompressTime");
-    _local_send_timer = ADD_TIMER(_profile, "LocalSendTime");
-    _split_block_hash_compute_timer = ADD_TIMER(_profile, "SplitBlockHashComputeTime");
-    _distribute_rows_into_channels_timer = ADD_TIMER(_profile, "DistributeRowsIntoChannelsTime");
-    _send_new_partition_timer = ADD_TIMER(_profile, "SendNewPartitionTime");
-    _blocks_sent_counter = ADD_COUNTER_WITH_LEVEL(_profile, "BlocksProduced", TUnit::UNIT, 1);
-    _overall_throughput = _profile->add_derived_counter(
+    _bytes_sent_counter = ADD_COUNTER(custom_profile(), "BytesSent", TUnit::BYTES);
+    _uncompressed_bytes_counter =
+            ADD_COUNTER(custom_profile(), "UncompressedRowBatchSize", TUnit::BYTES);
+    _local_sent_rows = ADD_COUNTER(custom_profile(), "LocalSentRows", TUnit::UNIT);
+    _serialize_batch_timer = ADD_TIMER(custom_profile(), "SerializeBatchTime");
+    _compress_timer = ADD_TIMER(custom_profile(), "CompressTime");
+    _local_send_timer = ADD_TIMER(custom_profile(), "LocalSendTime");
+    _split_block_hash_compute_timer = ADD_TIMER(custom_profile(), "SplitBlockHashComputeTime");
+    _distribute_rows_into_channels_timer =
+            ADD_TIMER(custom_profile(), "DistributeRowsIntoChannelsTime");
+    _send_new_partition_timer = ADD_TIMER(custom_profile(), "SendNewPartitionTime");
+    _blocks_sent_counter =
+            ADD_COUNTER_WITH_LEVEL(custom_profile(), "BlocksProduced", TUnit::UNIT, 1);
+    _overall_throughput = custom_profile()->add_derived_counter(
             "OverallThroughput", TUnit::BYTES_PER_SECOND,
             [this]() {
                 return RuntimeProfile::units_per_second(_bytes_sent_counter,
-                                                        _profile->total_time_counter());
+                                                        custom_profile()->total_time_counter());
             },
             "");
-    _merge_block_timer = ADD_TIMER(profile(), "MergeBlockTime");
-    _local_bytes_send_counter = ADD_COUNTER(_profile, "LocalBytesSent", TUnit::BYTES);
-    _wait_for_dependency_timer = ADD_TIMER_WITH_LEVEL(_profile, timer_name, 1);
+    _merge_block_timer = ADD_TIMER(custom_profile(), "MergeBlockTime");
+    _local_bytes_send_counter = ADD_COUNTER(custom_profile(), "LocalBytesSent", TUnit::BYTES);
+    _wait_for_dependency_timer = ADD_TIMER_WITH_LEVEL(common_profile(), timer_name, 1);
     _wait_queue_timer =
-            ADD_CHILD_TIMER_WITH_LEVEL(_profile, "WaitForRpcBufferQueue", timer_name, 1);
+            ADD_CHILD_TIMER_WITH_LEVEL(common_profile(), "WaitForRpcBufferQueue", timer_name, 1);
 
     _create_channels();
     // Make sure brpc stub is ready before execution.
-    for (int i = 0; i < channels.size(); ++i) {
-        RETURN_IF_ERROR(channels[i]->init(state));
-        _wait_channel_timer.push_back(_profile->add_nonzero_counter(
-                fmt::format("WaitForLocalExchangeBuffer{}", i), TUnit ::TIME_NS, timer_name, 1));
+    for (auto& channel : channels) {
+        RETURN_IF_ERROR(channel->init(state));
     }
-    _wait_broadcast_buffer_timer = ADD_CHILD_TIMER(_profile, "WaitForBroadcastBuffer", timer_name);
+    _wait_broadcast_buffer_timer =
+            ADD_CHILD_TIMER(common_profile(), "WaitForBroadcastBuffer", timer_name);
 
     auto& p = _parent->cast<ExchangeSinkOperatorX>();
     _part_type = p._part_type;
@@ -106,7 +109,7 @@ Status ExchangeSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& inf
     _rpc_channels_num = channels.size() - local_size;
 
     if (!_only_local_exchange) {
-        _sink_buffer = p.get_sink_buffer(state->fragment_instance_id().lo);
+        _sink_buffer = p.get_sink_buffer(state, state->fragment_instance_id().lo);
         register_channels(_sink_buffer.get());
         _queue_dependency = Dependency::create_shared(_parent->operator_id(), _parent->node_id(),
                                                       "ExchangeSinkQueueDependency", true);
@@ -120,8 +123,8 @@ Status ExchangeSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& inf
                         channels.size());
         RETURN_IF_ERROR(_partitioner->init(p._texprs));
         RETURN_IF_ERROR(_partitioner->prepare(state, p._row_desc));
-        _profile->add_info_string("Partitioner",
-                                  fmt::format("Crc32HashPartitioner({})", _partition_count));
+        custom_profile()->add_info_string(
+                "Partitioner", fmt::format("Crc32HashPartitioner({})", _partition_count));
     } else if (_part_type == TPartitionType::BUCKET_SHFFULE_HASH_PARTITIONED) {
         _partition_count = channels.size();
         _partitioner =
@@ -129,12 +132,12 @@ Status ExchangeSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& inf
                         channels.size());
         RETURN_IF_ERROR(_partitioner->init(p._texprs));
         RETURN_IF_ERROR(_partitioner->prepare(state, p._row_desc));
-        _profile->add_info_string("Partitioner",
-                                  fmt::format("Crc32HashPartitioner({})", _partition_count));
+        custom_profile()->add_info_string(
+                "Partitioner", fmt::format("Crc32HashPartitioner({})", _partition_count));
     } else if (_part_type == TPartitionType::OLAP_TABLE_SINK_HASH_PARTITIONED) {
         _partition_count = channels.size();
-        _profile->add_info_string("Partitioner",
-                                  fmt::format("TabletSinkHashPartitioner({})", _partition_count));
+        custom_profile()->add_info_string(
+                "Partitioner", fmt::format("TabletSinkHashPartitioner({})", _partition_count));
         _partitioner = std::make_unique<vectorized::TabletSinkHashPartitioner>(
                 _partition_count, p._tablet_sink_txn_id, p._tablet_sink_schema,
                 p._tablet_sink_partition, p._tablet_sink_location, p._tablet_sink_tuple_id, this);
@@ -160,8 +163,8 @@ Status ExchangeSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& inf
 
         RETURN_IF_ERROR(_partitioner->init(p._texprs));
         RETURN_IF_ERROR(_partitioner->prepare(state, p._row_desc));
-        _profile->add_info_string("Partitioner",
-                                  fmt::format("ScaleWriterPartitioner({})", _partition_count));
+        custom_profile()->add_info_string(
+                "Partitioner", fmt::format("ScaleWriterPartitioner({})", _partition_count));
     }
 
     return Status::OK();
@@ -172,8 +175,7 @@ void ExchangeSinkLocalState::_create_channels() {
     std::map<int64_t, int64_t> fragment_id_to_channel_index;
     for (int i = 0; i < p._dests.size(); ++i) {
         const auto& fragment_instance_id = p._dests[i].fragment_instance_id;
-        if (fragment_id_to_channel_index.find(fragment_instance_id.lo) ==
-            fragment_id_to_channel_index.end()) {
+        if (!fragment_id_to_channel_index.contains(fragment_instance_id.lo)) {
             channels.push_back(std::make_shared<vectorized::Channel>(
                     this, p._dests[i].brpc_server, fragment_instance_id, p._dest_node_id));
             fragment_id_to_channel_index.emplace(fragment_instance_id.lo, channels.size() - 1);
@@ -209,11 +211,10 @@ Status ExchangeSinkLocalState::open(RuntimeState* state) {
     SCOPED_TIMER(exec_time_counter());
     SCOPED_TIMER(_open_timer);
     RETURN_IF_ERROR(Base::open(state));
-    _writer.reset(new Writer());
-    auto& p = _parent->cast<ExchangeSinkOperatorX>();
+    _writer = std::make_unique<Writer>();
 
-    for (int i = 0; i < channels.size(); ++i) {
-        RETURN_IF_ERROR(channels[i]->open(state));
+    for (auto& channel : channels) {
+        RETURN_IF_ERROR(channel->open(state));
     }
 
     PUniqueId id;
@@ -224,16 +225,17 @@ Status ExchangeSinkLocalState::open(RuntimeState* state) {
         _broadcast_pb_mem_limiter =
                 vectorized::BroadcastPBlockHolderMemLimiter::create_shared(_queue_dependency);
     } else if (_last_local_channel_idx > -1) {
-        size_t dep_id = 0;
         for (auto& channel : channels) {
             if (channel->is_local()) {
                 if (auto dep = channel->get_local_channel_dependency()) {
+                    if (dep == nullptr) {
+                        return Status::InternalError("local channel dependency is nullptr");
+                    }
                     _local_channels_dependency.push_back(dep);
-                    DCHECK(_local_channels_dependency[dep_id] != nullptr);
-                    dep_id++;
-                } else {
-                    LOG(WARNING) << "local recvr is null: query id = "
-                                 << print_id(state->query_id()) << " node id = " << p.node_id();
+                    _wait_channel_timer.push_back(common_profile()->add_nonzero_counter(
+                            fmt::format("WaitForLocalExchangeBuffer{}",
+                                        _local_channels_dependency.size()),
+                            TUnit ::TIME_NS, timer_name, 1));
                 }
             }
         }
@@ -249,11 +251,8 @@ Status ExchangeSinkLocalState::open(RuntimeState* state) {
 }
 
 std::string ExchangeSinkLocalState::name_suffix() {
-    std::string name = " (id=" + std::to_string(_parent->node_id());
     auto& p = _parent->cast<ExchangeSinkOperatorX>();
-    name += ",dst_id=" + std::to_string(p._dest_node_id);
-    name += ")";
-    return name;
+    return fmt::format(exchange_sink_name_suffix, std::to_string(p._dest_node_id));
 }
 
 segment_v2::CompressionTypePB ExchangeSinkLocalState::compression_type() const {
@@ -281,7 +280,6 @@ ExchangeSinkOperatorX::ExchangeSinkOperatorX(
           _fragment_instance_ids(fragment_instance_ids) {
 #ifndef BE_TEST
     DCHECK_GT(destinations.size(), 0);
-#endif
     DCHECK(sink.output_partition.type == TPartitionType::UNPARTITIONED ||
            sink.output_partition.type == TPartitionType::HASH_PARTITIONED ||
            sink.output_partition.type == TPartitionType::RANDOM ||
@@ -290,6 +288,7 @@ ExchangeSinkOperatorX::ExchangeSinkOperatorX(
            sink.output_partition.type == TPartitionType::BUCKET_SHFFULE_HASH_PARTITIONED ||
            sink.output_partition.type == TPartitionType::HIVE_TABLE_SINK_HASH_PARTITIONED ||
            sink.output_partition.type == TPartitionType::HIVE_TABLE_SINK_UNPARTITIONED);
+#endif
     _name = "ExchangeSinkOperatorX";
     _pool = std::make_shared<ObjectPool>();
     if (sink.__isset.output_tuple_id) {
@@ -301,7 +300,7 @@ ExchangeSinkOperatorX::ExchangeSinkOperatorX(
         _part_type != TPartitionType::BUCKET_SHFFULE_HASH_PARTITIONED) {
         // if the destinations only one dest, we need to use broadcast
         std::unordered_set<UniqueId> dest_fragment_ids_set;
-        for (auto& dest : _dests) {
+        for (const auto& dest : _dests) {
             dest_fragment_ids_set.insert(dest.fragment_instance_id);
             if (dest_fragment_ids_set.size() > 1) {
                 break;
@@ -349,7 +348,7 @@ void ExchangeSinkOperatorX::_init_sink_buffer() {
     for (auto fragment_instance_id : _fragment_instance_ids) {
         ins_ids.push_back(fragment_instance_id.lo);
     }
-    _sink_buffer = _create_buffer(ins_ids);
+    _sink_buffer = _create_buffer(_state, ins_ids);
 }
 
 template <typename ChannelPtrType>
@@ -516,7 +515,20 @@ Status ExchangeSinkOperatorX::sink(RuntimeState* state, vectorized::Block* block
         for (auto& channel : local_state.channels) {
             COUNTER_UPDATE(local_state.memory_used_counter(), -channel->mem_usage());
             Status st = channel->close(state);
-            if (!st.ok() && final_st.ok()) {
+            /**
+             * Consider this case below:
+             *
+             *                 +--- Channel0 (Running)
+             *                 |
+             * ExchangeSink ---+--- Channel1 (EOF)
+             *                 |
+             *                 +--- Channel2 (Running)
+             *
+             * Channel1 is EOF now and return `END_OF_FILE` here. However, Channel0 and Channel2
+             * still need new data. If ExchangeSink returns EOF, downstream tasks will no longer receive
+             * blocks including EOS signal. So we must ensure to return EOF iff all channels are EOF.
+             */
+            if (!st.ok() && !st.is<ErrorCode::END_OF_FILE>() && final_st.ok()) {
                 final_st = st;
             }
         }
@@ -565,18 +577,18 @@ Status ExchangeSinkLocalState::close(RuntimeState* state, Status exec_status) {
                        _local_channels_dependency[i]->watcher_elapse_time());
     }
     if (_sink_buffer) {
-        _sink_buffer->update_profile(profile());
+        _sink_buffer->update_profile(custom_profile());
         _sink_buffer->close();
     }
     return Base::close(state, exec_status);
 }
 
 std::shared_ptr<ExchangeSinkBuffer> ExchangeSinkOperatorX::_create_buffer(
-        const std::vector<InstanceLoId>& sender_ins_ids) {
+        RuntimeState* state, const std::vector<InstanceLoId>& sender_ins_ids) {
     PUniqueId id;
     id.set_hi(_state->query_id().hi);
     id.set_lo(_state->query_id().lo);
-    auto sink_buffer = std::make_unique<ExchangeSinkBuffer>(id, _dest_node_id, _node_id, state(),
+    auto sink_buffer = std::make_unique<ExchangeSinkBuffer>(id, _dest_node_id, _node_id, state,
                                                             sender_ins_ids);
     for (const auto& _dest : _dests) {
         sink_buffer->construct_request(_dest.fragment_instance_id);
@@ -590,17 +602,17 @@ std::shared_ptr<ExchangeSinkBuffer> ExchangeSinkOperatorX::_create_buffer(
 // (Note: This does not reduce the total number of RPCs.)
 // In a merge sort scenario, there are only n RPCs, so a shared sink buffer is not needed.
 std::shared_ptr<ExchangeSinkBuffer> ExchangeSinkOperatorX::get_sink_buffer(
-        InstanceLoId sender_ins_id) {
+        RuntimeState* state, InstanceLoId sender_ins_id) {
     // When the child is SortSourceOperatorX or LocalExchangeSourceOperatorX,
     // it is an order-by scenario.
     // In this case, there is only one target instance, and no n * n RPC concurrency will occur.
     // Therefore, sharing a sink buffer is not necessary.
     if (_dest_is_merge) {
-        return _create_buffer({sender_ins_id});
+        return _create_buffer(state, {sender_ins_id});
     }
     if (_state->enable_shared_exchange_sink_buffer()) {
         return _sink_buffer;
     }
-    return _create_buffer({sender_ins_id});
+    return _create_buffer(state, {sender_ins_id});
 }
 } // namespace doris::pipeline

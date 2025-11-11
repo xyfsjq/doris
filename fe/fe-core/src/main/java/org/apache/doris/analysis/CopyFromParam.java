@@ -26,6 +26,7 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
+import org.apache.doris.info.TableNameInfo;
 
 import com.google.common.base.Function;
 import com.google.common.base.Joiner;
@@ -40,6 +41,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
+/**
+ * CopyFromParam
+ */
 public class CopyFromParam {
     private static final Logger LOG = LogManager.getLogger(CopyFromParam.class);
     private static final String DOLLAR = "$";
@@ -67,7 +71,23 @@ public class CopyFromParam {
         this.fileFilterExpr = whereExpr;
     }
 
-    public void analyze(String fullDbName, TableName tableName, boolean useDeleteSign, String fileType)
+    /**
+     * CopyFromParam
+     */
+    public CopyFromParam(StageAndPattern stageAndPattern, List<Expr> exprList, Expr fileFilterExpr,
+                         List<String> fileColumns, List<Expr> columnMappingList, List<String> targetColumns) {
+        this.stageAndPattern = stageAndPattern;
+        this.exprList = exprList;
+        this.fileFilterExpr = fileFilterExpr;
+        this.fileColumns = fileColumns;
+        this.columnMappingList = columnMappingList;
+        this.targetColumns = targetColumns;
+    }
+
+    /**
+     * analyze
+     */
+    public void analyze(String fullDbName, TableNameInfo tableName, boolean useDeleteSign, String fileType)
             throws AnalysisException {
         if (exprList == null && fileFilterExpr == null && !useDeleteSign) {
             return;
@@ -246,6 +266,9 @@ public class CopyFromParam {
         }
     }
 
+    /**
+     * toSql
+     */
     public String toSql() {
         StringBuilder sb = new StringBuilder();
         if (columnMappingList != null || fileFilterExpr != null) {

@@ -29,7 +29,6 @@
 #include "vec/columns/column_array.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_vector.h"
-#include "vec/columns/columns_number.h"
 #include "vec/common/assert_cast.h"
 #include "vec/core/block.h"
 #include "vec/core/column_numbers.h"
@@ -78,7 +77,7 @@ public:
     std::string get_name() const override { return name; }
 
     Status execute(VExprContext* context, vectorized::Block* block, int* result_column_id,
-                   const DataTypePtr& result_type, const VExprSPtrs& children) override {
+                   const DataTypePtr& result_type, const VExprSPtrs& children) const override {
         LambdaArgs args_info;
         // collect used slot ref in lambda function body
         std::vector<int>& output_slot_ref_indexs = args_info.output_slot_ref_indexs;
@@ -186,6 +185,39 @@ public:
             data_types.push_back(col_type.get_nested_type());
         }
 
+        ColumnWithTypeAndName result_arr;
+        // if column_array is NULL, we know the array_data_column will not write any data,
+        // so the column is empty. eg : (x) -> concat('|',x + "1"). if still execute the lambda function, will cause the bolck rows are not equal
+        // the x column is empty, but "|" is const literal, size of column is 1, so the block rows is 1, but the x column is empty, will be coredump.
+        if (std::any_of(lambda_datas.begin(), lambda_datas.end(),
+                        [](const auto& v) { return v->empty(); })) {
+            DataTypePtr nested_type;
+            bool is_nullable = result_type->is_nullable();
+            if (is_nullable) {
+                nested_type =
+                        assert_cast<const DataTypeNullable*>(result_type.get())->get_nested_type();
+            } else {
+                nested_type = result_type;
+            }
+            auto empty_nested_column = assert_cast<const DataTypeArray*>(nested_type.get())
+                                               ->get_nested_type()
+                                               ->create_column();
+            auto result_array_column = ColumnArray::create(std::move(empty_nested_column),
+                                                           std::move(array_column_offset));
+
+            if (is_nullable) {
+                result_arr = {ColumnNullable::create(std::move(result_array_column),
+                                                     std::move(outside_null_map)),
+                              result_type, "Result"};
+            } else {
+                result_arr = {std::move(result_array_column), result_type, "Result"};
+            }
+
+            block->insert(result_arr);
+            *result_column_id = block->columns() - 1;
+            return Status::OK();
+        }
+
         MutableColumnPtr result_col = nullptr;
         DataTypePtr res_type;
         std::string res_name;
@@ -199,7 +231,7 @@ public:
         Block lambda_block;
         auto column_size = names.size();
         MutableColumns columns(column_size);
-        while (args_info.current_row_idx < block->rows()) {
+        do {
             bool mem_reuse = lambda_block.mem_reuse();
             for (int i = 0; i < column_size; i++) {
                 if (mem_reuse) {
@@ -222,7 +254,7 @@ public:
                 long current_step = std::min(
                         max_step, (long)(args_info.cur_size - args_info.current_offset_in_array));
                 size_t pos = args_info.array_start + args_info.current_offset_in_array;
-                for (int i = 0; i < arguments.size(); ++i) {
+                for (int i = 0; i < arguments.size() && current_step > 0; ++i) {
                     columns[gap + i]->insert_range_from(*lambda_datas[i], pos, current_step);
                 }
                 args_info.current_offset_in_array += current_step;
@@ -265,10 +297,9 @@ public:
             }
             result_col->insert_range_from(*res_col, 0, res_col->size());
             lambda_block.clear_column_data(column_size);
-        }
+        } while (args_info.current_row_idx < block->rows());
 
         //4. get the result column after execution, reassemble it into a new array column, and return.
-        ColumnWithTypeAndName result_arr;
         if (result_type->is_nullable()) {
             if (res_type->is_nullable()) {
                 result_arr = {
@@ -309,12 +340,12 @@ public:
     }
 
 private:
-    bool _contains_column_id(const std::vector<int>& output_slot_ref_indexs, int id) {
+    bool _contains_column_id(const std::vector<int>& output_slot_ref_indexs, int id) const {
         const auto it = std::find(output_slot_ref_indexs.begin(), output_slot_ref_indexs.end(), id);
         return it != output_slot_ref_indexs.end();
     }
 
-    void _set_column_ref_column_id(VExprSPtr expr, int gap) {
+    void _set_column_ref_column_id(VExprSPtr expr, int gap) const {
         for (const auto& child : expr->children()) {
             if (child->is_column_ref()) {
                 auto* ref = static_cast<VColumnRef*>(child.get());
@@ -325,7 +356,8 @@ private:
         }
     }
 
-    void _collect_slot_ref_column_id(VExprSPtr expr, std::vector<int>& output_slot_ref_indexs) {
+    void _collect_slot_ref_column_id(VExprSPtr expr,
+                                     std::vector<int>& output_slot_ref_indexs) const {
         for (const auto& child : expr->children()) {
             if (child->is_slot_ref()) {
                 const auto* ref = static_cast<VSlotRef*>(child.get());
@@ -338,7 +370,7 @@ private:
 
     void _extend_data(std::vector<MutableColumnPtr>& columns, Block* block,
                       int current_repeat_times, int size, int64_t current_row_idx,
-                      const std::vector<int>& output_slot_ref_indexs) {
+                      const std::vector<int>& output_slot_ref_indexs) const {
         if (!current_repeat_times || !size) {
             return;
         }

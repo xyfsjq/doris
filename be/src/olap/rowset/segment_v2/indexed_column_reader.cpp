@@ -22,7 +22,6 @@
 #include <algorithm>
 
 #include "common/status.h"
-#include "gutil/strings/substitute.h" // for Substitute
 #include "io/io_common.h"
 #include "olap/key_coder.h"
 #include "olap/olap_common.h"
@@ -56,8 +55,6 @@ static bvar::Adder<uint64_t> g_index_reader_pk_pages("doris_pk", "index_reader_p
 static bvar::PerSecond<bvar::Adder<uint64_t>> g_index_reader_pk_bytes_per_second(
         "doris_pk", "index_reader_pk_pages_per_second", &g_index_reader_pk_pages, 60);
 
-using strings::Substitute;
-
 int64_t IndexedColumnReader::get_metadata_size() const {
     return sizeof(IndexedColumnReader) + _meta.ByteSizeLong();
 }
@@ -71,7 +68,7 @@ Status IndexedColumnReader::load(bool use_page_cache, bool kept_in_memory,
     if (_type_info == nullptr) {
         return Status::NotSupported("unsupported typeinfo, type={}", _meta.data_type());
     }
-    RETURN_IF_ERROR(EncodingInfo::get(_type_info, _meta.encoding(), &_encoding_info));
+    RETURN_IF_ERROR(EncodingInfo::get(_type_info->type(), _meta.encoding(), &_encoding_info));
     _value_key_coder = get_key_coder(_type_info->type());
 
     // read and parse ordinal index page when exists

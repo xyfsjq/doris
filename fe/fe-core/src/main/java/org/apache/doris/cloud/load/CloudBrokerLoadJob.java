@@ -46,6 +46,7 @@ import org.apache.doris.qe.Coordinator;
 import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.resource.computegroup.ComputeGroupMgr;
 import org.apache.doris.system.Backend;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TUniqueId;
@@ -105,14 +106,10 @@ public class CloudBrokerLoadJob extends BrokerLoadJob {
 
             this.cloudClusterId = ((CloudSystemInfoService) Env.getCurrentSystemInfo())
                     .getCloudClusterIdByName(clusterName);
-            if (!Strings.isNullOrEmpty(context.getSessionVariable().getCloudCluster())) {
-                clusterName = context.getSessionVariable().getCloudCluster();
-                this.cloudClusterId =
-                    ((CloudSystemInfoService) Env.getCurrentSystemInfo()).getCloudClusterIdByName(clusterName);
-            }
             if (Strings.isNullOrEmpty(this.cloudClusterId)) {
-                LOG.warn("cluster id is empty, cluster name {}", clusterName);
-                throw new MetaNotFoundException("cluster id is empty, cluster name: " + clusterName);
+                LOG.warn("can not find compute group: {}", clusterName);
+                String computeGroupHints = ComputeGroupMgr.computeGroupNotFoundPromptMsg(clusterName);
+                throw new MetaNotFoundException(computeGroupHints);
             }
             sessionVariables.put(CLOUD_CLUSTER_ID, this.cloudClusterId);
         }
@@ -127,12 +124,21 @@ public class CloudBrokerLoadJob extends BrokerLoadJob {
             throw new UserException("cluster name is empty, cluster id is: " + cloudClusterId);
         }
 
+        // NOTE: set user info in context in for auth check in CloudReplica
         if (ConnectContext.get() == null) {
             ConnectContext connectContext = new ConnectContext();
             connectContext.setCloudCluster(clusterName);
+            connectContext.setCurrentUserIdentity(this.userInfo);
+            if (connectContext.getEnv() == null) {
+                connectContext.setEnv(Env.getCurrentEnv());
+            }
             return new AutoCloseConnectContext(connectContext);
         } else {
             ConnectContext.get().setCloudCluster(clusterName);
+            ConnectContext.get().setCurrentUserIdentity(this.userInfo);
+            if (ConnectContext.get().getEnv() == null) {
+                ConnectContext.get().setEnv(Env.getCurrentEnv());
+            }
             return null;
         }
     }
@@ -149,9 +155,10 @@ public class CloudBrokerLoadJob extends BrokerLoadJob {
             boolean isEnableMemtableOnSinkNode, int batchSize, FileGroupAggKey aggKey,
             BrokerPendingTaskAttachment attachment) throws UserException {
         cloudClusterId = sessionVariables.get(CLOUD_CLUSTER_ID);
-        LoadLoadingTask task = new CloudLoadLoadingTask(db, table, brokerDesc,
+        LoadLoadingTask task = new CloudLoadLoadingTask(this.userInfo, db, table, brokerDesc,
                 brokerFileGroups, getDeadlineMs(), getExecMemLimit(),
-                isStrictMode(), isPartialUpdate(), transactionId, this, getTimeZone(), getTimeout(),
+                isStrictMode(), isPartialUpdate(), getPartialUpdateNewKeyPolicy(),
+                transactionId, this, getTimeZone(), getTimeout(),
                 getLoadParallelism(), getSendBatchParallelism(),
                 getMaxFilterRatio() <= 0, enableProfile ? jobProfile : null, isSingleTabletLoadPerSink(),
                 getPriority(), isEnableMemtableOnSinkNode, batchSize, cloudClusterId);
@@ -161,6 +168,7 @@ public class CloudBrokerLoadJob extends BrokerLoadJob {
         try (AutoCloseConnectContext r = buildConnectContext()) {
             task.init(loadId, attachment.getFileStatusByTable(aggKey),
                     attachment.getFileNumByTable(aggKey), getUserInfo());
+            task.settWorkloadGroups(tWorkloadGroups);
         } catch (UserException e) {
             throw e;
         }

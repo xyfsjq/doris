@@ -18,12 +18,17 @@
 package org.apache.doris.httpv2.rest;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.InfoSchemaDb;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
+import org.apache.doris.mysql.privilege.PrivPredicate;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.system.Backend;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.Getter;
 import lombok.Setter;
 import org.apache.logging.log4j.LogManager;
@@ -33,8 +38,6 @@ import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * This class responsible for returning current backends info.
@@ -66,12 +69,8 @@ public class BackendsAction extends RestBaseController {
 
     @RequestMapping(path = "/api/backends", method = {RequestMethod.GET})
     public Object getBackends(HttpServletRequest request, HttpServletResponse response) {
-        /**
-         * As required, the interface should require user have GlobalAuth-PrivPredicate.ADMIN permission.
-         * However, a user who uses spark-doris-connector/flink-doris-connector does not have corresponding permission.
-         * To ensure that the connector works properly, we do not verify the permission of the interface.
-         */
         executeCheckPassword(request, response);
+        checkDbAuth(ConnectContext.get().getCurrentUserIdentity(), InfoSchemaDb.DATABASE_NAME, PrivPredicate.SELECT);
 
         boolean needAlive = false;
         String isAlive = request.getParameter(IS_ALIVE);

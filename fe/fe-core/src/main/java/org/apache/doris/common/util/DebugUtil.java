@@ -19,9 +19,13 @@ package org.apache.doris.common.util;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.proto.Types;
+import org.apache.doris.thrift.TPlanNodeRuntimeStatsItem;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.base.Strings;
+import org.apache.commons.lang3.StringUtils;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -184,56 +188,61 @@ public class DebugUtil {
             return "";
         }
 
-        StringBuilder output = new StringBuilder();
-
-        // Assuming each inner list has exactly 3 columns
-        int[] columnWidths = new int[3];
-
-        // Calculate the maximum width of each column
-        // First consider the header widths: "VarName", "CurrentValue", "DefaultValue"
-        String[] headers = {"VarName", "CurrentValue", "DefaultValue"};
-        for (int i = 0; i < headers.length; i++) {
-            columnWidths[i] = headers[i].length();  // Initialize with header length
-        }
-
-        // Update column widths based on data
+        JSONArray array = new JSONArray();
         for (List<String> row : nestedList) {
-            for (int i = 0; i < row.size(); i++) {
-                columnWidths[i] = Math.max(columnWidths[i], row.get(i).length());
+            if (row == null || row.isEmpty()) {
+                continue;
             }
+            JSONObject obj = new JSONObject();
+            // Expected order: VarName, CurrentValue, DefaultValue
+            if (row.size() >= 1) {
+                obj.put("VarName", row.get(0));
+            }
+            if (row.size() >= 2) {
+                obj.put("CurrentValue", row.get(1));
+            }
+            if (row.size() >= 3) {
+                obj.put("DefaultValue", row.get(2));
+            }
+            array.put(obj);
+        }
+        // Pretty print with indentation for readability in logs/profile
+        return array.toString(2);
+    }
+
+    public static String prettyPrintPlanNodeRuntimeStatsItems(
+            List<TPlanNodeRuntimeStatsItem> planNodeRuntimeStatsItems) {
+        StringBuilder result = new StringBuilder();
+        if (planNodeRuntimeStatsItems == null || planNodeRuntimeStatsItems.isEmpty()) {
+            result.append("The list is empty or null.\n");
+            return result.toString();
         }
 
-        // Build the table header
-        for (int i = 0; i < headers.length; i++) {
-            output.append(String.format("%-" + columnWidths[i] + "s", headers[i]));
-            if (i < headers.length - 1) {
-                output.append(" | ");  // Separator between columns
-            }
-        }
-        output.append("\n");  // Newline after the header
+        result.append(String.format("%-10s %-10s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-10s %-10s\n",
+                "NodeID", "InstanceNum", "InputRows", "OutputRows", "CommonFilterRows", "CommonFilterInputRows",
+                "RuntimeFilterRows", "RuntimeFilterInputRows", "JoinBuilderRows", "JoinProbeRows",
+                "JoinBuilderSkewRatio", "JoinProbeSkewRatio"));
 
-        // Add a separator line for better readability (optional)
-        for (int i = 0; i < headers.length; i++) {
-            output.append(String.format("%-" + columnWidths[i] + "s", Strings.repeat("-", columnWidths[i])));
-            if (i < headers.length - 1) {
-                output.append("-|-");  // Separator between columns
-            }
+        for (TPlanNodeRuntimeStatsItem item : planNodeRuntimeStatsItems) {
+            result.append(String.format("%-10d %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-10d %-10d\n",
+                    item.getNodeId(),
+                    item.getInstanceNum(),
+                    item.getInputRows(),
+                    item.getOutputRows(),
+                    item.getCommonFilterRows(),
+                    item.getCommonFilterInputRows(),
+                    item.getRuntimeFilterRows(),
+                    item.getRuntimeFilterInputRows(),
+                    item.getJoinBuilderRows(),
+                    item.getJoinProbeRows(),
+                    item.getJoinBuilderSkewRatio(),
+                    item.getJoinProberSkewRatio()
+            ));
         }
-        output.append("\n");  // Newline after the separator
+        return result.toString();
+    }
 
-        // Build the table body with proper alignment based on column widths
-        for (List<String> row : nestedList) {
-            for (int i = 0; i < row.size(); i++) {
-                String element = row.get(i);
-                // Pad with spaces if the element is shorter than the column width
-                output.append(String.format("%-" + columnWidths[i] + "s", element));
-                if (i < row.size() - 1) {
-                    output.append(" | ");  // Separator between columns
-                }
-            }
-            output.append("\n");  // Newline after each row
-        }
-
-        return output.toString();
+    private static String format(int width, String name) {
+        return name + StringUtils.repeat(" ", Math.max(0, name.length() - width));
     }
 }

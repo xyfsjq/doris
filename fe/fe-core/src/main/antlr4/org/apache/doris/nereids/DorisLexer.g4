@@ -20,10 +20,7 @@
 lexer grammar DorisLexer;
 
 @members {
-  /**
-   * When true, parser should throw ParseExcetion for unclosed bracketed comment.
-   */
-  public boolean has_unclosed_bracketed_comment = false;
+  public boolean isNoBackslashEscapes = false;
 
   /**
    * Verify whether current token is a valid decimal token (which contains dot).
@@ -45,16 +42,6 @@ lexer grammar DorisLexer;
     } else {
       return true;
     }
-  }
-
-  /**
-   * This method will be called when the character stream ends and try to find out the
-   * unclosed bracketed comment.
-   * If the method be called, it means the end of the entire character stream match,
-   * and we set the flag and fail later.
-   */
-  public void markUnclosedComment() {
-    has_unclosed_bracketed_comment = true;
   }
 }
 
@@ -89,6 +76,7 @@ ALL: 'ALL';
 ALTER: 'ALTER';
 ANALYZE: 'ANALYZE';
 ANALYZED: 'ANALYZED';
+ANALYZER: 'ANALYZER';
 AND: 'AND';
 ANTI: 'ANTI';
 APPEND: 'APPEND';
@@ -118,6 +106,8 @@ BITOR: 'BITOR';
 BITXOR: 'BITXOR';
 BLOB: 'BLOB';
 BOOLEAN: 'BOOLEAN';
+BOTH: 'BOTH';
+BRANCH: 'BRANCH';
 BRIEF: 'BRIEF';
 BROKER: 'BROKER';
 BUCKETS: 'BUCKETS';
@@ -136,6 +126,7 @@ CATALOGS: 'CATALOGS';
 CHAIN: 'CHAIN';
 CHAR: 'CHAR' | 'CHARACTER';
 CHARSET: 'CHARSET';
+CHAR_FILTER: 'CHAR_FILTER';
 CHECK: 'CHECK';
 CLEAN: 'CLEAN';
 CLUSTER: 'CLUSTER';
@@ -185,6 +176,8 @@ DATEV2: 'DATEV2';
 DATETIMEV1: 'DATETIMEV1';
 DATEV1: 'DATEV1';
 DAY: 'DAY';
+DAY_SECOND: 'DAY_SECOND';
+DAYS: 'DAYS';
 DECIMAL: 'DECIMAL';
 DECIMALV2: 'DECIMALV2';
 DECIMALV3: 'DECIMALV3';
@@ -197,6 +190,8 @@ DESC: 'DESC';
 DESCRIBE: 'DESCRIBE';
 DIAGNOSE: 'DIAGNOSE';
 DIAGNOSIS: 'DIAGNOSIS';
+DICTIONARIES: 'DICTIONARIES';
+DICTIONARY: 'DICTIONARY';
 DISK: 'DISK';
 DISTINCT: 'DISTINCT';
 DISTINCTPC: 'DISTINCTPC';
@@ -216,6 +211,7 @@ DYNAMIC: 'DYNAMIC';
 E:'E';
 ELSE: 'ELSE';
 ENABLE: 'ENABLE';
+ENCRYPTION: 'ENCRYPTION';
 ENCRYPTKEY: 'ENCRYPTKEY';
 ENCRYPTKEYS: 'ENCRYPTKEYS';
 END: 'END';
@@ -224,6 +220,7 @@ ENGINE: 'ENGINE';
 ENGINES: 'ENGINES';
 ENTER: 'ENTER';
 ERRORS: 'ERRORS';
+ESCAPE: 'ESCAPE';
 EVENTS: 'EVENTS';
 EVERY: 'EVERY';
 EXCEPT: 'EXCEPT';
@@ -267,7 +264,9 @@ GRAPH: 'GRAPH';
 GROUP: 'GROUP';
 GROUPING: 'GROUPING';
 GROUPS: 'GROUPS';
+GROUP_CONCAT: 'GROUP_CONCAT';
 HASH: 'HASH';
+HASH_MAP: 'HASH_MAP';
 HAVING: 'HAVING';
 HDFS: 'HDFS';
 HELP: 'HELP';
@@ -277,6 +276,7 @@ HLL_UNION: 'HLL_UNION';
 HOSTNAME: 'HOSTNAME';
 HOTSPOT: 'HOTSPOT';
 HOUR: 'HOUR';
+HOURS:  'HOURS';
 HUB: 'HUB';
 IDENTIFIED: 'IDENTIFIED';
 IF: 'IF';
@@ -297,6 +297,7 @@ INTERSECT: 'INTERSECT';
 INTERVAL: 'INTERVAL';
 INTO: 'INTO';
 INVERTED: 'INVERTED';
+IP_TRIE: 'IP_TRIE';
 IPV4: 'IPV4';
 IPV6: 'IPV6';
 IS: 'IS';
@@ -314,10 +315,12 @@ KEYS: 'KEYS';
 KILL: 'KILL';
 LABEL: 'LABEL';
 LARGEINT: 'LARGEINT';
+LAYOUT: 'LAYOUT';
 LAST: 'LAST';
 LATERAL: 'LATERAL';
 LDAP: 'LDAP';
 LDAP_ADMIN_PASSWORD: 'LDAP_ADMIN_PASSWORD';
+LEADING: 'LEADING';
 LEFT: 'LEFT';
 LESS: 'LESS';
 LEVEL: 'LEVEL';
@@ -337,8 +340,11 @@ LOW_PRIORITY: 'LOW_PRIORITY';
 MANUAL: 'MANUAL';
 MAP: 'MAP';
 MATCH: 'MATCH';
+MATCHED: 'MATCHED';
 MATCH_ALL: 'MATCH_ALL';
 MATCH_ANY: 'MATCH_ANY';
+MATCH_NAME: 'MATCH_NAME';
+MATCH_NAME_GLOB: 'MATCH_NAME_GLOB';
 MATCH_PHRASE: 'MATCH_PHRASE';
 MATCH_PHRASE_EDGE: 'MATCH_PHRASE_EDGE';
 MATCH_PHRASE_PREFIX: 'MATCH_PHRASE_PREFIX';
@@ -348,11 +354,13 @@ MAX: 'MAX';
 MAXVALUE: 'MAXVALUE';
 MEMO:'MEMO';
 MERGE: 'MERGE';
+MID: 'MID';
 MIGRATE: 'MIGRATE';
 MIGRATIONS: 'MIGRATIONS';
 MIN: 'MIN';
 MINUS: 'MINUS';
 MINUTE: 'MINUTE';
+MINUTES: 'MINUTES';
 MODIFY: 'MODIFY';
 MONTH: 'MONTH';
 MTMV: 'MTMV';
@@ -363,6 +371,7 @@ NEGATIVE: 'NEGATIVE';
 NEVER: 'NEVER';
 NEXT: 'NEXT';
 NGRAM_BF: 'NGRAM_BF';
+ANN: 'ANN';
 NO: 'NO';
 NO_USE_MV: 'NO_USE_MV';
 NON_NULLABLE: 'NON_NULLABLE';
@@ -373,8 +382,10 @@ OBSERVER: 'OBSERVER';
 OF: 'OF';
 OFFSET: 'OFFSET';
 ON: 'ON';
+OFF: 'OFF';
 ONLY: 'ONLY';
 OPEN: 'OPEN';
+OPTIMIZE: 'OPTIMIZE';
 OPTIMIZED: 'OPTIMIZED';
 OR: 'OR';
 ORDER: 'ORDER';
@@ -406,6 +417,7 @@ PROCESS: 'PROCESS';
 PLUGIN: 'PLUGIN';
 PLUGINS: 'PLUGINS';
 POLICY: 'POLICY';
+POSITION: 'POSITION';
 PRECEDING: 'PRECEDING';
 PREPARE: 'PREPARE';
 PRIMARY: 'PRIMARY';
@@ -448,6 +460,8 @@ RESOURCES: 'RESOURCES';
 RESTORE: 'RESTORE';
 RESTRICTIVE: 'RESTRICTIVE';
 RESUME: 'RESUME';
+RETAIN: 'RETAIN';
+RETENTION: 'RETENTION';
 RETURNS: 'RETURNS';
 REVOKE: 'REVOKE';
 REWRITTEN: 'REWRITTEN';
@@ -457,6 +471,8 @@ ROLE: 'ROLE';
 ROLES: 'ROLES';
 ROLLBACK: 'ROLLBACK';
 ROLLUP: 'ROLLUP';
+ROOT: 'ROOT';
+ROTATE: 'ROTATE';
 ROUTINE: 'ROUTINE';
 ROW: 'ROW';
 ROWS: 'ROWS';
@@ -469,6 +485,7 @@ SCHEMAS: 'SCHEMAS';
 SECOND: 'SECOND';
 SELECT: 'SELECT';
 SEMI: 'SEMI';
+SEPARATOR: 'SEPARATOR';
 SERIALIZABLE: 'SERIALIZABLE';
 SESSION: 'SESSION';
 SESSION_USER: 'SESSION_USER';
@@ -481,6 +498,7 @@ SIGNED: 'SIGNED';
 SKEW: 'SKEW';
 SMALLINT: 'SMALLINT';
 SNAPSHOT: 'SNAPSHOT';
+SNAPSHOTS: 'SNAPSHOTS';
 SONAME: 'SONAME';
 SPLIT: 'SPLIT';
 SQL: 'SQL';
@@ -497,6 +515,8 @@ STREAM: 'STREAM';
 STREAMING: 'STREAMING';
 STRING: 'STRING';
 STRUCT: 'STRUCT';
+SUBSTR: 'SUBSTR';
+SUBSTRING: 'SUBSTRING';
 SUM: 'SUM';
 SUPERUSER: 'SUPERUSER';
 SWITCH: 'SWITCH';
@@ -507,8 +527,10 @@ TABLES: 'TABLES';
 TABLESAMPLE: 'TABLESAMPLE';
 TABLET: 'TABLET';
 TABLETS: 'TABLETS';
+TAG: 'TAG';
 TASK: 'TASK';
 TASKS: 'TASKS';
+TDE: 'TDE';
 TEMPORARY: 'TEMPORARY';
 TERMINATED: 'TERMINATED';
 TEXT: 'TEXT';
@@ -518,6 +540,9 @@ TIME: 'TIME';
 TIMESTAMP: 'TIMESTAMP';
 TINYINT: 'TINYINT';
 TO: 'TO';
+TOKENIZER: 'TOKENIZER';
+TOKEN_FILTER: 'TOKEN_FILTER';
+TRAILING: 'TRAILING';
 TRANSACTION: 'TRANSACTION';
 TRASH: 'TRASH';
 TREE: 'TREE';
@@ -525,6 +550,7 @@ TRIGGERS: 'TRIGGERS';
 TRIM: 'TRIM';
 TRUE: 'TRUE';
 TRUNCATE: 'TRUNCATE';
+TRY_CAST: 'TRY_CAST';
 TYPE: 'TYPE';
 TYPECAST: 'TYPE_CAST';
 TYPES: 'TYPES';
@@ -544,6 +570,7 @@ USE_MV: 'USE_MV';
 USING: 'USING';
 VALUE: 'VALUE';
 VALUES: 'VALUES';
+VARBINARY: 'VARBINARY';
 VARCHAR: 'VARCHAR';
 VARIABLE: 'VARIABLE';
 VARIABLES: 'VARIABLES';
@@ -600,10 +627,13 @@ ATSIGN: '@';
 DOUBLEATSIGN: '@@';
 
 STRING_LITERAL
-    : '\'' ('\\'. | '\'\'' | ~('\'' | '\\'))* '\''
-    | '"' ( '\\'. | '""' | ~('"'| '\\') )* '"'
-    | 'R\'' (~'\'')* '\''
-    | 'R"'(~'"')* '"'
+    :  '\'' ( {!isNoBackslashEscapes}? '\\'. | '\'\'' | {!isNoBackslashEscapes}? ~('\'' | '\\') | {isNoBackslashEscapes}? ~('\''))* '\''
+    | '"' ( {!isNoBackslashEscapes}? '\\'. | '""' | {!isNoBackslashEscapes}? ~('"'| '\\') | {isNoBackslashEscapes}? ~('"'))* '"'
+    ;
+
+VARBINARY_LITERAL
+    : [Xx]'\'' HEXDIGIT* '\''
+    | [Xx]'"' HEXDIGIT* '"'
     ;
 
 LEADING_STRING
@@ -664,6 +694,10 @@ fragment DIGIT
     : [0-9]
     ;
 
+fragment HEXDIGIT
+    : [0-9a-fA-F]
+    ;
+
 fragment LETTER
     : [a-zA-Z$_] // these are the "java letters" below 0x7F
     | ~[\u0000-\u007F\uD800-\uDBFF] // covers all characters above 0x7F which are not a surrogate
@@ -675,7 +709,7 @@ SIMPLE_COMMENT
     ;
 
 BRACKETED_COMMENT
-    : COMMENT_START ( BRACKETED_COMMENT | . )*? ('*/' | {markUnclosedComment();} EOF) -> channel(2)
+    : COMMENT_START ( BRACKETED_COMMENT | . )*? '*/' -> channel(2)
     ;
 
 

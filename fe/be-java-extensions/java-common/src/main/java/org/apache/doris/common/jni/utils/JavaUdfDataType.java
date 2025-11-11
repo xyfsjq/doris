@@ -60,6 +60,8 @@ public class JavaUdfDataType {
     public static final JavaUdfDataType ARRAY_TYPE = new JavaUdfArrayType("ARRAY_TYPE", TPrimitiveType.ARRAY, 0);
     public static final JavaUdfDataType MAP_TYPE = new JavaUdfMapType("MAP_TYPE", TPrimitiveType.MAP, 0);
     public static final JavaUdfDataType STRUCT_TYPE = new JavaUdfStructType("STRUCT_TYPE", TPrimitiveType.STRUCT, 0);
+    public static final JavaUdfDataType VARBINARY_TYPE = new JavaUdfDataType("VARBINARY_TYPE", TPrimitiveType.VARBINARY,
+            0);
 
     private static final Map<TPrimitiveType, JavaUdfDataType> javaUdfDataTypeMap = new HashMap<>();
 
@@ -91,6 +93,7 @@ public class JavaUdfDataType {
         addJavaUdfDataType(STRUCT_TYPE);
         addJavaUdfDataType(IPV4);
         addJavaUdfDataType(IPV6);
+        addJavaUdfDataType(VARBINARY_TYPE);
     }
 
     private final String description;
@@ -154,12 +157,14 @@ public class JavaUdfDataType {
         } else if (c == BigDecimal.class) {
             return Sets.newHashSet(JavaUdfDataType.DECIMALV2, JavaUdfDataType.DECIMAL32, JavaUdfDataType.DECIMAL64,
                     JavaUdfDataType.DECIMAL128);
-        } else if (c == java.util.ArrayList.class) {
+        } else if (Type.ARRAY_SUPPORTED_JAVA_TYPE.contains(c)) {
             return Sets.newHashSet(JavaUdfDataType.ARRAY_TYPE, JavaUdfDataType.STRUCT_TYPE);
-        } else if (c == java.util.HashMap.class) {
+        } else if (Type.MAP_SUPPORTED_JAVA_TYPE.contains(c)) {
             return Sets.newHashSet(JavaUdfDataType.MAP_TYPE);
         } else if (c == InetAddress.class) {
             return Sets.newHashSet(JavaUdfDataType.IPV4, JavaUdfDataType.IPV6);
+        } else if (c == Byte[].class || c == byte[].class) {
+            return Sets.newHashSet(JavaUdfDataType.VARBINARY_TYPE);
         }
         return Sets.newHashSet(JavaUdfDataType.INVALID_TYPE);
     }

@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.distribute;
 
 import org.apache.doris.common.profile.SummaryProfile;
+import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.trees.plans.distribute.worker.BackendDistributedPlanWorkerManager;
 import org.apache.doris.nereids.trees.plans.distribute.worker.DistributedPlanWorker;
@@ -80,17 +81,35 @@ public class DistributePlanner {
 
     /** plan */
     public FragmentIdMapping<DistributedPlan> plan() {
-        updateProfileIfPresent(SummaryProfile::setQueryPlanFinishTime);
+        updateProfileIfPresent(profile -> profile.setQueryPlanFinishTime(TimeUtils.getStartTimeMs()));
         try {
             BackendDistributedPlanWorkerManager workerManager = new BackendDistributedPlanWorkerManager(
                             statementContext.getConnectContext(), notNeedBackend, isLoadJob);
             LoadBalanceScanWorkerSelector workerSelector = new LoadBalanceScanWorkerSelector(workerManager);
             FragmentIdMapping<UnassignedJob> fragmentJobs
                     = UnassignedJobBuilder.buildJobs(workerSelector, statementContext, idToFragments);
+            // assign BE and dop, to instance
             ListMultimap<PlanFragmentId, AssignedJob> instanceJobs
                     = AssignedJobBuilder.buildJobs(fragmentJobs, workerManager, isLoadJob);
             FragmentIdMapping<DistributedPlan> distributedPlans = buildDistributePlans(fragmentJobs, instanceJobs);
+            // for broadcast or something impacts links' shape, they're in Node's property (like exchange's
+            // partitionType). we use them to link plans. no needs of extra modification.
             FragmentIdMapping<DistributedPlan> linkedPlans = linkPlans(distributedPlans);
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("=== LinkedPlans Debug Info ===");
+                linkedPlans.forEach((fragmentId, plan) -> {
+                    LOG.debug("Fragment[{}]:", fragmentId);
+                    if (plan instanceof PipelineDistributedPlan) {
+                        PipelineDistributedPlan pPlan = (PipelineDistributedPlan) plan;
+                        LOG.debug("  Jobs: {}", pPlan.getInstanceJobs());
+                        LOG.debug("  Destinations: {}", pPlan.getDestinations());
+                        LOG.debug("  Inputs: {}", pPlan.getInputs());
+                    }
+                });
+                LOG.debug("===========================");
+            }
+
             updateProfileIfPresent(SummaryProfile::setAssignFragmentTime);
             return linkedPlans;
         } catch (Throwable t) {

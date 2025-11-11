@@ -81,7 +81,7 @@ public class AlterLightSchChangeHelper {
         if (connectContext == null) {
             rpcTimoutMs = DEFAULT_RPC_TIMEOUT * 1000L;
         } else {
-            rpcTimoutMs = connectContext.getExecTimeout() * 1000L;
+            rpcTimoutMs = connectContext.getExecTimeoutS() * 1000L;
         }
     }
 
@@ -252,6 +252,7 @@ public class AlterLightSchChangeHelper {
                 indexMeta.setMaxColUniqueId(schemaPair.first);
                 indexMeta.setSchema(schemaPair.second);
             }
+            olapTable.rebuildFullSchema();
         } catch (IOException e) {
             throw new IllegalStateException("fail to reset index schema", e);
         }

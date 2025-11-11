@@ -33,15 +33,18 @@ import org.apache.doris.catalog.Function;
 import org.apache.doris.catalog.Function.NullableMode;
 import org.apache.doris.catalog.FunctionUtil;
 import org.apache.doris.catalog.MapType;
+import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarFunction;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.StructType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.EnvUtils;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.plugin.CloudPluginDownloader;
 import org.apache.doris.common.util.URI;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.mysql.privilege.PrivPredicate;
@@ -58,11 +61,13 @@ import org.apache.doris.nereids.trees.expressions.BitAnd;
 import org.apache.doris.nereids.trees.expressions.BitNot;
 import org.apache.doris.nereids.trees.expressions.BitOr;
 import org.apache.doris.nereids.trees.expressions.BitXor;
+import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.Divide;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.IntegralDivide;
 import org.apache.doris.nereids.trees.expressions.Mod;
 import org.apache.doris.nereids.trees.expressions.Multiply;
+import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.Subtract;
 import org.apache.doris.nereids.trees.expressions.functions.BoundFunction;
@@ -100,6 +105,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -110,33 +116,33 @@ import java.util.stream.Collectors;
  */
 public class CreateFunctionCommand extends Command implements ForwardWithSync {
     @Deprecated
-    private static final String OBJECT_FILE_KEY = "object_file";
-    private static final String FILE_KEY = "file";
-    private static final String SYMBOL_KEY = "symbol";
-    private static final String PREPARE_SYMBOL_KEY = "prepare_fn";
-    private static final String CLOSE_SYMBOL_KEY = "close_fn";
-    private static final String MD5_CHECKSUM = "md5";
-    private static final String INIT_KEY = "init_fn";
-    private static final String UPDATE_KEY = "update_fn";
-    private static final String MERGE_KEY = "merge_fn";
-    private static final String SERIALIZE_KEY = "serialize_fn";
-    private static final String FINALIZE_KEY = "finalize_fn";
-    private static final String GET_VALUE_KEY = "get_value_fn";
-    private static final String REMOVE_KEY = "remove_fn";
-    private static final String BINARY_TYPE = "type";
-    private static final String EVAL_METHOD_KEY = "evaluate";
-    private static final String CREATE_METHOD_NAME = "create";
-    private static final String DESTROY_METHOD_NAME = "destroy";
-    private static final String ADD_METHOD_NAME = "add";
-    private static final String SERIALIZE_METHOD_NAME = "serialize";
-    private static final String MERGE_METHOD_NAME = "merge";
-    private static final String GETVALUE_METHOD_NAME = "getValue";
-    private static final String STATE_CLASS_NAME = "State";
+    public static final String OBJECT_FILE_KEY = "object_file";
+    public static final String FILE_KEY = "file";
+    public static final String SYMBOL_KEY = "symbol";
+    public static final String PREPARE_SYMBOL_KEY = "prepare_fn";
+    public static final String CLOSE_SYMBOL_KEY = "close_fn";
+    public static final String MD5_CHECKSUM = "md5";
+    public static final String INIT_KEY = "init_fn";
+    public static final String UPDATE_KEY = "update_fn";
+    public static final String MERGE_KEY = "merge_fn";
+    public static final String SERIALIZE_KEY = "serialize_fn";
+    public static final String FINALIZE_KEY = "finalize_fn";
+    public static final String GET_VALUE_KEY = "get_value_fn";
+    public static final String REMOVE_KEY = "remove_fn";
+    public static final String BINARY_TYPE = "type";
+    public static final String EVAL_METHOD_KEY = "evaluate";
+    public static final String CREATE_METHOD_NAME = "create";
+    public static final String DESTROY_METHOD_NAME = "destroy";
+    public static final String ADD_METHOD_NAME = "add";
+    public static final String SERIALIZE_METHOD_NAME = "serialize";
+    public static final String MERGE_METHOD_NAME = "merge";
+    public static final String GETVALUE_METHOD_NAME = "getValue";
+    public static final String STATE_CLASS_NAME = "State";
     // add for java udf check return type nullable mode, always_nullable or always_not_nullable
-    private static final String IS_RETURN_NULL = "always_nullable";
+    public static final String IS_RETURN_NULL = "always_nullable";
     // iff is static load, BE will be cache the udf class load, so only need load once
-    private static final String IS_STATIC_LOAD = "static_load";
-    private static final String EXPIRATION_TIME = "expiration_time";
+    public static final String IS_STATIC_LOAD = "static_load";
+    public static final String EXPIRATION_TIME = "expiration_time";
 
     // timeout for both connection and read. 10 seconds is long enough.
     private static final int HTTP_TIMEOUT_MS = 10000;
@@ -155,6 +161,7 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
     private TFunctionBinaryType binaryType = TFunctionBinaryType.JAVA_UDF;
     // needed item set after analyzed
     private String userFile;
+    private String originalUserFile; // Keep original jar name for BE
     private Function function;
     private String checksum = "";
     private boolean isStaticLoad = false;
@@ -168,9 +175,9 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
      * CreateFunctionCommand
      */
     public CreateFunctionCommand(SetType setType, boolean ifNotExists, boolean isAggregate, boolean isAlias,
-                                 boolean isTableFunction, FunctionName functionName, FunctionArgTypesInfo argsDef,
-                                 DataType returnType, DataType intermediateType, List<String> parameters,
-                                 Expression originFunction, Map<String, String> properties) {
+            boolean isTableFunction, FunctionName functionName, FunctionArgTypesInfo argsDef,
+            DataType returnType, DataType intermediateType, List<String> parameters,
+            Expression originFunction, Map<String, String> properties) {
         super(PlanType.CREATE_FUNCTION_COMMAND);
         this.setType = setType;
         this.ifNotExists = ifNotExists;
@@ -300,6 +307,11 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
         }
 
         userFile = properties.getOrDefault(FILE_KEY, properties.get(OBJECT_FILE_KEY));
+        originalUserFile = userFile; // Keep original jar name for BE
+        // Convert userFile to realUrl only for FE checksum calculation
+        if (!Strings.isNullOrEmpty(userFile) && binaryType != TFunctionBinaryType.RPC) {
+            userFile = getRealUrl(userFile);
+        }
         if (!Strings.isNullOrEmpty(userFile) && binaryType != TFunctionBinaryType.RPC) {
             try {
                 computeObjectChecksum();
@@ -373,6 +385,33 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
         }
     }
 
+    private String getRealUrl(String url) {
+        if (!url.contains(":/")) {
+            return checkAndReturnDefaultJavaUdfUrl(url);
+        }
+        return url;
+    }
+
+    private String checkAndReturnDefaultJavaUdfUrl(String url) {
+        String defaultUrl = EnvUtils.getDorisHome() + "/plugins/java_udf";
+        // In cloud mode, try cloud download first
+        if (Config.isCloudMode()) {
+            String targetPath = defaultUrl + "/" + url;
+            try {
+                String downloadedPath = CloudPluginDownloader.downloadFromCloud(
+                        CloudPluginDownloader.PluginType.JAVA_UDF, url, targetPath);
+                if (!downloadedPath.isEmpty()) {
+                    return "file://" + downloadedPath;
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("Cannot download UDF from cloud: " + url
+                        + ". Please retry later or check your UDF has been uploaded to cloud.");
+            }
+        }
+        // Return the file path (original UDF behavior)
+        return "file://" + defaultUrl + "/" + url;
+    }
+
     private void analyzeUdtf() throws AnalysisException {
         String symbol = properties.get(SYMBOL_KEY);
         if (Strings.isNullOrEmpty(symbol)) {
@@ -383,8 +422,8 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
         }
         analyzeJavaUdf(symbol);
         URI location;
-        if (!Strings.isNullOrEmpty(userFile)) {
-            location = URI.create(userFile);
+        if (!Strings.isNullOrEmpty(originalUserFile)) {
+            location = URI.create(originalUserFile);
         } else {
             location = null;
         }
@@ -403,8 +442,8 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
         AggregateFunction.AggregateFunctionBuilder builder = AggregateFunction.AggregateFunctionBuilder
                 .createUdfBuilder();
         URI location;
-        if (!Strings.isNullOrEmpty(userFile)) {
-            location = URI.create(userFile);
+        if (!Strings.isNullOrEmpty(originalUserFile)) {
+            location = URI.create(originalUserFile);
         } else {
             location = null;
         }
@@ -460,6 +499,8 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
         function.setBinaryType(binaryType);
         function.setChecksum(checksum);
         function.setNullableMode(returnNullMode);
+        function.setStaticLoad(isStaticLoad);
+        function.setExpirationTime(expirationTime);
     }
 
     private void analyzeUdf() throws AnalysisException {
@@ -480,8 +521,8 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
             analyzeJavaUdf(symbol);
         }
         URI location;
-        if (!Strings.isNullOrEmpty(userFile)) {
-            location = URI.create(userFile);
+        if (!Strings.isNullOrEmpty(originalUserFile)) {
+            location = URI.create(originalUserFile);
         } else {
             location = null;
         }
@@ -508,7 +549,7 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
                     throw new AnalysisException("Class [" + clazz + "] not found in classpath");
                 }
             }
-            URL[] urls = { new URL("jar:" + userFile + "!/") };
+            URL[] urls = {new URL("jar:" + userFile + "!/")};
             try (URLClassLoader cl = URLClassLoader.newInstance(urls)) {
                 checkUdafClass(clazz, cl, allMethods);
             } catch (ClassNotFoundException e) {
@@ -660,7 +701,7 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
                     throw new AnalysisException("Class [" + clazz + "] not found in classpath");
                 }
             }
-            URL[] urls = { new URL("jar:" + userFile + "!/") };
+            URL[] urls = {new URL("jar:" + userFile + "!/")};
             try (URLClassLoader cl = URLClassLoader.newInstance(urls)) {
                 checkUdfClass(clazz, cl);
             } catch (ClassNotFoundException e) {
@@ -694,7 +735,9 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
                 m -> m.getParameters().length == argsDef.getArgTypes().length).collect(Collectors.toList());
         if (evalArgLengthMatchList.size() == 0) {
             throw new AnalysisException(
-                    String.format("The number of parameters for method '%s' in class '%s' should be %d",
+                    String.format(
+                            "The arguments number udf provided and create function command is not equal,"
+                                    + " the parameters of '%s' method in class '%s' maybe should %d.",
                             EVAL_METHOD_KEY, udfClass.getCanonicalName(), argsDef.getArgTypes().length));
         } else if (evalArgLengthMatchList.size() == 1) {
             Method method = evalArgLengthMatchList.get(0);
@@ -745,19 +788,21 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
             javaTypes = Type.PrimitiveTypeToJavaClassType.get(structType.getPrimitiveType());
         } else {
             throw new AnalysisException(
-                    String.format("Method '%s' in class '%s' does not support type '%s'",
+                    String.format("Method '%s' in class '%s' does not support type '%s'.",
                             method.getName(), clazz.getCanonicalName(), expType));
         }
 
         if (javaTypes == null) {
             throw new AnalysisException(
-                    String.format("Method '%s' in class '%s' does not support type '%s'",
-                            method.getName(), clazz.getCanonicalName(), expType.toString()));
+                    String.format("Method '%s' in class '%s' does not support type '%s'.",
+                            method.getName(), clazz.getCanonicalName(), expType.getPrimitiveType().toString()));
         }
         if (!javaTypes.contains(pType)) {
             throw new AnalysisException(
-                    String.format("UDF class '%s' method '%s' %s[%s] type is not supported!",
-                            clazz.getCanonicalName(), method.getName(), pname, pType.getCanonicalName()));
+                    String.format(
+                            "UDF class '%s' of method '%s' %s is [%s] type, but create function command type is %s.",
+                            clazz.getCanonicalName(), method.getName(), pname, pType.getCanonicalName(),
+                            expType.getPrimitiveType().toString()));
         }
     }
 
@@ -841,7 +886,6 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
                 typeBuilder.setId(Types.PGenericType.TypeId.DATEV2);
                 break;
             case DATETIME:
-            case TIME:
                 typeBuilder.setId(Types.PGenericType.TypeId.DATETIME);
                 break;
             case DATETIMEV2:
@@ -887,8 +931,84 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
     }
 
     private void analyzeAliasFunction(ConnectContext ctx) throws AnalysisException {
+        if (parameters.size() != argsDef.getArgTypes().length) {
+            throw new AnalysisException(
+                    "Alias function [" + functionName + "] args number is not equal to parameters number");
+        }
+        List<Expression> exprs;
+        List<String> typeDefParams = new ArrayList<>();
+        if (originFunction instanceof org.apache.doris.nereids.trees.expressions.functions.Function) {
+            exprs = originFunction.getArguments();
+        } else if (originFunction instanceof Cast) {
+            exprs = originFunction.children();
+            DataType targetType = originFunction.getDataType();
+            Type type = targetType.toCatalogDataType();
+            if (type.isScalarType()) {
+                ScalarType scalarType = (ScalarType) type;
+                PrimitiveType primitiveType = scalarType.getPrimitiveType();
+                switch (primitiveType) {
+                    case DECIMAL32:
+                    case DECIMAL64:
+                    case DECIMAL128:
+                    case DECIMAL256:
+                    case DECIMALV2:
+                        if (!Strings.isNullOrEmpty(scalarType.getScalarPrecisionStr())) {
+                            typeDefParams.add(scalarType.getScalarPrecisionStr());
+                        }
+                        if (!Strings.isNullOrEmpty(scalarType.getScalarScaleStr())) {
+                            typeDefParams.add(scalarType.getScalarScaleStr());
+                        }
+                        break;
+                    case CHAR:
+                    case VARCHAR:
+                        if (!Strings.isNullOrEmpty(scalarType.getLenStr())) {
+                            typeDefParams.add(scalarType.getLenStr());
+                        }
+                        break;
+                    default:
+                        throw new AnalysisException("Alias type is invalid: " + primitiveType);
+                }
+            }
+        } else {
+            throw new AnalysisException("Not supported expr type: " + originFunction);
+        }
+        Set<String> set = new HashSet<>();
+        for (String str : parameters) {
+            if (!set.add(str)) {
+                throw new AnalysisException(
+                        "Alias function [" + functionName + "] has duplicate parameter [" + str + "].");
+            }
+            boolean existFlag = false;
+            // check exprs
+            for (Expression expr : exprs) {
+                existFlag |= checkParams(expr, str);
+            }
+            // check targetTypeDef
+            for (String typeDefParam : typeDefParams) {
+                existFlag |= typeDefParam.equals(str);
+            }
+            if (!existFlag) {
+                throw new AnalysisException("Alias function [" + functionName + "]  do not contain parameter [" + str
+                        + "]. typeDefParams="
+                        + typeDefParams.stream().map(String::toString).collect(Collectors.joining(", ")));
+            }
+        }
         function = AliasFunction.createFunction(functionName, argsDef.getArgTypes(),
                 Type.VARCHAR, argsDef.isVariadic(), parameters, translateToLegacyExpr(originFunction, ctx));
+    }
+
+    private boolean checkParams(Expression expr, String param) {
+        for (Expression e : expr.children()) {
+            if (checkParams(e, param)) {
+                return true;
+            }
+        }
+        if (expr instanceof Slot) {
+            if (param.equals(((Slot) expr).getName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -943,7 +1063,7 @@ public class CreateFunctionCommand extends Command implements ForwardWithSync {
             SlotRef slotRef = new SlotRef(slotReference.getDataType().toCatalogDataType(), slotReference.nullable());
             slotRef.setLabel(slotReference.getName());
             slotRef.setCol(slotReference.getName());
-            slotRef.setDisableTableName(true);
+            slotRef.disableTableName();
             return slotRef;
         }
 
