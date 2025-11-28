@@ -83,7 +83,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -111,8 +111,7 @@ public class MTMVPlanUtil {
             RuleType.ELIMINATE_JOIN_BY_UK,
             RuleType.ELIMINATE_GROUP_BY_KEY_BY_UNIFORM,
             RuleType.ELIMINATE_GROUP_BY,
-            RuleType.SALT_JOIN,
-            RuleType.AGG_SCALAR_SUBQUERY_TO_WINDOW_FUNCTION
+            RuleType.SALT_JOIN
     );
     // The rules should be disabled when run MTMV task
     public static final List<RuleType> DISABLE_RULES_WHEN_RUN_MTMV_TASK = DISABLE_RULES_WHEN_GENERATE_MTMV_CACHE;

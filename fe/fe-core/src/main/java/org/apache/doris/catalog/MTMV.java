@@ -49,7 +49,7 @@ import org.apache.doris.qe.ConnectContext;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
-import org.apache.commons.collections.MapUtils;
+import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -185,6 +185,7 @@ public class MTMV extends OlapTable {
         try {
             // only can update state, refresh state will be change by add task
             this.schemaChangeVersion++;
+            this.refreshSnapshot = new MTMVRefreshSnapshot();
             return this.status.updateStateAndDetail(newStatus);
         } finally {
             writeMvUnlock();
