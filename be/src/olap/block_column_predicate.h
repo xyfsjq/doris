@@ -40,8 +40,6 @@ class Roaring;
 } // namespace roaring
 
 namespace doris {
-class WrapperField;
-
 namespace segment_v2 {
 class BloomFilter;
 class InvertedIndexIterator;
@@ -60,7 +58,7 @@ public:
     virtual void get_all_column_ids(std::set<ColumnId>& column_id_set) const = 0;
 
     virtual void get_all_column_predicate(
-            std::set<const ColumnPredicate*>& predicate_set) const = 0;
+            std::set<std::shared_ptr<const ColumnPredicate>>& predicate_set) const = 0;
 
     virtual uint16_t evaluate(vectorized::MutableColumns& block, uint16_t* sel,
                               uint16_t selected_size) const {
@@ -76,7 +74,7 @@ public:
 
     virtual bool support_zonemap() const { return true; }
 
-    virtual bool evaluate_and(const std::pair<WrapperField*, WrapperField*>& statistic) const {
+    virtual bool evaluate_and(const segment_v2::ZoneMap& zone_map) const {
         throw Exception(Status::FatalError("should not reach here"));
     }
 
@@ -118,13 +116,15 @@ class SingleColumnBlockPredicate : public BlockColumnPredicate {
     ENABLE_FACTORY_CREATOR(SingleColumnBlockPredicate);
 
 public:
-    explicit SingleColumnBlockPredicate(const ColumnPredicate* pre) : _predicate(pre) {}
+    explicit SingleColumnBlockPredicate(const std::shared_ptr<const ColumnPredicate>& pre)
+            : _predicate(pre) {}
 
     void get_all_column_ids(std::set<ColumnId>& column_id_set) const override {
         column_id_set.insert(_predicate->column_id());
     }
 
-    void get_all_column_predicate(std::set<const ColumnPredicate*>& predicate_set) const override {
+    void get_all_column_predicate(
+            std::set<std::shared_ptr<const ColumnPredicate>>& predicate_set) const override {
         predicate_set.insert(_predicate);
     }
 
@@ -133,7 +133,7 @@ public:
     void evaluate_and(vectorized::MutableColumns& block, uint16_t* sel, uint16_t selected_size,
                       bool* flags) const override;
     bool support_zonemap() const override { return _predicate->support_zonemap(); }
-    bool evaluate_and(const std::pair<WrapperField*, WrapperField*>& statistic) const override;
+    bool evaluate_and(const segment_v2::ZoneMap& zone_map) const override;
     bool evaluate_and(vectorized::ParquetPredicate::ColumnStat* statistic) const override {
         return _predicate->evaluate_and(statistic);
     }
@@ -154,7 +154,7 @@ public:
     }
 
 private:
-    const ColumnPredicate* _predicate = nullptr;
+    const std::shared_ptr<const ColumnPredicate> _predicate = nullptr;
 };
 
 class MutilColumnBlockPredicate : public BlockColumnPredicate {
@@ -185,7 +185,8 @@ public:
         }
     }
 
-    void get_all_column_predicate(std::set<const ColumnPredicate*>& predicate_set) const override {
+    void get_all_column_predicate(
+            std::set<std::shared_ptr<const ColumnPredicate>>& predicate_set) const override {
         for (auto& child_block_predicate : _block_column_predicate_vec) {
             child_block_predicate->get_all_column_predicate(predicate_set);
         }
@@ -237,7 +238,7 @@ public:
 
     void evaluate_vec(vectorized::MutableColumns& block, uint16_t size, bool* flags) const override;
 
-    bool evaluate_and(const std::pair<WrapperField*, WrapperField*>& statistic) const override;
+    bool evaluate_and(const segment_v2::ZoneMap& zone_map) const override;
 
     bool evaluate_and(const segment_v2::BloomFilter* bf) const override;
 

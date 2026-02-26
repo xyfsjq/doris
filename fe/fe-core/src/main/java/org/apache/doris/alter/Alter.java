@@ -97,6 +97,7 @@ import org.apache.doris.persist.ModifyTablePropertyOperationLog;
 import org.apache.doris.persist.ReplaceTableOperationLog;
 import org.apache.doris.policy.StoragePolicy;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ConnectContextUtil;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TOdbcTableType;
@@ -387,6 +388,7 @@ public class Alter {
 
     private void processAlterTableForExternalTable(
             ExternalTable table, List<AlterOp> alterOps) throws UserException {
+        long updateTime = System.currentTimeMillis();
         for (AlterOp alterOp : alterOps) {
             if (alterOp instanceof ModifyTablePropertiesOp) {
                 setExternalTableAutoAnalyzePolicy(table, alterOps);
@@ -429,7 +431,7 @@ public class Alter {
                 AddPartitionFieldOp addPartitionField = (AddPartitionFieldOp) alterOp;
                 if (table instanceof IcebergExternalTable) {
                     ((IcebergExternalCatalog) table.getCatalog()).addPartitionField(
-                            (IcebergExternalTable) table, addPartitionField);
+                            (IcebergExternalTable) table, addPartitionField, updateTime);
                 } else {
                     throw new UserException("ADD PARTITION KEY is only supported for Iceberg tables");
                 }
@@ -437,7 +439,7 @@ public class Alter {
                 DropPartitionFieldOp dropPartitionField = (DropPartitionFieldOp) alterOp;
                 if (table instanceof IcebergExternalTable) {
                     ((IcebergExternalCatalog) table.getCatalog()).dropPartitionField(
-                            (IcebergExternalTable) table, dropPartitionField);
+                            (IcebergExternalTable) table, dropPartitionField, updateTime);
                 } else {
                     throw new UserException("DROP PARTITION KEY is only supported for Iceberg tables");
                 }
@@ -445,7 +447,7 @@ public class Alter {
                 ReplacePartitionFieldOp replacePartitionField = (ReplacePartitionFieldOp) alterOp;
                 if (table instanceof IcebergExternalTable) {
                     ((IcebergExternalCatalog) table.getCatalog()).replacePartitionField(
-                            (IcebergExternalTable) table, replacePartitionField);
+                            (IcebergExternalTable) table, replacePartitionField, updateTime);
                 } else {
                     throw new UserException("REPLACE PARTITION KEY is only supported for Iceberg tables");
                 }
@@ -677,7 +679,7 @@ public class Alter {
                     DynamicPartitionUtil.checkAlterAllowed(
                             (OlapTable) db.getTableOrMetaException(tableName, TableType.OLAP));
                 }
-                Env.getCurrentEnv().addPartition(db, tableName, (AddPartitionOp) alterOp, false, 0, true);
+                Env.getCurrentEnv().addPartition(db, tableName, (AddPartitionOp) alterOp, false, 0, true, null);
             } else if (alterOp instanceof AddPartitionLikeOp) {
                 if (!((AddPartitionLikeOp) alterOp).getTempPartition()) {
                     DynamicPartitionUtil.checkAlterAllowed(
@@ -836,11 +838,12 @@ public class Alter {
 
         String tableName = tableNameInfo.getTbl();
         View view = (View) db.getTableOrMetaException(tableName, TableType.VIEW);
-        modifyViewDef(db, view, alterViewInfo.getInlineViewDef(), ctx.getSessionVariable().getSqlMode(),
+        modifyViewDef(db, view, alterViewInfo.getInlineViewDef(),
+                ConnectContextUtil.getAffectQueryResultInPlanVariables(ConnectContext.get()),
                 alterViewInfo.getColumns(), alterViewInfo.getComment());
     }
 
-    private void modifyViewDef(Database db, View view, String inlineViewDef, long sqlMode,
+    private void modifyViewDef(Database db, View view, String inlineViewDef, Map<String, String> variables,
                                List<Column> newFullSchema, String comment) throws DdlException {
         db.writeLockOrDdlException();
         try {
@@ -851,14 +854,14 @@ public class Alter {
                 }
                 // when do alter view modify comment, inlineViewDef and newFullSchema will be empty.
                 if (!Strings.isNullOrEmpty(inlineViewDef)) {
-                    view.setInlineViewDefWithSqlMode(inlineViewDef, sqlMode);
+                    view.setInlineViewDefWithSessionVariables(inlineViewDef, variables);
                     view.setNewFullSchema(newFullSchema);
                 }
                 String viewName = view.getName();
                 db.unregisterTable(viewName);
                 db.registerTable(view);
                 AlterViewInfo alterViewInfo = new AlterViewInfo(db.getId(), view.getId(),
-                        inlineViewDef, newFullSchema, sqlMode, comment);
+                        inlineViewDef, newFullSchema, variables, comment);
                 Env.getCurrentEnv().getMtmvService().alterView(new BaseTableInfo(view));
                 Env.getCurrentEnv().getEditLog().logModifyViewDef(alterViewInfo);
                 LOG.info("modify view[{}] definition to {}", viewName, inlineViewDef);
@@ -887,7 +890,7 @@ public class Alter {
             if (comment != null) {
                 view.setComment(comment);
             } else {
-                view.setInlineViewDefWithSqlMode(inlineViewDef, alterViewInfo.getSqlMode());
+                view.setInlineViewDefWithSessionVariables(inlineViewDef, alterViewInfo.getSessionVariables());
                 view.setNewFullSchema(newFullSchema);
             }
 

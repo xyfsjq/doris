@@ -86,6 +86,9 @@ public:
 
     Status update_tmp_rowset(const RowsetMeta& rs_meta);
 
+    Status update_packed_file_info(const std::string& packed_file_path,
+                                   const cloud::PackedFileInfoPB& packed_file_info);
+
     Status commit_txn(const StreamLoadContext& ctx, bool is_2pc);
 
     Status abort_txn(const StreamLoadContext& ctx);
@@ -165,6 +168,12 @@ public:
     Status get_snapshot_properties(SnapshotSwitchStatus& switch_status,
                                    int64_t& max_reserved_snapshots,
                                    int64_t& snapshot_interval_seconds);
+
+    // Get all cluster status for the instance
+    // Returns cluster_id -> (status, mtime_ms)
+    // If my_cluster_id is not null, also returns the requesting node's cluster_id
+    Status get_cluster_status(std::unordered_map<std::string, std::pair<int32_t, int64_t>>* result,
+                              std::string* my_cluster_id = nullptr);
 
 private:
     bool sync_tablet_delete_bitmap_by_cache(CloudTablet* tablet, int64_t old_max_version,

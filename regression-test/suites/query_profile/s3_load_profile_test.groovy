@@ -16,17 +16,7 @@
 // under the License.
 
 import groovy.json.JsonSlurper
-
-def getProfileList = { masterHTTPAddr ->
-    def dst = 'http://' + masterHTTPAddr
-    def conn = new URL(dst + "/rest/v1/query_profile").openConnection()
-    conn.setRequestMethod("GET")
-    def encoding = Base64.getEncoder().encodeToString((context.config.feHttpUser + ":" + 
-            (context.config.feHttpPassword == null ? "" : context.config.feHttpPassword)).getBytes("UTF-8"))
-    conn.setRequestProperty("Authorization", "Basic ${encoding}")
-    return conn.getInputStream().getText()
-}
-
+import org.apache.doris.regression.action.ProfileAction
 
 def getProfile = { masterHTTPAddr, id ->
     def dst = 'http://' + masterHTTPAddr
@@ -201,10 +191,13 @@ PROPERTIES (
             break
         }
     }
+    if (masterIP == "" || masterHTTPPort == "") {
+        assertTrue(false, "Cannot find master FE from show frontends result: $allFrontends")
+    }
     def masterAddress = masterIP + ":" + masterHTTPPort
     logger.info("masterIP:masterHTTPPort is:${masterAddress}")
 
-    def profileString = getProfile(masterAddress, jobId)
+    def profileString = getProfile(masterAddress, jobId.toString())
     logger.info("profileDataString:" + profileString)
     assertTrue(profileString.contains("NumScanners"))
     assertTrue(profileString.contains("RowsProduced"))

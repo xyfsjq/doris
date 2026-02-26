@@ -31,6 +31,7 @@
 #include "gtest/gtest_pred_impl.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
+#include "olap/field.h"
 #include "olap/rowset/segment_v2/index_file_reader.h"
 #include "olap/rowset/segment_v2/index_file_writer.h"
 #include "olap/rowset/segment_v2/inverted_index_compound_reader.h"
@@ -47,6 +48,7 @@
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_string.h"
 #include "vec/common/pod_array_fwd.h"
+#include "vec/core/block.h"
 #include "vec/core/field.h"
 #include "vec/core/types.h"
 #include "vec/data_types/data_type_array.h"
@@ -279,7 +281,8 @@ public:
         EXPECT_EQ(st, Status::OK());
 
         EXPECT_EQ(_inverted_index_builder->finish(), Status::OK());
-        EXPECT_EQ(index_file_writer->close(), Status::OK());
+        EXPECT_EQ(index_file_writer->begin_close(), Status::OK());
+        EXPECT_EQ(index_file_writer->finish_close(), Status::OK());
 
         ExpectedDocMap expected = {{"amory", {0, 1}}, {"doris", {0}}, {"commiter", {1}}};
         check_terms_stats(index_path_prefix, &expected, {}, InvertedIndexStorageFormatPB::V1,
@@ -365,7 +368,8 @@ public:
         st = _inverted_index_builder->add_array_nulls(null_map, block.rows());
         EXPECT_EQ(st, Status::OK());
         EXPECT_EQ(_inverted_index_builder->finish(), Status::OK());
-        EXPECT_EQ(index_file_writer->close(), Status::OK());
+        EXPECT_EQ(index_file_writer->begin_close(), Status::OK());
+        EXPECT_EQ(index_file_writer->finish_close(), Status::OK());
 
         ExpectedDocMap expected = {{"amory", {0, 1}}, {"doris", {0}}, {"commiter", {1}}};
         check_terms_stats(index_path_prefix, &expected, {}, InvertedIndexStorageFormatPB::V1,
@@ -477,7 +481,8 @@ public:
         st = _inverted_index_builder->add_array_nulls(null_map, block.rows());
         EXPECT_EQ(st, Status::OK());
         EXPECT_EQ(_inverted_index_builder->finish(), Status::OK());
-        EXPECT_EQ(index_file_writer->close(), Status::OK());
+        EXPECT_EQ(index_file_writer->begin_close(), Status::OK());
+        EXPECT_EQ(index_file_writer->finish_close(), Status::OK());
 
         // Expected inverted index result: only index non-null elements
         // Row 1: non-null in a2 is "test"
@@ -591,7 +596,8 @@ public:
         st = _inverted_index_builder->add_array_nulls(null_map, block.rows());
         EXPECT_EQ(st, Status::OK());
         EXPECT_EQ(_inverted_index_builder->finish(), Status::OK());
-        EXPECT_EQ(index_file_writer->close(), Status::OK());
+        EXPECT_EQ(index_file_writer->begin_close(), Status::OK());
+        EXPECT_EQ(index_file_writer->finish_close(), Status::OK());
 
         // Expected inverted index result: only index non-null elements
         // Row 1: non-null in a2 is "test"
@@ -793,7 +799,8 @@ public:
         }
 
         EXPECT_EQ(_inverted_index_builder->finish(), Status::OK());
-        EXPECT_EQ(index_file_writer->close(), Status::OK());
+        EXPECT_EQ(index_file_writer->begin_close(), Status::OK());
+        EXPECT_EQ(index_file_writer->finish_close(), Status::OK());
 
         std::vector<int> expected_null_bitmap = {0, 3, 5, 7};
         check_terms_stats(index_path_prefix, &merged_expected, expected_null_bitmap,
@@ -896,7 +903,8 @@ public:
         st = _inverted_index_builder->add_array_nulls(null_map, block.rows());
         EXPECT_EQ(st, Status::OK());
         EXPECT_EQ(_inverted_index_builder->finish(), Status::OK());
-        EXPECT_EQ(index_file_writer->close(), Status::OK());
+        EXPECT_EQ(index_file_writer->begin_close(), Status::OK());
+        EXPECT_EQ(index_file_writer->finish_close(), Status::OK());
 
         // expected inverted index: row0 contains "123" and "456" (doc id 0), row1 is null, row2 contains "789" and "101112" (doc id 2)
         ExpectedDocMap expected = {{"123", {0}}, {"456", {0}}, {"789", {2}}, {"101112", {2}}};
@@ -1007,7 +1015,8 @@ public:
         EXPECT_EQ(st, Status::OK());
 
         EXPECT_EQ(_inverted_index_builder->finish(), Status::OK());
-        EXPECT_EQ(index_file_writer->close(), Status::OK());
+        EXPECT_EQ(index_file_writer->begin_close(), Status::OK());
+        EXPECT_EQ(index_file_writer->finish_close(), Status::OK());
 
         std::vector<int> expected_null_bitmap = {0, 1};
         ExpectedDocMap expected {};

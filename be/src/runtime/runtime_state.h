@@ -73,6 +73,7 @@ class MemTrackerLimiter;
 class QueryContext;
 class RuntimeFilterConsumer;
 class RuntimeFilterProducer;
+class TaskExecutionContext;
 
 // A collection of items that are part of the global state of a
 // query and shared across all execution nodes of that query.
@@ -122,6 +123,11 @@ public:
     int64_t scan_queue_mem_limit() const {
         return _query_options.__isset.scan_queue_mem_limit ? _query_options.scan_queue_mem_limit
                                                            : _query_options.mem_limit / 20;
+    }
+
+    bool enable_adjust_conjunct_order_by_cost() const {
+        return _query_options.__isset.enable_adjust_conjunct_order_by_cost &&
+               _query_options.enable_adjust_conjunct_order_by_cost;
     }
 
     int32_t max_column_reader_num() const {
@@ -204,10 +210,6 @@ public:
 
     bool enable_insert_strict() const {
         return _query_options.__isset.enable_insert_strict && _query_options.enable_insert_strict;
-    }
-
-    bool enable_decimal256() const {
-        return _query_options.__isset.enable_decimal256 && _query_options.enable_decimal256;
     }
 
     bool enable_common_expr_pushdown() const {
@@ -504,6 +506,16 @@ public:
         _iceberg_commit_datas.emplace_back(iceberg_commit_data);
     }
 
+    std::vector<TMCCommitData> mc_commit_datas() const {
+        std::lock_guard<std::mutex> lock(_mc_commit_datas_mutex);
+        return _mc_commit_datas;
+    }
+
+    void add_mc_commit_datas(const TMCCommitData& mc_commit_data) {
+        std::lock_guard<std::mutex> lock(_mc_commit_datas_mutex);
+        _mc_commit_datas.emplace_back(mc_commit_data);
+    }
+
     // local runtime filter mgr, the runtime filter do not have remote target or
     // not need local merge should regist here. the instance exec finish, the local
     // runtime filter mgr can release the memory of local runtime filter
@@ -515,7 +527,7 @@ public:
         _runtime_filter_mgr = runtime_filter_mgr;
     }
 
-    QueryContext* get_query_ctx() { return _query_ctx; }
+    QueryContext* get_query_ctx() const { return _query_ctx; }
 
     [[nodiscard]] bool low_memory_mode() const;
 
@@ -532,6 +544,27 @@ public:
         return _query_options.__isset.enable_profile && _query_options.enable_profile;
     }
 
+    int cte_max_recursion_depth() const {
+        return _query_options.__isset.cte_max_recursion_depth
+                       ? _query_options.cte_max_recursion_depth
+                       : 0;
+    }
+
+    bool enable_streaming_agg_hash_join_force_passthrough() const {
+        return _query_options.__isset.enable_streaming_agg_hash_join_force_passthrough &&
+               _query_options.enable_streaming_agg_hash_join_force_passthrough;
+    }
+
+    bool enable_distinct_streaming_agg_force_passthrough() const {
+        return _query_options.__isset.enable_distinct_streaming_agg_force_passthrough &&
+               _query_options.enable_distinct_streaming_agg_force_passthrough;
+    }
+
+    bool enable_broadcast_join_force_passthrough() const {
+        return _query_options.__isset.enable_broadcast_join_force_passthrough &&
+               _query_options.enable_broadcast_join_force_passthrough;
+    }
+
     int rpc_verbose_profile_max_instance_count() const {
         return _query_options.__isset.rpc_verbose_profile_max_instance_count
                        ? _query_options.rpc_verbose_profile_max_instance_count
@@ -545,6 +578,11 @@ public:
 
     bool enable_parallel_scan() const {
         return _query_options.__isset.enable_parallel_scan && _query_options.enable_parallel_scan;
+    }
+
+    bool enable_aggregate_function_null_v2() const {
+        return _query_options.__isset.enable_aggregate_function_null_v2 &&
+               _query_options.enable_aggregate_function_null_v2;
     }
 
     bool is_read_csv_empty_line_as_null() const {
@@ -691,6 +729,11 @@ public:
         }
     }
 
+    MOCK_FUNCTION bool enable_use_hybrid_sort() const {
+        return _query_options.__isset.enable_use_hybrid_sort &&
+               _query_options.enable_use_hybrid_sort;
+    }
+
     void set_max_operator_id(int max_operator_id) { _max_operator_id = max_operator_id; }
 
     int max_operator_id() const { return _max_operator_id; }
@@ -712,6 +755,17 @@ public:
         return VectorSearchUserParams(_query_options.hnsw_ef_search,
                                       _query_options.hnsw_check_relative_distance,
                                       _query_options.hnsw_bounded_queue, _query_options.ivf_nprobe);
+    }
+
+    void reset_to_rerun();
+
+    void set_force_make_rf_wait_infinite() {
+        _query_options.__set_runtime_filter_wait_infinitely(true);
+    }
+
+    bool runtime_filter_wait_infinitely() const {
+        return _query_options.__isset.runtime_filter_wait_infinitely &&
+               _query_options.runtime_filter_wait_infinitely;
     }
 
 private:
@@ -819,6 +873,9 @@ private:
     mutable std::mutex _iceberg_commit_datas_mutex;
     std::vector<TIcebergCommitData> _iceberg_commit_datas;
 
+    mutable std::mutex _mc_commit_datas_mutex;
+    std::vector<TMCCommitData> _mc_commit_datas;
+
     std::vector<std::unique_ptr<doris::pipeline::PipelineXLocalStateBase>> _op_id_to_local_state;
 
     std::unique_ptr<doris::pipeline::PipelineXSinkLocalStateBase> _sink_local_state;
@@ -840,6 +897,8 @@ private:
 
     // used for encoding the global lazy materialize
     std::shared_ptr<IdFileMap> _id_file_map = nullptr;
+
+    std::set<int> _registered_runtime_filter_ids;
 };
 
 #define RETURN_IF_CANCELLED(state)               \

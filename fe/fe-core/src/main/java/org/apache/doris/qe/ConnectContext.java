@@ -61,8 +61,6 @@ import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.stats.StatsErrorEstimator;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.util.MoreFieldsThread;
-import org.apache.doris.plsql.Exec;
-import org.apache.doris.plsql.executor.PlSqlOperation;
 import org.apache.doris.plugin.AuditEvent.AuditEventBuilder;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.resource.computegroup.ComputeGroup;
@@ -217,8 +215,6 @@ public class ConnectContext {
     // Only when the connection is created again, the new resource tags will be retrieved from the UserProperty
     private ComputeGroup computeGroup = null;
 
-    private PlSqlOperation plSqlOperation = null;
-
     private String sqlHash;
 
     private JSONObject minidump = null;
@@ -253,8 +249,6 @@ public class ConnectContext {
     // but the internal implementation will call the logic of `AlterTable`.
     // In this case, `skipAuth` needs to be set to `true` to skip the permission check of `AlterTable`
     private boolean skipAuth = false;
-    private Exec exec;
-    private boolean runProcedure = false;
 
     // isProxy used for forward request from other FE and used in one thread
     // it's default thread-safe
@@ -426,7 +420,6 @@ public class ConnectContext {
         context.setEnv(env);
         context.setDatabase(currentDb);
         context.setCurrentUserIdentity(currentUserIdentity);
-        context.setProcedureExec(exec);
         return context;
     }
 
@@ -850,13 +843,6 @@ public class ConnectContext {
     public void clear() {
         executor = null;
         statementContext = null;
-    }
-
-    public PlSqlOperation getPlSqlOperation() {
-        if (plSqlOperation == null) {
-            plSqlOperation = new PlSqlOperation();
-        }
-        return plSqlOperation;
     }
 
     /**
@@ -1405,11 +1391,11 @@ public class ConnectContext {
     }
 
     /**
-     * Tries to choose an available cluster in the following order
-     * 1. Do nothing if a cluster has been chosen for current session. It may be
-     *    chosen explicitly by `use @` command or setCloudCluster() or this method
-     * 2. Tries to choose a default cluster if current mysql user has been set any
-     * 3. Tries to choose an authorized cluster if all preceeding conditions failed
+     * Tries to choose an available cluster in the following order:
+     * 1. Get cluster from session variable (set by `use @` command or setCloudCluster())
+     * 2. Get cluster from cached variable (this.cloudCluster) if available (from previous policy selection)
+     * 3. Get cluster from user's default cluster property if set
+     * 4. Choose an authorized cluster by policy if all preceding conditions failed
      *
      * @param updateErr whether set the connect state to error if the returned cluster is null or empty
      * @return non-empty cluster name if a cluster has been chosen otherwise null or empty string
@@ -1432,18 +1418,7 @@ public class ConnectContext {
             return sessionCluster;
         }
 
-        // 2 get cluster from user
-        String userPropCluster = getDefaultCloudClusterFromUser(true);
-        if (!StringUtils.isEmpty(userPropCluster)) {
-            choseWay = "user property";
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("finally set context compute group name {} for user {} with chose way '{}'", userPropCluster,
-                        getCurrentUserIdentity(), choseWay);
-            }
-            return userPropCluster;
-        }
-
-        // 3 get cluster from a cached variable in connect context
+        // 2 get cluster from a cached variable in connect context
         // this value comes from a cluster selection policy
         if (!Strings.isNullOrEmpty(this.cloudCluster)) {
             choseWay = "user selection policy";
@@ -1452,6 +1427,18 @@ public class ConnectContext {
                         cloudCluster, getCurrentUserIdentity(), choseWay);
             }
             return cloudCluster;
+        }
+
+        // 3 get cluster from user
+        String userPropCluster = getDefaultCloudClusterFromUser(true);
+        if (!StringUtils.isEmpty(userPropCluster)) {
+            choseWay = "user property";
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("finally set context compute group name {} for user {} with chose way '{}'", userPropCluster,
+                        getCurrentUserIdentity(), choseWay);
+            }
+            this.cloudCluster = userPropCluster;
+            return userPropCluster;
         }
 
         String policyCluster = "";
@@ -1474,9 +1461,8 @@ public class ConnectContext {
                 getState().setError(ErrorCode.ERR_CLOUD_CLUSTER_ERROR, exception.getMessage());
             }
             throw exception;
-        } else {
-            this.cloudCluster = policyCluster;
         }
+        this.cloudCluster = policyCluster;
 
         if (LOG.isDebugEnabled()) {
             LOG.debug("finally set context compute group name {} for user {} with chose way '{}'", this.cloudCluster,
@@ -1551,22 +1537,6 @@ public class ConnectContext {
 
     public void setSkipAuth(boolean skipAuth) {
         this.skipAuth = skipAuth;
-    }
-
-    public boolean isRunProcedure() {
-        return runProcedure;
-    }
-
-    public void setRunProcedure(boolean runProcedure) {
-        this.runProcedure = runProcedure;
-    }
-
-    public void setProcedureExec(Exec exec) {
-        this.exec = exec;
-    }
-
-    public Exec getProcedureExec() {
-        return exec;
     }
 
     public int getNetReadTimeout() {

@@ -34,6 +34,7 @@ namespace doris::vectorized {
 template <template <typename> class Data>
 AggregateFunctionPtr create_aggregate_function_single_value(const String& name,
                                                             const DataTypes& argument_types,
+                                                            const DataTypePtr& result_type,
                                                             const bool result_is_nullable,
                                                             const AggregateFunctionAttr& attr) {
     assert_arity_range(name, argument_types, 1, 1);
@@ -60,6 +61,10 @@ AggregateFunctionPtr create_aggregate_function_single_value(const String& name,
     case PrimitiveType::TYPE_DATETIMEV2:
         return creator_without_type::create_unary_arguments<
                 AggregateFunctionsSingleValue<Data<SingleValueDataFixed<TYPE_DATETIMEV2>>>>(
+                argument_types, result_is_nullable, attr);
+    case PrimitiveType::TYPE_TIMESTAMPTZ:
+        return creator_without_type::create_unary_arguments<
+                AggregateFunctionsSingleValue<Data<SingleValueDataFixed<TYPE_TIMESTAMPTZ>>>>(
                 argument_types, result_is_nullable, attr);
     case PrimitiveType::TYPE_TIME:
     case PrimitiveType::TYPE_TIMEV2:
@@ -129,30 +134,13 @@ AggregateFunctionPtr create_aggregate_function_single_value(const String& name,
         return creator_without_type::create_unary_arguments<
                 AggregateFunctionsSingleValue<Data<SingleValueDataDecimal<TYPE_DECIMAL256>>>>(
                 argument_types, result_is_nullable, attr);
+    // For Complex type. Currently, only type_array supports min and max.
     case PrimitiveType::TYPE_ARRAY:
-        return creator_without_type::create_unary_arguments<
-                AggregateFunctionsSingleValue<Data<SingleValueDataComplexType>>>(
-                argument_types, result_is_nullable, attr);
     case PrimitiveType::TYPE_MAP:
-        return creator_without_type::create_unary_arguments<
-                AggregateFunctionsSingleValue<Data<SingleValueDataComplexType>>>(
-                argument_types, result_is_nullable, attr);
     case PrimitiveType::TYPE_STRUCT:
-        return creator_without_type::create_unary_arguments<
-                AggregateFunctionsSingleValue<Data<SingleValueDataComplexType>>>(
-                argument_types, result_is_nullable, attr);
     case PrimitiveType::TYPE_AGG_STATE:
-        return creator_without_type::create_unary_arguments<
-                AggregateFunctionsSingleValue<Data<SingleValueDataComplexType>>>(
-                argument_types, result_is_nullable, attr);
     case PrimitiveType::TYPE_BITMAP:
-        return creator_without_type::create_unary_arguments<
-                AggregateFunctionsSingleValue<Data<SingleValueDataComplexType>>>(
-                argument_types, result_is_nullable, attr);
     case PrimitiveType::TYPE_HLL:
-        return creator_without_type::create_unary_arguments<
-                AggregateFunctionsSingleValue<Data<SingleValueDataComplexType>>>(
-                argument_types, result_is_nullable, attr);
     case PrimitiveType::TYPE_QUANTILE_STATE:
         return creator_without_type::create_unary_arguments<
                 AggregateFunctionsSingleValue<Data<SingleValueDataComplexType>>>(

@@ -74,6 +74,10 @@ size_t CacheBlockMetaStore::get_write_queue_size() const {
 }
 
 Status CacheBlockMetaStore::init() {
+    if (_initialized.load(std::memory_order_acquire)) {
+        return Status::OK();
+    }
+
     std::filesystem::create_directories(_db_path);
 
     _options.create_if_missing = true;
@@ -119,6 +123,7 @@ Status CacheBlockMetaStore::init() {
     }
 
     _write_thread = std::thread(&CacheBlockMetaStore::async_write_worker, this);
+    _initialized.store(true, std::memory_order_release);
 
     return Status::OK();
 }
@@ -325,6 +330,33 @@ std::unique_ptr<BlockMetaIterator> CacheBlockMetaStore::get_all() {
         return nullptr;
     }
     return std::unique_ptr<BlockMetaIterator>(new RocksDBIterator(iter));
+}
+
+size_t CacheBlockMetaStore::approximate_entry_count() const {
+    if (!_db) {
+        LOG(WARNING) << "Database not initialized when counting entries";
+        return 0;
+    }
+
+    rocksdb::ReadOptions read_options;
+    std::unique_ptr<rocksdb::Iterator> iter(
+            _db->NewIterator(read_options, _file_cache_meta_cf_handle.get()));
+    if (!iter) {
+        LOG(WARNING) << "Failed to create iterator when counting entries";
+        return 0;
+    }
+
+    size_t count = 0;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        ++count;
+    }
+
+    if (!iter->status().ok()) {
+        LOG(WARNING) << "Iterator encountered error when counting entries: "
+                     << iter->status().ToString();
+    }
+
+    return count;
 }
 
 void CacheBlockMetaStore::delete_key(const BlockMetaKey& key) {

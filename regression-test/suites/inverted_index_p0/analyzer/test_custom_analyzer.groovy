@@ -63,8 +63,8 @@ suite("test_custom_analyzer", "p0") {
         CREATE INVERTED INDEX ANALYZER IF NOT EXISTS keyword_lowercase
         PROPERTIES
         (
-            "tokenizer" = "keyword",
-            "token_filter" = "asciifolding, lowercase"
+        "tokenizer" = "keyword",
+        "token_filter" = "asciifolding, lowercase"
         );
     """
 
@@ -94,7 +94,7 @@ suite("test_custom_analyzer", "p0") {
             "type" = "pinyin",
             "keep_first_letter" = "true",
             "keep_full_pinyin" = "false",
-            "keep_joined_full_pinyin    " = "false",
+            "keep_joined_full_pinyin" = "false",
             "keep_original" = "false",
             "lowercase" = "true"
         );
@@ -246,6 +246,71 @@ suite("test_custom_analyzer", "p0") {
         );
     """
 
+    // Test basic tokenizer with different extra_chars settings
+    // 1. basic tokenizer without extra_chars (default)
+    sql """
+        CREATE INVERTED INDEX TOKENIZER IF NOT EXISTS basic_tokenizer_no_extra
+        PROPERTIES
+        (
+            "type" = "basic"
+        );
+    """
+
+    // 2. basic tokenizer with extra_chars = "_"
+    sql """
+        CREATE INVERTED INDEX TOKENIZER IF NOT EXISTS basic_tokenizer_underscore
+        PROPERTIES
+        (
+            "type" = "basic",
+            "extra_chars" = "_"
+        );
+    """
+
+    // 3. basic tokenizer with extra_chars = "_-"
+    sql """
+        CREATE INVERTED INDEX TOKENIZER IF NOT EXISTS basic_tokenizer_underscore_dash
+        PROPERTIES
+        (
+            "type" = "basic",
+            "extra_chars" = "_-"
+        );
+    """
+
+    // Create analyzers for each tokenizer
+    sql """
+        CREATE INVERTED INDEX ANALYZER IF NOT EXISTS basic_analyzer_no_extra
+        PROPERTIES
+        (
+            "tokenizer" = "basic_tokenizer_no_extra",
+            "token_filter" = "lowercase"
+        );
+    """
+
+    sql """
+        CREATE INVERTED INDEX ANALYZER IF NOT EXISTS basic_analyzer_underscore
+        PROPERTIES
+        (
+            "tokenizer" = "basic_tokenizer_underscore",
+            "token_filter" = "lowercase"
+        );
+    """
+
+    sql """
+        CREATE INVERTED INDEX ANALYZER IF NOT EXISTS basic_analyzer_underscore_dash
+        PROPERTIES
+        (
+            "tokenizer" = "basic_tokenizer_underscore_dash",
+            "token_filter" = "lowercase"
+        );
+    """
+
+    sql """
+        CREATE INVERTED INDEX TOKENIZER IF NOT EXISTS icu_tokenizer_no_extra
+        PROPERTIES
+        (
+            "type" = "icu"
+        );
+    """
     // Wait for all analyzers to be ready - increased timeout due to many objects
     sql """ select sleep(15) """
 
@@ -261,7 +326,13 @@ suite("test_custom_analyzer", "p0") {
     qt_tokenize_sql """ select tokenize("1080º Avalanche", '"analyzer"="lowercase_delimited"'); """
     qt_tokenize_sql """ select tokenize("GET /images/hm_bg.jpg HTTP/1.0", '"analyzer"="basic_analyzer"'); """
     qt_tokenize_sql """ select tokenize("让我们说「Hello」そして世界とつながろう！", '"analyzer"="icu_analyzer"'); """
-    
+
+    // Test basic tokenizer with extra_chars settings
+    // Test input: "hello_world-test" - contains underscore and dash
+    qt_tokenize_basic_1 """ select tokenize("hello_world-test", '"analyzer"="basic_analyzer_no_extra"'); """
+    qt_tokenize_basic_2 """ select tokenize("hello_world-test", '"analyzer"="basic_analyzer_underscore"'); """
+    qt_tokenize_basic_3 """ select tokenize("hello_world-test", '"analyzer"="basic_analyzer_underscore_dash"'); """
+
     // Test pinyin tokenize functions - different analyzers
     qt_tokenize_pinyin1 """ select tokenize("刘德华", '"analyzer"="pinyin_analyzer"'); """
     qt_tokenize_pinyin2 """ select tokenize("张学友", '"analyzer"="pinyin_analyzer"'); """
@@ -582,5 +653,234 @@ suite("test_custom_analyzer", "p0") {
 
     } finally {
         sql "DROP TABLE IF EXISTS ${indexTbName6}"
+    }
+
+    // Test ignore_pinyin_offset parameter
+    // Create tokenizer with ignore_pinyin_offset=true (default)
+    sql """
+        CREATE INVERTED INDEX TOKENIZER IF NOT EXISTS pinyin_tokenizer_ignore_true
+        PROPERTIES (
+            "type" = "pinyin",
+            "keep_first_letter" = "true",
+            "keep_full_pinyin" = "true",
+            "ignore_pinyin_offset" = "true"
+        );
+    """
+
+    // Create tokenizer with ignore_pinyin_offset=false
+    sql """
+        CREATE INVERTED INDEX TOKENIZER IF NOT EXISTS pinyin_tokenizer_ignore_false
+        PROPERTIES (
+            "type" = "pinyin",
+            "keep_first_letter" = "true",
+            "keep_full_pinyin" = "true",
+            "ignore_pinyin_offset" = "false"
+        );
+    """
+
+    // Create analyzers
+    sql """
+        CREATE INVERTED INDEX ANALYZER IF NOT EXISTS pinyin_analyzer_ignore_true
+        PROPERTIES (
+            "tokenizer" = "pinyin_tokenizer_ignore_true"
+        );
+    """
+
+    sql """
+        CREATE INVERTED INDEX ANALYZER IF NOT EXISTS pinyin_analyzer_ignore_false
+        PROPERTIES (
+            "tokenizer" = "pinyin_tokenizer_ignore_false"
+        );
+    """
+
+    // Wait for all analyzers to be ready - increased timeout due to many objects
+    sql """ select sleep(15) """
+
+    // Test with ignore_pinyin_offset=true - all tokens should have same offset
+    qt_sql_ignore_offset_true_1 """ select tokenize('刘德华', '"analyzer"="pinyin_analyzer_ignore_true"'); """
+    qt_sql_ignore_offset_true_2 """ select tokenize('你好', '"analyzer"="pinyin_analyzer_ignore_true"'); """
+    qt_sql_ignore_offset_true_3 """ select tokenize('银行', '"analyzer"="pinyin_analyzer_ignore_true"'); """
+
+    // Test with ignore_pinyin_offset=false - tokens should have independent offsets
+    qt_sql_ignore_offset_false_1 """ select tokenize('刘德华', '"analyzer"="pinyin_analyzer_ignore_false"'); """
+    qt_sql_ignore_offset_false_2 """ select tokenize('你好', '"analyzer"="pinyin_analyzer_ignore_false"'); """
+    qt_sql_ignore_offset_false_3 """ select tokenize('银行', '"analyzer"="pinyin_analyzer_ignore_false"'); """
+
+    // Test with mixed content
+    qt_sql_ignore_offset_true_mixed """ select tokenize('刘a德', '"analyzer"="pinyin_analyzer_ignore_true"'); """
+    qt_sql_ignore_offset_false_mixed """ select tokenize('刘a德', '"analyzer"="pinyin_analyzer_ignore_false"'); """
+
+    // ==================== Bug Fix Tests ====================
+    // Test Bug #1: Space handling consistency between pinyin tokenizer and pinyin filter
+    // When using pinyin filter with keyword tokenizer, spaces should be ignored (not trigger buffer processing)
+    // This matches ES behavior where spaces don't split the ASCII buffer
+    
+    // Drop existing objects first to ensure clean state
+    try {
+        sql """ DROP INVERTED INDEX ANALYZER pinyin_analyzer_space_test """
+    } catch (Exception e) { /* ignore if not exists */ }
+    try {
+        sql """ DROP INVERTED INDEX ANALYZER pinyin_filter_analyzer_space_test """
+    } catch (Exception e) { /* ignore if not exists */ }
+    try {
+        sql """ DROP INVERTED INDEX TOKENIZER pinyin_tokenizer_space_test """
+    } catch (Exception e) { /* ignore if not exists */ }
+    try {
+        sql """ DROP INVERTED INDEX TOKEN_FILTER pinyin_filter_space_test """
+    } catch (Exception e) { /* ignore if not exists */ }
+    
+    // Create pinyin tokenizer for comparison (spaces should be ignored in joined output)
+    // Key settings: keep_none_chinese=false (don't output English separately)
+    //               keep_none_chinese_in_joined_full_pinyin=true (include English in joined output)
+    sql """
+        CREATE INVERTED INDEX TOKENIZER pinyin_tokenizer_space_test
+        PROPERTIES (
+            "type" = "pinyin",
+            "keep_first_letter" = "false",
+            "keep_separate_first_letter" = "false",
+            "keep_full_pinyin" = "false",
+            "keep_joined_full_pinyin" = "true",
+            "keep_none_chinese" = "false",
+            "keep_none_chinese_in_joined_full_pinyin" = "true",
+            "none_chinese_pinyin_tokenize" = "false",
+            "keep_original" = "false",
+            "lowercase" = "false",
+            "trim_whitespace" = "false",
+            "ignore_pinyin_offset" = "true"
+        );
+    """
+    
+    // Create pinyin filter with keyword tokenizer for comparison
+    // Same settings as tokenizer to ensure consistent behavior
+    sql """
+        CREATE INVERTED INDEX TOKEN_FILTER pinyin_filter_space_test
+        PROPERTIES (
+            "type" = "pinyin",
+            "keep_first_letter" = "false",
+            "keep_separate_first_letter" = "false",
+            "keep_full_pinyin" = "false",
+            "keep_joined_full_pinyin" = "true",
+            "keep_none_chinese" = "false",
+            "keep_none_chinese_in_joined_full_pinyin" = "true",
+            "none_chinese_pinyin_tokenize" = "false",
+            "keep_original" = "false",
+            "lowercase" = "false",
+            "trim_whitespace" = "false",
+            "ignore_pinyin_offset" = "true"
+        );
+    """
+    
+    // Wait for tokenizer and filter to be ready before creating analyzers
+    sql """ select sleep(15) """
+    
+    sql """
+        CREATE INVERTED INDEX ANALYZER pinyin_analyzer_space_test
+        PROPERTIES (
+            "tokenizer" = "pinyin_tokenizer_space_test"
+        );
+    """
+    
+    sql """
+        CREATE INVERTED INDEX ANALYZER pinyin_filter_analyzer_space_test
+        PROPERTIES (
+            "tokenizer" = "keyword",
+            "token_filter" = "pinyin_filter_space_test"
+        );
+    """
+    
+    // Wait for analyzers to be ready
+    sql """ select sleep(15) """
+    
+    // Bug #1 Test: Mixed Chinese and English with spaces
+    // Input: "ALF 刘德华" - space should be ignored, English and pinyin should be joined
+    // Key point: Space between "ALF" and "刘德华" should NOT split the ASCII buffer
+    // Expected output: ["ALFliudehua"] - English and pinyin joined together
+    qt_sql_bug1_mixed_tokenizer """ select tokenize('ALF 刘德华', '"analyzer"="pinyin_analyzer_space_test"'); """
+    qt_sql_bug1_mixed_filter """ select tokenize('ALF 刘德华', '"analyzer"="pinyin_filter_analyzer_space_test"'); """
+    
+    // Test Bug #2: Pure English fallback
+    // When keep_none_chinese=false and input is pure English, should preserve original token (ES behavior)
+    
+    // Drop existing objects first
+    try {
+        sql """ DROP INVERTED INDEX ANALYZER pinyin_analyzer_fallback_test """
+    } catch (Exception e) { /* ignore if not exists */ }
+    try {
+        sql """ DROP INVERTED INDEX TOKEN_FILTER pinyin_filter_fallback_test """
+    } catch (Exception e) { /* ignore if not exists */ }
+    
+    sql """
+        CREATE INVERTED INDEX TOKEN_FILTER pinyin_filter_fallback_test
+        PROPERTIES (
+            "type" = "pinyin",
+            "keep_none_chinese" = "false",
+            "keep_original" = "false",
+            "keep_first_letter" = "false",
+            "keep_full_pinyin" = "false",
+            "keep_joined_full_pinyin" = "true",
+            "ignore_pinyin_offset" = "true",
+            "keep_none_chinese_in_first_letter" = "false",
+            "keep_none_chinese_in_joined_full_pinyin" = "false",
+            "lowercase" = "false"
+        );
+    """
+    
+    // Wait for filter to be ready before creating analyzer
+    sql """ select sleep(15) """
+    
+    sql """
+        CREATE INVERTED INDEX ANALYZER pinyin_analyzer_fallback_test
+        PROPERTIES (
+            "tokenizer" = "keyword",
+            "token_filter" = "pinyin_filter_fallback_test"
+        );
+    """
+    
+    // Wait for analyzer to be ready
+    sql """ select sleep(15) """
+    
+    // Bug #2 Test: Pure English should be preserved via fallback mechanism
+    // Before fix: [] (token was dropped)
+    // After fix: original token preserved
+    qt_sql_bug2_pure_english """ select tokenize('Lanky Kong', '"analyzer"="pinyin_analyzer_fallback_test"'); """
+    qt_sql_bug2_pure_numbers """ select tokenize('12345', '"analyzer"="pinyin_analyzer_fallback_test"'); """
+    
+    // Bug #2 Test: Chinese should still work normally (output joined pinyin)
+    qt_sql_bug2_chinese """ select tokenize('刘德华', '"analyzer"="pinyin_analyzer_fallback_test"'); """
+    
+    // ==================== End Bug Fix Tests ====================
+
+    // Test table creation and queries with ignore_pinyin_offset
+    def indexTbName7 = "test_custom_analyzer_pinyin_offset"
+    sql "DROP TABLE IF EXISTS ${indexTbName7}"
+    sql """
+        CREATE TABLE ${indexTbName7} (
+            `a` bigint NOT NULL AUTO_INCREMENT(1),
+            `content` text NULL,
+            INDEX idx_content (`content`) USING INVERTED PROPERTIES("support_phrase" = "true", "analyzer" = "pinyin_analyzer_ignore_true")
+        ) ENGINE=OLAP
+        DUPLICATE KEY(`a`)
+        DISTRIBUTED BY RANDOM BUCKETS 1
+        PROPERTIES (
+        "replication_allocation" = "tag.location.default: 1"
+        );
+    """
+
+    sql """ INSERT INTO ${indexTbName7} VALUES (1, "刘德华"); """
+    sql """ INSERT INTO ${indexTbName7} VALUES (2, "你好世界"); """
+    sql """ INSERT INTO ${indexTbName7} VALUES (3, "银行卡"); """
+
+    try {
+        sql "sync"
+        sql """ set enable_common_expr_pushdown = true; """
+
+        // Test queries with ignore_pinyin_offset=true
+        qt_sql_table_ignore_offset_1 """ select * from ${indexTbName7} where content match 'liu' order by a; """
+        qt_sql_table_ignore_offset_2 """ select * from ${indexTbName7} where content match 'ldh' order by a; """
+        qt_sql_table_ignore_offset_3 """ select * from ${indexTbName7} where content match 'yin' order by a; """
+        qt_sql_table_ignore_offset_4 """ select * from ${indexTbName7} where content match 'hang' order by a; """
+
+    } finally {
+        sql "DROP TABLE IF EXISTS ${indexTbName7}"
     }
 }

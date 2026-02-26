@@ -21,12 +21,15 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.UserException;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.datasource.doris.RemoteDorisExternalCatalog;
 import org.apache.doris.datasource.hive.HMSExternalCatalog;
 import org.apache.doris.datasource.iceberg.IcebergExternalCatalog;
 import org.apache.doris.datasource.jdbc.JdbcExternalCatalog;
+import org.apache.doris.datasource.maxcompute.MaxComputeExternalCatalog;
 import org.apache.doris.dictionary.Dictionary;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.exceptions.ParseException;
+import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.commands.info.DMLCommandType;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
@@ -38,6 +41,7 @@ import org.apache.doris.thrift.TPartialUpdateNewRowPolicy;
 import com.google.common.collect.ImmutableList;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -59,6 +63,8 @@ public class UnboundTableSinkCreator {
             return new UnboundHiveTableSink<>(nameParts, colNames, hints, partitions, query);
         } else if (curCatalog instanceof IcebergExternalCatalog) {
             return new UnboundIcebergTableSink<>(nameParts, colNames, hints, partitions, query);
+        } else if (curCatalog instanceof MaxComputeExternalCatalog) {
+            return new UnboundMaxComputeTableSink<>(nameParts, colNames, hints, partitions, query);
         }
         throw new UserException("Load data to " + curCatalog.getClass().getSimpleName() + " is not supported.");
     }
@@ -70,9 +76,21 @@ public class UnboundTableSinkCreator {
                 List<String> colNames, List<String> hints, boolean temporaryPartition, List<String> partitions,
                 boolean isPartialUpdate, TPartialUpdateNewRowPolicy partialUpdateNewKeyPolicy,
                 DMLCommandType dmlCommandType, LogicalPlan plan) {
+        return createUnboundTableSink(nameParts, colNames, hints, temporaryPartition, partitions,
+                isPartialUpdate, partialUpdateNewKeyPolicy, dmlCommandType, plan, null);
+    }
+
+    /**
+     * create unbound sink for DML plan with static partition support for Iceberg.
+     */
+    public static LogicalSink<? extends Plan> createUnboundTableSink(List<String> nameParts,
+            List<String> colNames, List<String> hints, boolean temporaryPartition, List<String> partitions,
+            boolean isPartialUpdate, TPartialUpdateNewRowPolicy partialUpdateNewKeyPolicy,
+            DMLCommandType dmlCommandType, LogicalPlan plan,
+            Map<String, Expression> staticPartitionKeyValues) {
         String catalogName = RelationUtil.getQualifierName(ConnectContext.get(), nameParts).get(0);
         CatalogIf<?> curCatalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
-        if (curCatalog instanceof InternalCatalog) {
+        if (curCatalog instanceof InternalCatalog || curCatalog instanceof RemoteDorisExternalCatalog) {
             return new UnboundTableSink<>(nameParts, colNames, hints, temporaryPartition, partitions,
                     isPartialUpdate, partialUpdateNewKeyPolicy, dmlCommandType, Optional.empty(),
                     Optional.empty(), plan);
@@ -81,22 +99,27 @@ public class UnboundTableSinkCreator {
                     dmlCommandType, Optional.empty(), Optional.empty(), plan);
         } else if (curCatalog instanceof IcebergExternalCatalog) {
             return new UnboundIcebergTableSink<>(nameParts, colNames, hints, partitions,
-                    dmlCommandType, Optional.empty(), Optional.empty(), plan);
+                    dmlCommandType, Optional.empty(), Optional.empty(), plan, staticPartitionKeyValues);
         } else if (curCatalog instanceof JdbcExternalCatalog) {
             return new UnboundJdbcTableSink<>(nameParts, colNames, hints, partitions,
                     dmlCommandType, Optional.empty(), Optional.empty(), plan);
+        } else if (curCatalog instanceof MaxComputeExternalCatalog) {
+            return new UnboundMaxComputeTableSink<>(nameParts, colNames, hints, partitions,
+                    dmlCommandType, Optional.empty(), Optional.empty(), plan, staticPartitionKeyValues);
         }
         throw new RuntimeException("Load data to " + curCatalog.getClass().getSimpleName() + " is not supported.");
     }
 
     /**
-     * create unbound sink for DML plan with auto detect overwrite partition enable.
+     * create unbound sink for DML plan with auto detect overwrite partition enable
+     * and static partition support for Iceberg.
+     * TODO: staticPartitionKeyValues is only used for Iceberg, support other catalog types in future.
      */
     public static LogicalSink<? extends Plan> createUnboundTableSinkMaybeOverwrite(List<String> nameParts,
             List<String> colNames, List<String> hints, boolean temporaryPartition, List<String> partitions,
             boolean isAutoDetectPartition, boolean isOverwrite, boolean isPartialUpdate,
             TPartialUpdateNewRowPolicy partialUpdateNewKeyPolicy, DMLCommandType dmlCommandType,
-            LogicalPlan plan) {
+            LogicalPlan plan, Map<String, Expression> staticPartitionKeyValues) {
         if (isAutoDetectPartition) { // partitions is null
             if (!isOverwrite) {
                 throw new ParseException("ASTERISK is only supported in overwrite partition for OLAP table");
@@ -107,7 +130,7 @@ public class UnboundTableSinkCreator {
 
         String catalogName = RelationUtil.getQualifierName(ConnectContext.get(), nameParts).get(0);
         CatalogIf<?> curCatalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
-        if (curCatalog instanceof InternalCatalog) {
+        if (curCatalog instanceof InternalCatalog || curCatalog instanceof RemoteDorisExternalCatalog) {
             return new UnboundTableSink<>(nameParts, colNames, hints, temporaryPartition, partitions,
                     isAutoDetectPartition,
                     isPartialUpdate, partialUpdateNewKeyPolicy, dmlCommandType, Optional.empty(),
@@ -117,10 +140,13 @@ public class UnboundTableSinkCreator {
                     dmlCommandType, Optional.empty(), Optional.empty(), plan);
         } else if (curCatalog instanceof IcebergExternalCatalog && !isAutoDetectPartition) {
             return new UnboundIcebergTableSink<>(nameParts, colNames, hints, partitions,
-                    dmlCommandType, Optional.empty(), Optional.empty(), plan);
+                    dmlCommandType, Optional.empty(), Optional.empty(), plan, staticPartitionKeyValues);
         } else if (curCatalog instanceof JdbcExternalCatalog) {
             return new UnboundJdbcTableSink<>(nameParts, colNames, hints, partitions,
                     dmlCommandType, Optional.empty(), Optional.empty(), plan);
+        } else if (curCatalog instanceof MaxComputeExternalCatalog && !isAutoDetectPartition) {
+            return new UnboundMaxComputeTableSink<>(nameParts, colNames, hints, partitions,
+                    dmlCommandType, Optional.empty(), Optional.empty(), plan, staticPartitionKeyValues);
         }
 
         throw new AnalysisException(

@@ -17,6 +17,7 @@
 
 #include "olap/rowset/segment_v2/page_io.h"
 
+#include <crc32c/crc32c.h>
 #include <gen_cpp/segment_v2.pb.h>
 #include <stdint.h>
 
@@ -41,7 +42,7 @@
 #include "olap/rowset/segment_v2/page_handle.h"
 #include "util/block_compression.h"
 #include "util/coding.h"
-#include "util/crc32c.h"
+#include "util/concurrency_stats.h"
 #include "util/faststring.h"
 #include "util/runtime_profile.h"
 
@@ -103,7 +104,10 @@ Status PageIO::write_page(io::FileWriter* writer, const std::vector<Slice>& body
 
     // checksum
     uint8_t checksum_buf[sizeof(uint32_t)];
-    uint32_t checksum = crc32c::Value(page);
+    uint32_t checksum = 0;
+    for (const auto& slice : page) {
+        checksum = crc32c::Extend(checksum, (const uint8_t*)slice.data, slice.size);
+    }
     encode_fixed32_le(checksum_buf, checksum);
     page.emplace_back(checksum_buf, sizeof(uint32_t));
 
@@ -175,7 +179,7 @@ Status PageIO::read_and_decompress_page_(const PageReadOptions& opts, PageHandle
 
     if (opts.verify_checksum) {
         uint32_t expect = decode_fixed32_le((uint8_t*)page_slice.data + page_slice.size - 4);
-        uint32_t actual = crc32c::Value(page_slice.data, page_slice.size - 4);
+        uint32_t actual = crc32c::Crc32c(page_slice.data, page_slice.size - 4);
         // here const_cast is used for testing.
         InjectionContext ctx = {&actual, const_cast<PageReadOptions*>(&opts)};
         (void)ctx;
@@ -203,6 +207,7 @@ Status PageIO::read_and_decompress_page_(const PageReadOptions& opts, PageHandle
                     "Bad page: page is compressed but codec is NO_COMPRESSION, file={}",
                     opts.file_reader->path().native());
         }
+        SCOPED_CONCURRENCY_COUNT(ConcurrencyStatsManager::instance().page_io_decompress);
         SCOPED_RAW_TIMER(&opts.stats->decompress_ns);
         std::unique_ptr<DataPage> decompressed_page = std::make_unique<DataPage>(
                 footer->uncompressed_size() + footer_size + 4, opts.use_page_cache, opts.type);
@@ -231,12 +236,13 @@ Status PageIO::read_and_decompress_page_(const PageReadOptions& opts, PageHandle
             // for dict page, we need to use encoding_info based on footer->dict_page_footer().encoding()
             // to get its pre_decoder
             RETURN_IF_ERROR(EncodingInfo::get(FieldType::OLAP_FIELD_TYPE_VARCHAR,
-                                              footer->dict_page_footer().encoding(),
+                                              footer->dict_page_footer().encoding(), {},
                                               &encoding_info));
         }
         if (encoding_info) {
             auto* pre_decoder = encoding_info->get_data_page_pre_decoder();
             if (pre_decoder) {
+                SCOPED_CONCURRENCY_COUNT(ConcurrencyStatsManager::instance().page_io_pre_decode);
                 RETURN_IF_ERROR(pre_decoder->decode(
                         &page, &page_slice,
                         footer->data_page_footer().nullmap_size() + footer_size + 4,
@@ -252,6 +258,7 @@ Status PageIO::read_and_decompress_page_(const PageReadOptions& opts, PageHandle
     // just before add it to pagecache, it will be consistency with reading data from page cache.
     opts.stats->uncompressed_bytes_read += body->size;
     if (opts.use_page_cache && cache) {
+        SCOPED_CONCURRENCY_COUNT(ConcurrencyStatsManager::instance().page_io_insert_page_cache);
         // insert this page into cache and return the cache handle
         cache->insert(cache_key, page.get(), &cache_handle, opts.type, opts.kept_in_memory);
         *handle = PageHandle(std::move(cache_handle));

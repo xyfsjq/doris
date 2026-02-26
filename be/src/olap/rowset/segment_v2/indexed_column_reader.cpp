@@ -68,7 +68,7 @@ Status IndexedColumnReader::load(bool use_page_cache, bool kept_in_memory,
     if (_type_info == nullptr) {
         return Status::NotSupported("unsupported typeinfo, type={}", _meta.data_type());
     }
-    RETURN_IF_ERROR(EncodingInfo::get(_type_info->type(), _meta.encoding(), &_encoding_info));
+    RETURN_IF_ERROR(EncodingInfo::get(_type_info->type(), _meta.encoding(), {}, &_encoding_info));
     _value_key_coder = get_key_coder(_type_info->type());
 
     // read and parse ordinal index page when exists
@@ -165,6 +165,11 @@ Status IndexedColumnIterator::_read_data_page(const PagePointer& pp) {
     opts.need_check_bitmap = false;
     status = ParsedPage::create(std::move(handle), body, footer.data_page_footer(),
                                 _reader->encoding_info(), pp, 0, &_data_page, opts);
+    if (!status.ok()) {
+        LOG(WARNING) << "failed to create ParsedPage in IndexedColumnIterator, file="
+                     << _reader->_file_reader->path().native() << ", page_offset=" << pp.offset
+                     << ", page_size=" << pp.size << ", error=" << status;
+    }
     DCHECK(_reader->_meta.ordinal_index_meta().is_root_data_page()
                    ? _reader->_meta.num_values() == _data_page.num_rows
                    : true);

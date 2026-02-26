@@ -57,16 +57,16 @@ public:
         return Status::OK();
     }
 
-    Status execute_column(VExprContext* context, const Block* block, size_t count,
-                          ColumnPtr& result_column) const override {
-        DCHECK(_open_finished || _getting_const_col);
-        result_column = block->get_by_position(_column_id + _gap).column;
-        DCHECK_EQ(result_column->size(), count);
+    Status execute_column(VExprContext* context, const Block* block, Selector* selector,
+                          size_t count, ColumnPtr& result_column) const override {
+        DCHECK(_open_finished || block == nullptr);
+        auto origin_column = block->get_by_position(_column_id + _gap).column;
+        result_column = filter_column_with_selector(origin_column, selector, count);
         return Status::OK();
     }
 
     DataTypePtr execute_type(const Block* block) const override {
-        DCHECK(_open_finished || _getting_const_col);
+        DCHECK(_open_finished || block == nullptr);
         return block->get_by_position(_column_id + _gap).type;
     }
 
@@ -88,6 +88,8 @@ public:
             << VExpr::debug_string() << ")";
         return out.str();
     }
+
+    double execute_cost() const override { return 0.0; }
 
 private:
     int _column_id;

@@ -17,10 +17,12 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.catalog.Index;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SearchDslParser;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TExprNodeType;
+import org.apache.doris.thrift.TSearchFieldBinding;
 import org.apache.doris.thrift.TSearchParam;
 
 import org.junit.jupiter.api.Assertions;
@@ -28,7 +30,9 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 
 /**
@@ -53,11 +57,6 @@ public class SearchPredicateTest {
             typeField.setAccessible(true);
             typeField.set(slotRef, Type.STRING);
 
-            // Set analyzed flag to true from parent class Expr
-            java.lang.reflect.Field analyzedField = Expr.class.getDeclaredField("isAnalyzed");
-            analyzedField.setAccessible(true);
-            analyzedField.set(slotRef, true);
-
             // Create a mock SlotDescriptor and set it
             java.lang.reflect.Field descField = SlotRef.class.getDeclaredField("desc");
             descField.setAccessible(true);
@@ -79,7 +78,7 @@ public class SearchPredicateTest {
         SearchDslParser.QsPlan plan = createTestPlan();
         List<Expr> children = Arrays.asList(createTestSlotRef("title"));
 
-        SearchPredicate predicate = new SearchPredicate(dsl, plan, children);
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, true);
 
         Assertions.assertNotNull(predicate);
         Assertions.assertEquals(Type.BOOLEAN, predicate.getType());
@@ -92,7 +91,7 @@ public class SearchPredicateTest {
         SearchDslParser.QsPlan plan = createTestPlan();
         List<Expr> children = Arrays.asList(createTestSlotRef("title"));
 
-        SearchPredicate predicate = new SearchPredicate(dsl, plan, children);
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, true);
 
         String sql = predicate.toSqlImpl(false, false, null, null);
         Assertions.assertEquals("search('title:hello')", sql);
@@ -105,7 +104,7 @@ public class SearchPredicateTest {
         SlotRef titleSlot = createTestSlotRef("title");
         List<Expr> children = Arrays.asList(titleSlot);
 
-        SearchPredicate predicate = new SearchPredicate(dsl, plan, children);
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, true);
 
         TExprNode thriftNode = new TExprNode();
         predicate.toThrift(thriftNode);
@@ -138,7 +137,7 @@ public class SearchPredicateTest {
         SlotRef contentSlot = createTestSlotRef("content");
         List<Expr> children = Arrays.asList(titleSlot, contentSlot);
 
-        SearchPredicate predicate = new SearchPredicate(dsl, plan, children);
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, true);
 
         TExprNode thriftNode = new TExprNode();
         predicate.toThrift(thriftNode);
@@ -160,7 +159,7 @@ public class SearchPredicateTest {
         SearchDslParser.QsPlan plan = createTestPlan();
         List<Expr> children = Arrays.asList(createTestSlotRef("title"));
 
-        SearchPredicate original = new SearchPredicate(dsl, plan, children);
+        SearchPredicate original = new SearchPredicate(dsl, plan, children, true);
         SearchPredicate cloned = (SearchPredicate) original.clone();
 
         Assertions.assertNotNull(cloned);
@@ -178,9 +177,9 @@ public class SearchPredicateTest {
         SearchDslParser.QsPlan plan = createTestPlan();
         List<Expr> children = Arrays.asList(createTestSlotRef("title"));
 
-        SearchPredicate pred1 = new SearchPredicate(dsl1, plan, children);
-        SearchPredicate pred2 = new SearchPredicate(dsl2, plan, children);
-        SearchPredicate pred3 = new SearchPredicate(dsl3, plan, children);
+        SearchPredicate pred1 = new SearchPredicate(dsl1, plan, children, true);
+        SearchPredicate pred2 = new SearchPredicate(dsl2, plan, children, true);
+        SearchPredicate pred3 = new SearchPredicate(dsl3, plan, children, true);
 
         Assertions.assertTrue(pred1.equals(pred2));
         Assertions.assertTrue(!pred1.equals(pred3));
@@ -217,7 +216,7 @@ public class SearchPredicateTest {
                 createTestSlotRef("content"),
                 createTestSlotRef("category"));
 
-        SearchPredicate predicate = new SearchPredicate(dsl, plan, children);
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, true);
 
         TExprNode thriftNode = new TExprNode();
         predicate.toThrift(thriftNode);
@@ -247,7 +246,7 @@ public class SearchPredicateTest {
         SearchDslParser.QsPlan plan = createTestPlan();
         List<Expr> emptyChildren = Collections.emptyList();
 
-        SearchPredicate predicate = new SearchPredicate(dsl, plan, emptyChildren);
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, emptyChildren, true);
 
         Assertions.assertEquals(0, predicate.getChildren().size());
 
@@ -256,5 +255,137 @@ public class SearchPredicateTest {
 
         Assertions.assertNotNull(thriftNode.search_param);
         Assertions.assertEquals(dsl, thriftNode.search_param.original_dsl);
+    }
+
+    @Test
+    public void testFieldIndexesPassedToThrift() {
+        // Simulate a variant subcolumn search where FE passes index properties
+        String dsl = "data.string_8:admin";
+
+        SearchDslParser.QsNode root = new SearchDslParser.QsNode(
+                SearchDslParser.QsClauseType.TERM, "data.string_8", "admin");
+        List<SearchDslParser.QsFieldBinding> bindings = Arrays.asList(
+                new SearchDslParser.QsFieldBinding("data.string_8", 0));
+        SearchDslParser.QsPlan plan = new SearchDslParser.QsPlan(root, bindings);
+
+        SlotRef dataSlot = createTestSlotRef("data");
+        List<Expr> children = Arrays.asList(dataSlot);
+
+        // Create an Index with analyzer properties (simulates field_pattern matched index)
+        Map<String, String> indexProps = new HashMap<>();
+        indexProps.put("parser", "unicode");
+        indexProps.put("lower_case", "true");
+        Index invertedIndex = new Index(1L, "idx_text", Arrays.asList("data"),
+                org.apache.doris.nereids.trees.plans.commands.info.IndexDefinition.IndexType.INVERTED, indexProps, "");
+
+        List<Index> fieldIndexes = Arrays.asList(invertedIndex);
+
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, fieldIndexes, true);
+
+        TExprNode thriftNode = new TExprNode();
+        predicate.toThrift(thriftNode);
+
+        TSearchParam param = thriftNode.search_param;
+        Assertions.assertNotNull(param);
+        Assertions.assertEquals(1, param.field_bindings.size());
+
+        TSearchFieldBinding binding = param.field_bindings.get(0);
+        Assertions.assertEquals("data.string_8", binding.field_name);
+        Assertions.assertTrue(binding.is_variant_subcolumn);
+        Assertions.assertEquals("data", binding.parent_field_name);
+        Assertions.assertEquals("string_8", binding.subcolumn_path);
+
+        // Verify index_properties are set
+        Assertions.assertNotNull(binding.index_properties);
+        Assertions.assertEquals("unicode", binding.index_properties.get("parser"));
+        Assertions.assertEquals("true", binding.index_properties.get("lower_case"));
+    }
+
+    @Test
+    public void testFieldIndexesNullDoesNotSetProperties() {
+        String dsl = "title:hello";
+        SearchDslParser.QsPlan plan = createTestPlan();
+        SlotRef titleSlot = createTestSlotRef("title");
+        List<Expr> children = Arrays.asList(titleSlot);
+
+        // Pass null Index in the fieldIndexes list
+        List<Index> fieldIndexes = Arrays.asList((Index) null);
+
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, fieldIndexes, true);
+
+        TExprNode thriftNode = new TExprNode();
+        predicate.toThrift(thriftNode);
+
+        TSearchParam param = thriftNode.search_param;
+        TSearchFieldBinding binding = param.field_bindings.get(0);
+
+        // index_properties should not be set when Index is null
+        Assertions.assertFalse(binding.isSetIndexProperties());
+    }
+
+    @Test
+    public void testFieldIndexesEmptyListBackwardCompatible() {
+        // Verify that using the old constructor (without fieldIndexes) still works
+        String dsl = "title:hello";
+        SearchDslParser.QsPlan plan = createTestPlan();
+        SlotRef titleSlot = createTestSlotRef("title");
+        List<Expr> children = Arrays.asList(titleSlot);
+
+        // Constructor without fieldIndexes
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, true);
+
+        TExprNode thriftNode = new TExprNode();
+        predicate.toThrift(thriftNode);
+
+        TSearchParam param = thriftNode.search_param;
+        TSearchFieldBinding binding = param.field_bindings.get(0);
+
+        // index_properties should not be set
+        Assertions.assertFalse(binding.isSetIndexProperties());
+    }
+
+    @Test
+    public void testMultipleFieldsWithMixedIndexes() {
+        String dsl = "title:hello AND data.string_8:admin";
+
+        SearchDslParser.QsNode leftChild = new SearchDslParser.QsNode(
+                SearchDslParser.QsClauseType.TERM, "title", "hello");
+        SearchDslParser.QsNode rightChild = new SearchDslParser.QsNode(
+                SearchDslParser.QsClauseType.TERM, "data.string_8", "admin");
+        SearchDslParser.QsNode root = new SearchDslParser.QsNode(
+                SearchDslParser.QsClauseType.AND, Arrays.asList(leftChild, rightChild));
+
+        List<SearchDslParser.QsFieldBinding> fieldBindings = Arrays.asList(
+                new SearchDslParser.QsFieldBinding("title", 0),
+                new SearchDslParser.QsFieldBinding("data.string_8", 1));
+        SearchDslParser.QsPlan plan = new SearchDslParser.QsPlan(root, fieldBindings);
+
+        List<Expr> children = Arrays.asList(
+                createTestSlotRef("title"),
+                createTestSlotRef("data"));
+
+        // First field has no index, second has index with analyzer
+        Map<String, String> indexProps = new HashMap<>();
+        indexProps.put("parser", "unicode");
+        indexProps.put("lower_case", "true");
+        Index variantIndex = new Index(1L, "idx_text", Arrays.asList("data"),
+                org.apache.doris.nereids.trees.plans.commands.info.IndexDefinition.IndexType.INVERTED, indexProps, "");
+
+        List<Index> fieldIndexes = Arrays.asList(null, variantIndex);
+
+        SearchPredicate predicate = new SearchPredicate(dsl, plan, children, fieldIndexes, true);
+
+        TExprNode thriftNode = new TExprNode();
+        predicate.toThrift(thriftNode);
+
+        TSearchParam param = thriftNode.search_param;
+        Assertions.assertEquals(2, param.field_bindings.size());
+
+        // First field: no index_properties
+        Assertions.assertFalse(param.field_bindings.get(0).isSetIndexProperties());
+
+        // Second field: has index_properties
+        Assertions.assertTrue(param.field_bindings.get(1).isSetIndexProperties());
+        Assertions.assertEquals("unicode", param.field_bindings.get(1).index_properties.get("parser"));
     }
 }

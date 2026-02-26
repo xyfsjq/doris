@@ -68,6 +68,7 @@ import org.apache.doris.common.publish.TopicPublisher;
 import org.apache.doris.common.publish.TopicPublisherThread;
 import org.apache.doris.common.publish.WorkloadGroupPublisher;
 import org.apache.doris.common.util.Daemon;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.DynamicPartitionUtil;
 import org.apache.doris.common.util.HttpURLUtil;
 import org.apache.doris.common.util.MasterDaemon;
@@ -94,6 +95,7 @@ import org.apache.doris.datasource.hive.event.MetastoreEventsProcessor;
 import org.apache.doris.datasource.iceberg.IcebergExternalTable;
 import org.apache.doris.datasource.jdbc.JdbcExternalTable;
 import org.apache.doris.datasource.paimon.PaimonExternalTable;
+import org.apache.doris.datasource.paimon.PaimonSysExternalTable;
 import org.apache.doris.deploy.DeployManager;
 import org.apache.doris.deploy.impl.LocalFileDeployManager;
 import org.apache.doris.dictionary.DictionaryManager;
@@ -225,12 +227,12 @@ import org.apache.doris.persist.meta.MetaHeader;
 import org.apache.doris.persist.meta.MetaReader;
 import org.apache.doris.persist.meta.MetaWriter;
 import org.apache.doris.planner.TabletLoadIndexRecorderMgr;
-import org.apache.doris.plsql.metastore.PlsqlManager;
 import org.apache.doris.plugin.PluginInfo;
 import org.apache.doris.plugin.PluginMgr;
 import org.apache.doris.policy.PolicyMgr;
 import org.apache.doris.qe.AuditEventProcessor;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ConnectContextUtil;
 import org.apache.doris.qe.FEOpExecutor;
 import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.qe.JournalObservable;
@@ -529,8 +531,6 @@ public class Env {
 
     private StatisticsCleaner statisticsCleaner;
 
-    private PlsqlManager plsqlManager;
-
     private BinlogManager binlogManager;
 
     private BinlogGcer binlogGcer;
@@ -742,7 +742,7 @@ public class Env {
         this.feSessionMgr = new FESessionMgr();
         this.temporaryTableMgr = new TemporaryTableMgr();
         this.aliveSessionSet = Sets.newConcurrentHashSet();
-        this.tabletInvertedIndex = new TabletInvertedIndex();
+        this.tabletInvertedIndex = EnvFactory.getInstance().createTabletInvertedIndex();
         this.colocateTableIndex = new ColocateTableIndex();
         this.recycleBin = new CatalogRecycleBin();
         this.functionSet = new FunctionSet();
@@ -820,7 +820,6 @@ public class Env {
         this.admissionControl = new AdmissionControl(systemInfo);
         this.queryStats = new QueryStats();
         this.hiveTransactionMgr = new HiveTransactionMgr();
-        this.plsqlManager = new PlsqlManager();
         this.binlogManager = new BinlogManager();
         this.binlogGcer = new BinlogGcer();
         this.columnIdFlusher = new ColumnIdFlushDaemon();
@@ -864,7 +863,8 @@ public class Env {
     }
 
     private void refreshSession(String sessionId) {
-        sessionReportTimeMap.put(sessionId, System.currentTimeMillis());
+        // TODO: do nothing now until we fix memory link on Env#sessionReportTimeMap and Env#aliveSessionSet
+        // sessionReportTimeMap.put(sessionId, System.currentTimeMillis());
     }
 
     public void checkAndRefreshSession(String sessionId) {
@@ -992,10 +992,6 @@ public class Env {
         return metastoreEventsProcessor;
     }
 
-    public PlsqlManager getPlsqlManager() {
-        return plsqlManager;
-    }
-
     public KeyManagerStore getKeyManagerStore() {
         return keyManagerStore;
     }
@@ -1096,6 +1092,29 @@ public class Env {
     private void unlock() {
         if (lock.isHeldByCurrentThread()) {
             this.lock.unlock();
+        }
+    }
+
+    // Block the caller while holding the global env lock when the given debug point is enabled.
+    // Used to simulate a stuck import path that drags other operations waiting on the same lock.
+    public void debugBlockAllOnGlobalLock(String debugPointName) {
+        if (!DebugPointUtil.isEnable(debugPointName)) {
+            return;
+        }
+        try {
+            lock.lock();
+            LOG.info("debug point {} enabled, block and hold env lock", debugPointName);
+            while (DebugPointUtil.isEnable(debugPointName)) {
+                Thread.sleep(1000);
+            }
+            LOG.info("debug point {} cleared, release env lock", debugPointName);
+        } catch (InterruptedException e) {
+            LOG.warn("debug point {} interrupted while blocking env lock", debugPointName);
+            Thread.currentThread().interrupt();
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
     }
 
@@ -2452,7 +2471,7 @@ public class Env {
     }
 
     public long loadPlsqlProcedure(DataInputStream in, long checksum) throws IOException {
-        plsqlManager = PlsqlManager.read(in);
+        Text.readString(in);
         LOG.info("finished replay plsql procedure from image");
         return checksum;
     }
@@ -2768,7 +2787,6 @@ public class Env {
     }
 
     public long savePlsqlProcedure(CountingDataOutputStream dos, long checksum) throws IOException {
-        Env.getCurrentEnv().getPlsqlManager().write(dos);
         return checksum;
     }
 
@@ -3487,14 +3505,17 @@ public class Env {
      * @param isCreateTable this call is for creating table
      * @param generatedPartitionId the preset partition id for the partition to add
      * @param writeEditLog whether to write an edit log for this addition
-     * @return PartitionPersistInfo to be written to editlog. It may be null if no partitions added.
+     * @batchPartitions output parameter, used to batch write edit log outside this function, can be null.
+     * first is editlog PartitionPersistInfo, second is the added Partition
      * @throws DdlException
      */
-    public PartitionPersistInfo addPartition(Database db, String tableName, AddPartitionOp addPartitionOp,
+    public void addPartition(Database db, String tableName, AddPartitionOp addPartitionOp,
                                              boolean isCreateTable, long generatedPartitionId,
-                                             boolean writeEditLog) throws DdlException {
-        return getInternalCatalog().addPartition(db, tableName, addPartitionOp,
-            isCreateTable, generatedPartitionId, writeEditLog);
+                                             boolean writeEditLog,
+                                             List<Pair<PartitionPersistInfo, Partition>> batchPartitions)
+            throws DdlException {
+        getInternalCatalog().addPartition(db, tableName, addPartitionOp,
+                isCreateTable, generatedPartitionId, writeEditLog, batchPartitions);
     }
 
     public void addMultiPartitions(Database db, String tableName, AlterMultiPartitionOp multiPartitionOp)
@@ -3718,7 +3739,7 @@ public class Env {
         sb.append(olapTable.getInvertedIndexFileStorageFormat()).append("\"");
 
         // compression type
-        if (olapTable.getCompressionType() != TCompressionType.LZ4F) {
+        if (olapTable.getCompressionType() != TCompressionType.valueOf(Config.default_compression_type)) {
             sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_COMPRESSION).append("\" = \"");
             sb.append(olapTable.getCompressionType()).append("\"");
         }
@@ -3765,6 +3786,16 @@ public class Env {
                 sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_FUNCTION_COLUMN + "."
                         + PropertyAnalyzer.PROPERTIES_SEQUENCE_TYPE).append("\" = \"");
                 sb.append(olapTable.getSequenceType().toString()).append("\"");
+            }
+        }
+
+        // column group
+        Map<String, List<String>> seqMap = olapTable.getColumnSeqMapping();
+        if (seqMap != null && seqMap.size() != 0) {
+            for (Map.Entry<String, List<String>> columnGroup : seqMap.entrySet()) {
+                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_SEQUENCE_MAPPING).append(".")
+                    .append(columnGroup.getKey()).append("\" = \"");
+                sb.append(String.join(",", columnGroup.getValue())).append("\"");
             }
         }
 
@@ -4006,9 +4037,9 @@ public class Env {
                     }
                 }
                 sb.append(Joiner.on(", ").join(keysColumnNames)).append(")");
-                // show cluster keys
+                // show order keys
                 if (!clusterKeysColumnNamesToId.isEmpty()) {
-                    sb.append("\n").append("CLUSTER BY (`");
+                    sb.append("\n").append("ORDER BY (`");
                     sb.append(Joiner.on("`, `").join(clusterKeysColumnNamesToId.values())).append("`)");
                 }
             }
@@ -4233,6 +4264,9 @@ public class Env {
         } else if (table.getType() == TableType.ICEBERG_EXTERNAL_TABLE) {
             addTableComment(table, sb);
             IcebergExternalTable icebergExternalTable = (IcebergExternalTable) table;
+            if (icebergExternalTable.hasSortOrder()) {
+                sb.append("\n").append(icebergExternalTable.getSortOrderSql());
+            }
             sb.append("\nLOCATION '").append(icebergExternalTable.location()).append("'");
             sb.append("\nPROPERTIES (");
             Iterator<Entry<String, String>> iterator = icebergExternalTable.properties().entrySet().iterator();
@@ -4415,9 +4449,9 @@ public class Env {
                     }
                 }
                 sb.append(Joiner.on(", ").join(keysColumnNames)).append(")");
-                // show cluster keys
+                // show order keys
                 if (!clusterKeysColumnNamesToId.isEmpty()) {
-                    sb.append("\n").append("CLUSTER BY (`");
+                    sb.append("\n").append("ORDER BY (`");
                     sb.append(Joiner.on("`, `").join(clusterKeysColumnNamesToId.values())).append("`)");
                 }
             }
@@ -4648,6 +4682,9 @@ public class Env {
         } else if (table.getType() == TableType.ICEBERG_EXTERNAL_TABLE) {
             addTableComment(table, sb);
             IcebergExternalTable icebergExternalTable = (IcebergExternalTable) table;
+            if (icebergExternalTable.hasSortOrder()) {
+                sb.append("\n").append(icebergExternalTable.getSortOrderSql());
+            }
             sb.append("\nLOCATION '").append(icebergExternalTable.location()).append("'");
             sb.append("\nPROPERTIES (");
             Iterator<Entry<String, String>> iterator = icebergExternalTable.properties().entrySet().iterator();
@@ -4661,7 +4698,14 @@ public class Env {
             sb.append("\n)");
         } else if (table.getType() == TableType.PAIMON_EXTERNAL_TABLE) {
             addTableComment(table, sb);
-            PaimonExternalTable paimonExternalTable = (PaimonExternalTable) table;
+            PaimonExternalTable paimonExternalTable;
+            if (table instanceof PaimonExternalTable) {
+                paimonExternalTable = (PaimonExternalTable) table;
+            } else if (table instanceof PaimonSysExternalTable) {
+                paimonExternalTable = ((PaimonSysExternalTable) table).getSourceTable();
+            } else {
+                throw new RuntimeException("Unexpected Paimon table type: " + table.getClass().getSimpleName());
+            }
             Map<String, String> properties = paimonExternalTable.getTableProperties();
             sb.append("\nLOCATION '").append(properties.getOrDefault("path", "")).append("'");
             sb.append("\nPROPERTIES (");
@@ -5345,7 +5389,7 @@ public class Env {
                     break;
                 }
             }
-            if (sameKey && !Config.random_add_cluster_keys_for_mow) {
+            if (sameKey && !Config.random_add_order_by_keys_for_mow) {
                 throw new DdlException(shortKeyColumnCount + " short keys is a part of unique keys");
             }
         }
@@ -5728,6 +5772,10 @@ public class Env {
         table.checkNormalStateForAlter();
         if (colName.equalsIgnoreCase(newColName)) {
             throw new DdlException("Same column name");
+        }
+        // TODO support rename in future version
+        if (table.hasColumnSeqMapping()) {
+            throw new DdlException("table use sequence mapping do not support rename yet");
         }
 
         // @NOTE: Rename partition columns should also rename column names in partition expressions
@@ -6197,6 +6245,8 @@ public class Env {
                 }
 
                 defaultDistributionInfo.setBucketNum(bucketNum);
+                defaultDistributionInfo.setAutoBucket(distributionInfo.getAutoBucket());
+                olapTable.setIsAutoBucket(distributionInfo.getAutoBucket());
 
                 ModifyTableDefaultDistributionBucketNumOperationLog info
                         = new ModifyTableDefaultDistributionBucketNumOperationLog(db.getId(), olapTable.getId(),
@@ -6222,6 +6272,8 @@ public class Env {
         try {
             DistributionInfo defaultDistributionInfo = olapTable.getDefaultDistributionInfo();
             defaultDistributionInfo.setBucketNum(bucketNum);
+            defaultDistributionInfo.setAutoBucket(info.getAutoBucket());
+            olapTable.setIsAutoBucket(info.getAutoBucket());
         } finally {
             olapTable.writeUnlock();
         }
@@ -6316,8 +6368,8 @@ public class Env {
             long tableId = Env.getCurrentEnv().getNextId();
             View newView = new View(tableId, tableName, columns);
             newView.setComment(createViewInfo.getComment());
-            newView.setInlineViewDefWithSqlMode(createViewInfo.getInlineViewDef(),
-                    ConnectContext.get().getSessionVariable().getSqlMode());
+            newView.setInlineViewDefWithSessionVariables(createViewInfo.getInlineViewDef(),
+                    ConnectContextUtil.getAffectQueryResultInPlanVariables(ConnectContext.get()));
             if (!((Database) db).createTableWithLock(newView, false, createViewInfo.isIfNotExists()).first) {
                 throw new DdlException("Failed to create view[" + tableName + "].");
             }
@@ -7359,7 +7411,8 @@ public class Env {
     }
 
     public void registerSessionInfo(String sessionId) {
-        this.aliveSessionSet.add(sessionId);
+        // TODO: do nothing now until we fix memory link on Env#sessionReportTimeMap and Env#aliveSessionSet
+        // this.aliveSessionSet.add(sessionId);
     }
 
     public void unregisterSessionInfo(String sessionId) {
@@ -7378,4 +7431,3 @@ public class Env {
 
     protected void cloneClusterSnapshot() throws Exception {}
 }
-

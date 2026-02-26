@@ -144,7 +144,7 @@ Status Sorter::partial_sort(Block& src_block, Block& dest_block, bool reversed) 
         SCOPED_TIMER(_partial_sort_timer);
         uint64_t limit = reversed ? 0 : (_offset + _limit);
         sort_block(_materialize_sort_exprs ? dest_block : src_block, dest_block, _sort_description,
-                   limit);
+                   _hybrid_sorter, limit);
     }
 
     src_block.clear_column_data(num_cols);
@@ -154,18 +154,12 @@ Status Sorter::partial_sort(Block& src_block, Block& dest_block, bool reversed) 
 Status Sorter::_prepare_sort_columns(Block& src_block, Block& dest_block, bool reversed) {
     if (_materialize_sort_exprs) {
         auto output_tuple_expr_ctxs = _vsort_exec_exprs.sort_tuple_slot_expr_ctxs();
-        std::vector<int> valid_column_ids(output_tuple_expr_ctxs.size());
+        ColumnsWithTypeAndName columns_data(output_tuple_expr_ctxs.size());
         for (int i = 0; i < output_tuple_expr_ctxs.size(); ++i) {
-            RETURN_IF_ERROR(output_tuple_expr_ctxs[i]->execute(&src_block, &valid_column_ids[i]));
+            RETURN_IF_ERROR(output_tuple_expr_ctxs[i]->execute(&src_block, columns_data[i]));
         }
 
-        Block new_block;
-        for (auto column_id : valid_column_ids) {
-            if (column_id < 0) {
-                continue;
-            }
-            new_block.insert(src_block.get_by_position(column_id));
-        }
+        Block new_block {columns_data};
         dest_block.swap(new_block);
     }
 
@@ -189,7 +183,7 @@ FullSorter::FullSorter(VSortExecExprs& vsort_exec_exprs, int64_t limit, int64_t 
                        ObjectPool* pool, std::vector<bool>& is_asc_order,
                        std::vector<bool>& nulls_first, const RowDescriptor& row_desc,
                        RuntimeState* state, RuntimeProfile* profile)
-        : Sorter(vsort_exec_exprs, limit, offset, pool, is_asc_order, nulls_first),
+        : Sorter(vsort_exec_exprs, state, limit, offset, pool, is_asc_order, nulls_first),
           _state(MergeSorterState::create_unique(row_desc, offset)) {}
 
 // check whether the unsorted block can hold more data from input block and no need to alloc new memory
@@ -241,7 +235,7 @@ Status FullSorter::append_block(Block* block) {
 
     // iff have reach limit and the unsorted block capacity can't hold the block data size
     if (_reach_limit() && !has_enough_capacity(block, _state->unsorted_block().get())) {
-        RETURN_IF_ERROR(_do_sort());
+        RETURN_IF_ERROR(do_sort());
     }
 
     {
@@ -274,7 +268,7 @@ Status FullSorter::prepare_for_read(bool is_spill) {
         _state->ignore_offset();
     }
     if (_state->unsorted_block()->rows() > 0) {
-        RETURN_IF_ERROR(_do_sort());
+        RETURN_IF_ERROR(do_sort());
     }
     return _state->build_merge_tree(_sort_description);
 }
@@ -288,7 +282,7 @@ Status FullSorter::merge_sort_read_for_spill(RuntimeState* state, doris::vectori
     return _state->merge_sort_read(block, batch_size, eos);
 }
 
-Status FullSorter::_do_sort() {
+Status FullSorter::do_sort() {
     Block* src_block = _state->unsorted_block().get();
     Block desc_block = src_block->clone_without_columns();
     COUNTER_UPDATE(_partial_sort_counter, 1);

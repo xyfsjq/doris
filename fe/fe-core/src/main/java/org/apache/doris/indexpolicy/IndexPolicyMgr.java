@@ -53,7 +53,16 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
 
     @SerializedName(value = "idToIndexPolicy")
     private final Map<Long, IndexPolicy> idToIndexPolicy = Maps.newHashMap();
+    // Keys are normalized to lowercase for case-insensitive lookup
     private final Map<String, IndexPolicy> nameToIndexPolicy = Maps.newHashMap();
+
+    /**
+     * Normalize policy name to lowercase for case-insensitive lookup.
+     * Policy names are case-insensitive in Doris.
+     */
+    private static String normalizeKey(String name) {
+        return name == null ? null : name.trim().toLowerCase();
+    }
 
     private void writeLock() {
         lock.writeLock().lock();
@@ -83,14 +92,15 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
     }
 
     public void validateAnalyzerExists(String analyzerName) throws DdlException {
-        // Allow built-in analyzers
-        if (IndexPolicy.BUILTIN_ANALYZERS.contains(analyzerName)) {
+        String normalizedName = normalizeKey(analyzerName);
+        // Built-in analyzers are stored in lowercase, so use normalized name for comparison
+        if (IndexPolicy.BUILTIN_ANALYZERS.contains(normalizedName)) {
             return;
         }
 
         readLock();
         try {
-            IndexPolicy policy = nameToIndexPolicy.get(analyzerName);
+            IndexPolicy policy = nameToIndexPolicy.get(normalizedName);
             if (policy == null) {
                 throw new DdlException("Analyzer '" + analyzerName + "' does not exist");
             }
@@ -105,21 +115,47 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
         }
     }
 
+    public void validateNormalizerExists(String normalizerName) throws DdlException {
+        String normalizedName = normalizeKey(normalizerName);
+        // Built-in normalizers are stored in lowercase, so use normalized name for comparison
+        if (IndexPolicy.BUILTIN_NORMALIZERS.contains(normalizedName)) {
+            return;
+        }
+
+        readLock();
+        try {
+            IndexPolicy policy = nameToIndexPolicy.get(normalizedName);
+            if (policy == null) {
+                throw new DdlException("Normalizer '" + normalizerName + "' does not exist");
+            }
+            if (policy.getType() != IndexPolicyTypeEnum.NORMALIZER) {
+                throw new DdlException("Policy '" + normalizerName + "' is not a normalizer");
+            }
+            if (policy.isInvalid()) {
+                throw new DdlException("Normalizer '" + normalizerName + "' is invalid");
+            }
+        } finally {
+            readUnlock();
+        }
+    }
+
     public void createIndexPolicy(boolean ifNotExists, String policyName,
             IndexPolicyTypeEnum type, Map<String, String> properties) throws UserException {
         if (policyName == null || policyName.trim().isEmpty()) {
             throw new DdlException("Policy name cannot be empty or null");
         }
-        if (IndexPolicy.BUILTIN_TOKENIZERS.contains(policyName)) {
+        // Normalize policy name for case-insensitive comparison with built-in names
+        String normalizedName = normalizeKey(policyName);
+        if (IndexPolicy.BUILTIN_TOKENIZERS.contains(normalizedName)) {
             throw new DdlException("Policy name '" + policyName + "' conflicts with built-in tokenizer name");
         }
-        if (IndexPolicy.BUILTIN_TOKEN_FILTERS.contains(policyName)) {
+        if (IndexPolicy.BUILTIN_TOKEN_FILTERS.contains(normalizedName)) {
             throw new DdlException("Policy name '" + policyName + "' conflicts with built-in token filter name");
         }
-        if (IndexPolicy.BUILTIN_CHAR_FILTERS.contains(policyName)) {
+        if (IndexPolicy.BUILTIN_CHAR_FILTERS.contains(normalizedName)) {
             throw new DdlException("Policy name '" + policyName + "' conflicts with built-in char filter name");
         }
-        if (IndexPolicy.BUILTIN_ANALYZERS.contains(policyName)) {
+        if (IndexPolicy.BUILTIN_ANALYZERS.contains(normalizedName)) {
             throw new DdlException("Policy name '" + policyName + "' conflicts with built-in analyzer name");
         }
 
@@ -129,7 +165,7 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
         try {
             validatePolicyProperties(type, properties);
 
-            if (nameToIndexPolicy.containsKey(policyName)) {
+            if (nameToIndexPolicy.containsKey(normalizedName)) {
                 if (ifNotExists) {
                     return;
                 }
@@ -140,7 +176,8 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
                 throw new DdlException("Index policy number cannot exceed 100");
             }
 
-            nameToIndexPolicy.put(policyName, indexPolicy);
+            // Store with normalized key for case-insensitive lookup
+            nameToIndexPolicy.put(normalizedName, indexPolicy);
             idToIndexPolicy.put(indexPolicy.getId(), indexPolicy);
             Env.getCurrentEnv().getEditLog().logCreateIndexPolicy(indexPolicy);
         } finally {
@@ -152,7 +189,7 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
     public IndexPolicy getPolicyByName(String name) {
         readLock();
         try {
-            return nameToIndexPolicy.get(name);
+            return nameToIndexPolicy.get(normalizeKey(name));
         } finally {
             readUnlock();
         }
@@ -176,6 +213,9 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
                 break;
             case CHAR_FILTER:
                 validateCharFilterProperties(properties);
+                break;
+            case NORMALIZER:
+                validateNormalizerProperties(properties);
                 break;
             default:
                 throw new DdlException("Unknown index policy type: " + type);
@@ -210,6 +250,41 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
         if (charFilters != null && !charFilters.isEmpty()) {
             for (String filter : charFilters.split(",\\s*")) {
                 validatePolicyReference(filter, IndexPolicyTypeEnum.CHAR_FILTER);
+            }
+        }
+    }
+
+    private void validateNormalizerProperties(Map<String, String> properties) throws DdlException {
+        if (properties.containsKey(IndexPolicy.PROP_TOKENIZER)) {
+            throw new DdlException("Normalizer cannot contain 'tokenizer' field");
+        }
+
+        String charFilters = properties.get(IndexPolicy.PROP_CHAR_FILTER);
+        String tokenFilters = properties.get(IndexPolicy.PROP_TOKEN_FILTER);
+
+        if ((charFilters == null || charFilters.isEmpty())
+                && (tokenFilters == null || tokenFilters.isEmpty())) {
+            throw new DdlException("Normalizer must contain at least one 'char_filter' or 'token_filter'");
+        }
+
+        if (charFilters != null && !charFilters.isEmpty()) {
+            for (String filter : charFilters.split(",\\s*")) {
+                validatePolicyReference(filter, IndexPolicyTypeEnum.CHAR_FILTER);
+            }
+        }
+
+        if (tokenFilters != null && !tokenFilters.isEmpty()) {
+            for (String filter : tokenFilters.split(",\\s*")) {
+                validatePolicyReference(filter, IndexPolicyTypeEnum.TOKEN_FILTER);
+            }
+        }
+
+        for (String key : properties.keySet()) {
+            if (!key.equals(IndexPolicy.PROP_CHAR_FILTER)
+                    && !key.equals(IndexPolicy.PROP_TOKEN_FILTER)) {
+                throw new DdlException("Invalid normalizer property: '" + key + "'. Only '"
+                        + IndexPolicy.PROP_CHAR_FILTER + "' and '" + IndexPolicy.PROP_TOKEN_FILTER
+                        + "' are allowed.");
             }
         }
     }
@@ -267,8 +342,14 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
             case "pinyin":
                 validator = new PinyinTokenizerValidator();
                 break;
+            case "icu":
+                validator = new ICUTokenizerValidator();
+                break;
+            case "basic":
+                validator = new BasicTokenizerValidator();
+                break;
             default:
-                Set<String> userFacingTypes = IndexPolicy.BUILTIN_TOKEN_FILTERS.stream()
+                Set<String> userFacingTypes = IndexPolicy.BUILTIN_TOKENIZERS.stream()
                         .filter(t -> !t.equals("empty"))
                         .collect(Collectors.toSet());
                 throw new DdlException("Unsupported tokenizer type: " + type
@@ -299,6 +380,9 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
             case "pinyin":
                 validator = new PinyinTokenFilterValidator();
                 break;
+            case "icu_normalizer":
+                validator = new ICUNormalizerTokenFilterValidator();
+                break;
             default:
                 Set<String> userFacingTypes = IndexPolicy.BUILTIN_TOKEN_FILTERS.stream()
                         .filter(t -> !t.equals("empty"))
@@ -322,6 +406,9 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
             case "char_replace":
                 validator = new CharReplaceCharFilterValidator();
                 break;
+            case "icu_normalizer":
+                validator = new ICUNormalizerCharFilterValidator();
+                break;
             default:
                 Set<String> userFacingTypes = IndexPolicy.BUILTIN_CHAR_FILTERS.stream()
                         .filter(t -> !t.equals("empty"))
@@ -334,17 +421,24 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
 
     public void dropIndexPolicy(boolean isIfExists, String indexPolicyName,
             IndexPolicyTypeEnum type) throws DdlException, AnalysisException {
+        String normalizedName = normalizeKey(indexPolicyName);
         writeLock();
         try {
-            IndexPolicy policyToDrop = nameToIndexPolicy.get(indexPolicyName);
+            IndexPolicy policyToDrop = nameToIndexPolicy.get(normalizedName);
             if (policyToDrop == null) {
                 if (isIfExists) {
                     return;
                 }
                 throw new DdlException("index policy " + indexPolicyName + " does not exist");
             }
+            if (policyToDrop.getType() != type) {
+                throw new DdlException("Cannot drop " + policyToDrop.getType() + " policy '"
+                        + indexPolicyName + "' by DROP " + type + " statement.");
+            }
             if (policyToDrop.getType() == IndexPolicyTypeEnum.ANALYZER) {
                 checkAnalyzerNotUsedByIndex(policyToDrop.getName());
+            } else if (policyToDrop.getType() == IndexPolicyTypeEnum.NORMALIZER) {
+                checkNormalizerNotUsedByIndex(policyToDrop.getName());
             }
             if (policyToDrop.getType() == IndexPolicyTypeEnum.TOKENIZER
                     || policyToDrop.getType() == IndexPolicyTypeEnum.TOKEN_FILTER
@@ -353,7 +447,7 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
             }
             long id = policyToDrop.getId();
             idToIndexPolicy.remove(id);
-            nameToIndexPolicy.remove(indexPolicyName);
+            nameToIndexPolicy.remove(normalizedName);
             Env.getCurrentEnv().getEditLog().logDropIndexPolicy(new DropIndexPolicyLog(id));
         } finally {
             writeUnlock();
@@ -361,7 +455,18 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
         LOG.info("Drop index policy success: {}", indexPolicyName);
     }
 
+    /**
+     * Check if an analyzer is used by any inverted index.
+     *
+     * <p><b>PERFORMANCE WARNING:</b> This method performs a full scan of all databases,
+     * tables, and indexes. In large-scale clusters with many tables, this can be slow.
+     * Consider maintaining a reverse index (analyzer -> tables) if this becomes a bottleneck.
+     *
+     * @param analyzerName the analyzer name to check
+     * @throws DdlException if the analyzer is in use by any index
+     */
     private void checkAnalyzerNotUsedByIndex(String analyzerName) throws DdlException {
+        String normalizedName = normalizeKey(analyzerName);
         List<Database> databases = Env.getCurrentEnv().getInternalCatalog().getDbs();
         for (Database db : databases) {
             List<Table> tables = db.getTables();
@@ -370,9 +475,45 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
                     OlapTable olapTable = (OlapTable) table;
                     for (Index index : olapTable.getIndexes()) {
                         Map<String, String> properties = index.getProperties();
-                        if (properties != null
-                                && analyzerName.equals(properties.get(IndexPolicy.PROP_ANALYZER))) {
+                        String indexAnalyzer = properties == null ? null
+                                : properties.get(IndexPolicy.PROP_ANALYZER);
+                        if (indexAnalyzer != null
+                                && normalizedName.equals(normalizeKey(indexAnalyzer))) {
                             throw new DdlException("the analyzer " + analyzerName + " is used by index: "
+                                    + index.getIndexName() + " in table: "
+                                    + db.getFullName() + "." + table.getName());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Check if a normalizer is used by any inverted index.
+     *
+     * <p><b>PERFORMANCE WARNING:</b> This method performs a full scan of all databases,
+     * tables, and indexes. In large-scale clusters with many tables, this can be slow.
+     * Consider maintaining a reverse index (normalizer -> tables) if this becomes a bottleneck.
+     *
+     * @param normalizerName the normalizer name to check
+     * @throws DdlException if the normalizer is in use by any index
+     */
+    private void checkNormalizerNotUsedByIndex(String normalizerName) throws DdlException {
+        String normalizedName = normalizeKey(normalizerName);
+        List<Database> databases = Env.getCurrentEnv().getInternalCatalog().getDbs();
+        for (Database db : databases) {
+            List<Table> tables = db.getTables();
+            for (Table table : tables) {
+                if (table instanceof OlapTable) {
+                    OlapTable olapTable = (OlapTable) table;
+                    for (Index index : olapTable.getIndexes()) {
+                        Map<String, String> properties = index.getProperties();
+                        String indexNormalizer = properties == null ? null
+                                : properties.get(IndexPolicy.PROP_NORMALIZER);
+                        if (indexNormalizer != null
+                                && normalizedName.equals(normalizeKey(indexNormalizer))) {
+                            throw new DdlException("the normalizer " + normalizerName + " is used by index: "
                                     + index.getIndexName() + " in table: "
                                     + db.getFullName() + "." + table.getName());
                         }
@@ -385,38 +526,43 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
     private void checkPolicyNotReferenced(IndexPolicy policy) throws DdlException {
         String policyName = policy.getName();
         IndexPolicyTypeEnum policyType = policy.getType();
-        for (IndexPolicy analyzerPolicy : idToIndexPolicy.values()) {
-            if (analyzerPolicy.getType() == IndexPolicyTypeEnum.ANALYZER) {
-                Map<String, String> properties = analyzerPolicy.getProperties();
-                if (policyType == IndexPolicyTypeEnum.TOKENIZER) {
-                    String tokenizer = properties.get(IndexPolicy.PROP_TOKENIZER);
-                    if (policyName.equals(tokenizer)) {
-                        throw new DdlException("Cannot drop " + policyType + " policy '" + policyName
-                                + "' as it is referenced by ANALYZER policy '"
-                                        + analyzerPolicy.getName() + "'");
-                    }
-                } else if (policyType == IndexPolicyTypeEnum.TOKEN_FILTER) {
-                    String tokenFilters = properties.get(IndexPolicy.PROP_TOKEN_FILTER);
-                    if (tokenFilters != null && !tokenFilters.isEmpty()) {
-                        for (String filter : tokenFilters.split(",\\s*")) {
-                            if (policyName.equals(filter)) {
-                                throw new DdlException("Cannot drop " + policyType + " policy '"
-                                         + policyName + "' as it is referenced by ANALYZER policy '"
-                                                + analyzerPolicy.getName() + "'");
-                            }
-                        }
-                    }
-                } else if (policyType == IndexPolicyTypeEnum.CHAR_FILTER) {
-                    String charFilters = properties.get(IndexPolicy.PROP_CHAR_FILTER);
-                    if (charFilters != null && !charFilters.isEmpty()) {
-                        for (String filter : charFilters.split(",\\s*")) {
-                            if (policyName.equals(filter)) {
-                                throw new DdlException("Cannot drop " + policyType + " policy '"
-                                        + policyName + "' as it is referenced by ANALYZER policy '"
-                                                + analyzerPolicy.getName() + "'");
-                            }
-                        }
-                    }
+
+        for (IndexPolicy otherPolicy : idToIndexPolicy.values()) {
+            IndexPolicyTypeEnum otherType = otherPolicy.getType();
+
+            if (otherType != IndexPolicyTypeEnum.ANALYZER
+                    && otherType != IndexPolicyTypeEnum.NORMALIZER) {
+                continue;
+            }
+
+            Map<String, String> properties = otherPolicy.getProperties();
+            if (policyType == IndexPolicyTypeEnum.TOKENIZER
+                    && otherType == IndexPolicyTypeEnum.ANALYZER) {
+                String tokenizer = properties.get(IndexPolicy.PROP_TOKENIZER);
+                if (policyName.equals(tokenizer)) {
+                    throw new DdlException("Cannot drop " + policyType + " policy '" + policyName
+                            + "' as it is referenced by " + otherType + " policy '"
+                            + otherPolicy.getName() + "'");
+                }
+            } else if (policyType == IndexPolicyTypeEnum.TOKEN_FILTER) {
+                checkFilterReference(policyName, policyType, otherType, otherPolicy,
+                        properties.get(IndexPolicy.PROP_TOKEN_FILTER));
+            } else if (policyType == IndexPolicyTypeEnum.CHAR_FILTER) {
+                checkFilterReference(policyName, policyType, otherType, otherPolicy,
+                        properties.get(IndexPolicy.PROP_CHAR_FILTER));
+            }
+        }
+    }
+
+    private void checkFilterReference(String policyName, IndexPolicyTypeEnum policyType,
+            IndexPolicyTypeEnum referencingType, IndexPolicy referencingPolicy,
+            String filterList) throws DdlException {
+        if (filterList != null && !filterList.isEmpty()) {
+            for (String filter : filterList.split(",\\s*")) {
+                if (policyName.equals(filter)) {
+                    throw new DdlException("Cannot drop " + policyType + " policy '" + policyName
+                            + "' as it is referenced by " + referencingType + " policy '"
+                            + referencingPolicy.getName() + "'");
                 }
             }
         }
@@ -445,7 +591,8 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
         writeLock();
         try {
             idToIndexPolicy.put(indexPolicy.getId(), indexPolicy);
-            nameToIndexPolicy.put(indexPolicy.getName(), indexPolicy);
+            // Store with normalized key for case-insensitive lookup
+            nameToIndexPolicy.put(normalizeKey(indexPolicy.getName()), indexPolicy);
             LOG.debug("Replayed index policy: id={}, name={}",
                     indexPolicy.getId(), indexPolicy.getName());
         } finally {
@@ -462,7 +609,7 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
             }
             IndexPolicy indexPolicy = idToIndexPolicy.get(id);
             idToIndexPolicy.remove(id);
-            nameToIndexPolicy.remove(indexPolicy.getName());
+            nameToIndexPolicy.remove(normalizeKey(indexPolicy.getName()));
             LOG.debug("Replayed drop index policy: {}", indexPolicy.getName());
         } finally {
             writeUnlock();
@@ -483,7 +630,8 @@ public class IndexPolicyMgr implements Writable, GsonPostProcessable {
 
     @Override
     public void gsonPostProcess() throws IOException {
+        // Store with normalized key for case-insensitive lookup
         idToIndexPolicy.forEach(
-                (id, indexPolicy) -> nameToIndexPolicy.put(indexPolicy.getName(), indexPolicy));
+                (id, indexPolicy) -> nameToIndexPolicy.put(normalizeKey(indexPolicy.getName()), indexPolicy));
     }
 }

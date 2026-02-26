@@ -34,8 +34,10 @@
 #include "olap/rowset/segment_v2/bloom_filter.h"
 #include "olap/rowset/segment_v2/common.h"
 #include "olap/rowset/segment_v2/inverted_index_writer.h"
+#include "olap/rowset/segment_v2/options.h"
 #include "util/bitmap.h" // for BitmapChange
 #include "util/slice.h"  // for OwnedSlice
+#include "vec/columns/column_variant.h"
 
 namespace doris {
 
@@ -78,6 +80,9 @@ struct ColumnWriterOptions {
     // For collect segment statistics for compaction
     std::vector<RowsetReaderSharedPtr> input_rs_readers;
     const TabletIndex* ann_index = nullptr;
+
+    EncodingPreference encoding_preference {};
+
     std::string to_string() const {
         std::stringstream ss;
         ss << std::boolalpha << "meta=" << meta->DebugString()
@@ -118,8 +123,7 @@ public:
                                           const TabletColumn* column, io::FileWriter* file_writer,
                                           std::unique_ptr<ColumnWriter>* writer);
 
-    explicit ColumnWriter(std::unique_ptr<Field> field, bool is_nullable, ColumnMetaPB* meta)
-            : _field(std::move(field)), _is_nullable(is_nullable), _column_meta(meta) {}
+    explicit ColumnWriter(std::unique_ptr<Field> field, bool is_nullable, ColumnMetaPB* meta);
 
     virtual ~ColumnWriter() = default;
 
@@ -189,6 +193,9 @@ public:
 
     ColumnMetaPB* get_column_meta() const { return _column_meta; }
 
+protected:
+    vectorized::DataTypePtr _data_type;
+
 private:
     std::unique_ptr<Field> _field;
     bool _is_nullable;
@@ -245,6 +252,7 @@ public:
         _new_page_callback = flush_page_callback;
     }
     Status append_data(const uint8_t** ptr, size_t num_rows) override;
+    Status append_nullable(const uint8_t* null_map, const uint8_t** ptr, size_t num_rows) override;
 
     // used for append not null data. When page is full, will append data not reach num_rows.
     Status append_data_in_current_page(const uint8_t** ptr, size_t* num_written);
@@ -260,6 +268,12 @@ private:
     Status _internal_append_data_in_current_page(const uint8_t* ptr, size_t* num_written);
 
 private:
+    struct NullRun {
+        bool is_null;
+        uint32_t len;
+    };
+
+    std::vector<NullRun> _null_run_buffer;
     std::unique_ptr<PageBuilder> _page_builder;
 
     std::unique_ptr<NullBitmapBuilder> _null_bitmap_builder;
@@ -605,7 +619,7 @@ private:
     bool _is_finalized = false;
     ordinal_t _next_rowid = 0;
     size_t none_null_size = 0;
-    vectorized::MutableColumnPtr _column;
+    vectorized::ColumnVariant::MutablePtr _column;
     const TabletColumn* _tablet_column = nullptr;
     ColumnWriterOptions _opts;
     std::unique_ptr<ColumnWriter> _writer;

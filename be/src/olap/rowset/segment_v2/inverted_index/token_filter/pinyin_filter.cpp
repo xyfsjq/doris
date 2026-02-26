@@ -48,14 +48,6 @@ PinyinFilter::PinyinFilter(const TokenStreamPtr& in, std::shared_ptr<PinyinConfi
     if (!config_) {
         config_ = std::make_shared<PinyinConfig>();
     }
-
-    // Validate configuration (same as Java validation)
-    if (!(config_->keepFirstLetter || config_->keepSeparateFirstLetter || config_->keepFullPinyin ||
-          config_->keepJoinedFullPinyin || config_->keepSeparateChinese)) {
-        throw Exception(ErrorCode::INVALID_ARGUMENT,
-                        "pinyin config error, can't disable separate_first_letter, "
-                        "first_letter and full_pinyin at the same time.");
-    }
 }
 
 void PinyinFilter::initialize() {
@@ -143,10 +135,32 @@ bool PinyinFilter::readTerm(Token* token) {
         }
     }
 
-    // Process original text if needed
-    if (config_->keepOriginal && !processed_original_) {
+    // Preserve original text if configured or if no candidates were generated
+    // This ensures Unicode symbols (emoji, etc.) are preserved even without keep_original setting
+    // matching Elasticsearch behavior
+    // NOTE: Must be AFTER processCurrentToken() but BEFORE first_letters to maintain correct order
+    if (!processed_original_ && has_current_token_) {
+        bool should_add_original = config_->keepOriginal;
+
+        // For emoji/symbol fallback: check if ANY content WILL BE ACTUALLY OUTPUT
+        // Not just whether buffers have content, but whether they will be processed
+        // This handles cases like: keep_first_letter=false but first_letters_ has content
+        bool will_output_first_letter = config_->keepFirstLetter && !first_letters_.empty();
+        bool will_output_full_pinyin =
+                config_->keepJoinedFullPinyin && !full_pinyin_letters_.empty();
+        bool has_candidates = !candidate_.empty();
+
+        if (!should_add_original && !has_candidates && !will_output_first_letter &&
+            !will_output_full_pinyin) {
+            // No content will be output, trigger fallback to preserve original token
+            should_add_original = true;
+        }
+
         processed_original_ = true;
-        addCandidate(TermItem(current_source_, 0, static_cast<int>(current_source_.length()), 1));
+        if (should_add_original) {
+            addCandidate(
+                    TermItem(current_source_, 0, static_cast<int>(current_source_.length()), 1));
+        }
     }
 
     // Process joined full pinyin if needed
@@ -231,16 +245,12 @@ bool PinyinFilter::processCurrentToken() {
             PinyinUtil::instance().convert(source_codepoints, PinyinFormat::TONELESS_PINYIN_FORMAT);
     auto chinese_list = ChineseUtil::segmentChinese(source_codepoints);
 
-    if (pinyin_list.empty() && chinese_list.empty()) {
-        return false;
-    }
-
     // Process each character and generate candidates
     position_ = 0;
     std::string first_letters_buffer;
     std::string full_pinyin_buffer;
 
-    // Buffer for accumulating ASCII characters (like Java's buff)
+    // Buffer for accumulating ASCII characters
     std::string ascii_buffer;
     int ascii_buffer_start_pos = -1;
 
@@ -256,13 +266,26 @@ bool PinyinFilter::processCurrentToken() {
                         (codepoint >= '0' && codepoint <= '9');
 
         if (is_ascii && is_alnum) {
-            // Initialize ASCII buffer if needed
-            if (ascii_buffer.empty()) {
-                ascii_buffer_start_pos = static_cast<int>(i);
+            // Check if we should process ASCII characters individually
+            if (!config_->keepNoneChineseTogether && config_->keepNoneChinese) {
+                // Process accumulated ASCII buffer before processing individual character
+                if (!ascii_buffer.empty()) {
+                    processAsciiBuffer(ascii_buffer, ascii_buffer_start_pos, static_cast<int>(i));
+                    ascii_buffer.clear();
+                    ascii_buffer_start_pos = -1;
+                }
+                // Process individual ASCII character immediately
+                position_++;
+                std::string single_char(1, static_cast<char>(codepoint));
+                addCandidate(TermItem(single_char, static_cast<int>(i), static_cast<int>(i + 1),
+                                      position_));
+            } else {
+                // Accumulate ASCII characters for later processing
+                if (ascii_buffer.empty()) {
+                    ascii_buffer_start_pos = static_cast<int>(i);
+                }
+                ascii_buffer += static_cast<char>(codepoint);
             }
-
-            // Accumulate ASCII characters
-            ascii_buffer += static_cast<char>(codepoint);
 
             // Handle ASCII alphanumeric characters for first letters
             if (config_->keepNoneChineseInFirstLetter) {
@@ -271,8 +294,12 @@ bool PinyinFilter::processCurrentToken() {
             if (config_->keepNoneChineseInJoinedFullPinyin) {
                 full_pinyin_buffer += static_cast<char>(codepoint);
             }
+        } else if (is_ascii) {
+            // For non-alphanumeric ASCII characters (like spaces, punctuation),
+            // do nothing and continue to keep the buffer intact.
+            continue;
         } else {
-            // Process accumulated ASCII buffer when we hit non-ASCII
+            // Process accumulated ASCII buffer when we hit non-ASCII (Chinese) characters
             if (!ascii_buffer.empty()) {
                 processAsciiBuffer(ascii_buffer, ascii_buffer_start_pos, static_cast<int>(i));
                 ascii_buffer.clear();
@@ -311,6 +338,9 @@ bool PinyinFilter::processCurrentToken() {
                     }
                 }
             }
+            // For non-ASCII, non-Chinese characters (e.g., emoji, symbols),
+            // we don't add them to candidate. They will only be kept if the fallback
+            // mechanism is triggered (when candidate_ is empty).
         }
     }
 

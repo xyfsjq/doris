@@ -67,9 +67,8 @@ doris::Status VCastExpr::prepare(doris::RuntimeState* state, const doris::RowDes
     argument_template.reserve(2);
     argument_template.emplace_back(nullptr, child->data_type(), child_name);
     argument_template.emplace_back(nullptr, _cast_param_data_type, _target_data_type_name);
-    _function = SimpleFunctionFactory::instance().get_function(
-            function_name, argument_template, _data_type,
-            {.enable_decimal256 = state->enable_decimal256()});
+    _function = SimpleFunctionFactory::instance().get_function(function_name, argument_template,
+                                                               _data_type, {});
 
     if (_function == nullptr) {
         return Status::NotSupported("Cast from {} to {} is not implemented",
@@ -105,10 +104,9 @@ void VCastExpr::close(VExprContext* context, FunctionContext::FunctionStateScope
     VExpr::close(context, scope);
 }
 
-Status VCastExpr::execute_column(VExprContext* context, const Block* block, size_t count,
-                                 ColumnPtr& result_column) const {
-    DCHECK(_open_finished || _getting_const_col)
-            << _open_finished << _getting_const_col << _expr_name;
+Status VCastExpr::execute_column(VExprContext* context, const Block* block, Selector* selector,
+                                 size_t count, ColumnPtr& result_column) const {
+    DCHECK(_open_finished || block == nullptr) << _open_finished << _expr_name;
     if (is_const_and_have_executed()) { // const have executed in open function
         result_column = get_result_from_const(count);
         return Status::OK();
@@ -116,7 +114,7 @@ Status VCastExpr::execute_column(VExprContext* context, const Block* block, size
     // for each child call execute
 
     ColumnPtr from_column;
-    RETURN_IF_ERROR(_children[0]->execute_column(context, block, count, from_column));
+    RETURN_IF_ERROR(_children[0]->execute_column(context, block, selector, count, from_column));
 
     Block temp_block;
     temp_block.insert({from_column, _children[0]->execute_type(block), _children[0]->expr_name()});
@@ -146,10 +144,9 @@ DataTypePtr TryCastExpr::original_cast_return_type() const {
     }
 }
 
-Status TryCastExpr::execute_column(VExprContext* context, const Block* block, size_t count,
-                                   ColumnPtr& result_column) const {
-    DCHECK(_open_finished || _getting_const_col)
-            << _open_finished << _getting_const_col << _expr_name;
+Status TryCastExpr::execute_column(VExprContext* context, const Block* block, Selector* selector,
+                                   size_t count, ColumnPtr& result_column) const {
+    DCHECK(_open_finished || block == nullptr) << _open_finished << _expr_name;
     if (is_const_and_have_executed()) { // const have executed in open function
         result_column = get_result_from_const(count);
         return Status::OK();
@@ -160,7 +157,7 @@ Status TryCastExpr::execute_column(VExprContext* context, const Block* block, si
     // execute child first
 
     ColumnPtr from_column;
-    RETURN_IF_ERROR(_children[0]->execute_column(context, block, count, from_column));
+    RETURN_IF_ERROR(_children[0]->execute_column(context, block, selector, count, from_column));
     auto from_type = _children[0]->execute_type(block);
 
     // prepare block

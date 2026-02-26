@@ -53,6 +53,7 @@
 #include "io/fs/buffered_reader.h"
 #include "io/fs/file_reader.h"
 #include "olap/id_manager.h"
+#include "olap/rowset/segment_v2/column_reader.h"
 #include "olap/utils.h"
 #include "orc/Exceptions.hh"
 #include "orc/Int128.hh"
@@ -199,6 +200,35 @@ OrcReader::OrcReader(RuntimeProfile* profile, RuntimeState* state,
     _init_file_description();
 }
 
+OrcReader::OrcReader(RuntimeProfile* profile, RuntimeState* state,
+                     const TFileScanRangeParams& params, const TFileRangeDesc& range,
+                     size_t batch_size, const std::string& ctz,
+                     std::shared_ptr<io::IOContext> io_ctx_holder, FileMetaCache* meta_cache,
+                     bool enable_lazy_mat)
+        : _profile(profile),
+          _state(state),
+          _scan_params(params),
+          _scan_range(range),
+          _batch_size(std::max(batch_size, _MIN_BATCH_SIZE)),
+          _range_start_offset(range.start_offset),
+          _range_size(range.size),
+          _ctz(ctz),
+          _io_ctx(io_ctx_holder ? io_ctx_holder.get() : nullptr),
+          _io_ctx_holder(std::move(io_ctx_holder)),
+          _enable_lazy_mat(enable_lazy_mat),
+          _enable_filter_by_min_max(
+                  state == nullptr ? true : state->query_options().enable_orc_filter_by_min_max),
+          _dict_cols_has_converted(false) {
+    TimezoneUtils::find_cctz_time_zone(ctz, _time_zone);
+    VecDateTimeValue t;
+    t.from_unixtime(0, ctz);
+    _offset_days = t.day() == 31 ? -1 : 0; // If 1969-12-31, then returns -1.
+    _meta_cache = meta_cache;
+    _init_profile();
+    _init_system_properties();
+    _init_file_description();
+}
+
 OrcReader::OrcReader(const TFileScanRangeParams& params, const TFileRangeDesc& range,
                      const std::string& ctz, io::IOContext* io_ctx, FileMetaCache* meta_cache,
                      bool enable_lazy_mat)
@@ -208,6 +238,24 @@ OrcReader::OrcReader(const TFileScanRangeParams& params, const TFileRangeDesc& r
           _ctz(ctz),
           _file_system(nullptr),
           _io_ctx(io_ctx),
+          _enable_lazy_mat(enable_lazy_mat),
+          _enable_filter_by_min_max(true),
+          _dict_cols_has_converted(false) {
+    _meta_cache = meta_cache;
+    _init_system_properties();
+    _init_file_description();
+}
+
+OrcReader::OrcReader(const TFileScanRangeParams& params, const TFileRangeDesc& range,
+                     const std::string& ctz, std::shared_ptr<io::IOContext> io_ctx_holder,
+                     FileMetaCache* meta_cache, bool enable_lazy_mat)
+        : _profile(nullptr),
+          _scan_params(params),
+          _scan_range(range),
+          _ctz(ctz),
+          _file_system(nullptr),
+          _io_ctx(io_ctx_holder ? io_ctx_holder.get() : nullptr),
+          _io_ctx_holder(std::move(io_ctx_holder)),
           _enable_lazy_mat(enable_lazy_mat),
           _enable_filter_by_min_max(true),
           _dict_cols_has_converted(false) {
@@ -286,9 +334,16 @@ Status OrcReader::_create_file_reader() {
                 _scan_range.__isset.modification_time ? _scan_range.modification_time : 0;
         io::FileReaderOptions reader_options =
                 FileFactory::get_reader_options(_state, _file_description);
-        auto inner_reader = DORIS_TRY(io::DelegateReader::create_file_reader(
-                _profile, _system_properties, _file_description, reader_options,
-                io::DelegateReader::AccessMode::RANDOM, _io_ctx));
+        io::FileReaderSPtr inner_reader;
+        if (_io_ctx_holder != nullptr) {
+            inner_reader = DORIS_TRY(io::DelegateReader::create_file_reader(
+                    _profile, _system_properties, _file_description, reader_options,
+                    io::DelegateReader::AccessMode::RANDOM, _io_ctx_holder));
+        } else {
+            inner_reader = DORIS_TRY(io::DelegateReader::create_file_reader(
+                    _profile, _system_properties, _file_description, reader_options,
+                    io::DelegateReader::AccessMode::RANDOM, _io_ctx));
+        }
         _file_input_stream = std::make_unique<ORCFileInputStream>(
                 _scan_range.path, std::move(inner_reader), _io_ctx, _profile,
                 _orc_once_max_read_bytes, _orc_max_merge_distance_bytes);
@@ -350,13 +405,16 @@ Status OrcReader::_create_file_reader() {
 }
 
 Status OrcReader::init_reader(
-        const std::vector<std::string>* column_names, const VExprContextSPtrs& conjuncts,
-        bool is_acid, const TupleDescriptor* tuple_descriptor, const RowDescriptor* row_descriptor,
+        const std::vector<std::string>* column_names,
+        std::unordered_map<std::string, uint32_t>* col_name_to_block_idx,
+        const VExprContextSPtrs& conjuncts, bool is_acid, const TupleDescriptor* tuple_descriptor,
+        const RowDescriptor* row_descriptor,
         const VExprContextSPtrs* not_single_slot_filter_conjuncts,
         const std::unordered_map<int, VExprContextSPtrs>* slot_id_to_filter_conjuncts,
         std::shared_ptr<TableSchemaChangeHelper::Node> table_info_node_ptr,
         const std::set<uint64_t>& column_ids, const std::set<uint64_t>& filter_column_ids) {
     _table_column_names = column_names;
+    _col_name_to_block_idx = col_name_to_block_idx;
     _lazy_read_ctx.conjuncts = conjuncts;
     _is_acid = is_acid;
     _tuple_descriptor = tuple_descriptor;
@@ -1334,10 +1392,9 @@ Status OrcReader::_fill_partition_columns(
         const std::unordered_map<std::string, std::tuple<std::string, const SlotDescriptor*>>&
                 partition_columns) {
     DataTypeSerDe::FormatOptions _text_formatOptions;
-    // todo: maybe do not need to build name to index map every time
-    auto name_to_pos_map = block->get_name_to_pos_map();
     for (const auto& kv : partition_columns) {
-        auto col_ptr = block->get_by_position(name_to_pos_map[kv.first]).column->assume_mutable();
+        auto col_ptr = block->get_by_position((*_col_name_to_block_idx)[kv.first])
+                               .column->assume_mutable();
         const auto& [value, slot_desc] = kv.second;
         auto text_serde = slot_desc->get_data_type_ptr()->get_serde();
         Slice slice(value.data(), value.size());
@@ -1362,47 +1419,40 @@ Status OrcReader::_fill_partition_columns(
 Status OrcReader::_fill_missing_columns(
         Block* block, uint64_t rows,
         const std::unordered_map<std::string, VExprContextSPtr>& missing_columns) {
-    // todo: maybe do not need to build name to index map every time
-    auto name_to_pos_map = block->get_name_to_pos_map();
-    std::set<size_t> positions_to_erase;
     for (const auto& kv : missing_columns) {
-        if (!name_to_pos_map.contains(kv.first)) {
+        if (!_col_name_to_block_idx->contains(kv.first)) {
             return Status::InternalError("Failed to find missing column: {}, block: {}", kv.first,
                                          block->dump_structure());
         }
         if (kv.second == nullptr) {
             // no default column, fill with null
-            auto mutable_column =
-                    block->get_by_position(name_to_pos_map[kv.first]).column->assume_mutable();
+            auto mutable_column = block->get_by_position((*_col_name_to_block_idx)[kv.first])
+                                          .column->assume_mutable();
             auto* nullable_column = static_cast<vectorized::ColumnNullable*>(mutable_column.get());
             nullable_column->insert_many_defaults(rows);
         } else {
             // fill with default value
             const auto& ctx = kv.second;
-            auto origin_column_num = block->columns();
-            int result_column_id = -1;
             // PT1 => dest primitive type
-            RETURN_IF_ERROR(ctx->execute(block, &result_column_id));
-            bool is_origin_column = result_column_id < origin_column_num;
-            if (!is_origin_column) {
+            ColumnPtr result_column_ptr;
+            RETURN_IF_ERROR(ctx->execute(block, result_column_ptr));
+            if (result_column_ptr->use_count() == 1) {
                 // call resize because the first column of _src_block_ptr may not be filled by reader,
                 // so _src_block_ptr->rows() may return wrong result, cause the column created by `ctx->execute()`
                 // has only one row.
-                auto result_column_ptr = block->get_by_position(result_column_id).column;
                 auto mutable_column = result_column_ptr->assume_mutable();
                 mutable_column->resize(rows);
                 // result_column_ptr maybe a ColumnConst, convert it to a normal column
                 result_column_ptr = result_column_ptr->convert_to_full_column_if_const();
-                auto origin_column_type = block->get_by_position(name_to_pos_map[kv.first]).type;
+                auto origin_column_type =
+                        block->get_by_position((*_col_name_to_block_idx)[kv.first]).type;
                 bool is_nullable = origin_column_type->is_nullable();
                 block->replace_by_position(
-                        name_to_pos_map[kv.first],
+                        (*_col_name_to_block_idx)[kv.first],
                         is_nullable ? make_nullable(result_column_ptr) : result_column_ptr);
-                positions_to_erase.insert(result_column_id);
             }
         }
     }
-    block->erase(positions_to_erase);
     return Status::OK();
 }
 
@@ -1497,6 +1547,11 @@ DataTypePtr OrcReader::convert_to_doris_type(const orc::Type* orc_type) {
         return DataTypeFactory::instance().create_data_type(
                 PrimitiveType::TYPE_CHAR, true, 0, 0, cast_set<int>(orc_type->getMaximumLength()));
     case orc::TypeKind::TIMESTAMP_INSTANT:
+        if (_scan_params.__isset.enable_mapping_timestamp_tz &&
+            _scan_params.enable_mapping_timestamp_tz) {
+            return DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_TIMESTAMPTZ,
+                                                                true, 0, 6);
+        }
         return DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATETIMEV2, true, 0,
                                                             6);
     case orc::TypeKind::LIST: {
@@ -1857,6 +1912,8 @@ Status OrcReader::_fill_doris_data_column(const std::string& col_name,
         //                : std::make_unique<StringVectorBatch>(capacity, memoryPool);
         return _decode_string_column<is_filter>(col_name, data_column, orc_column_type->getKind(),
                                                 cvb, num_values);
+    case PrimitiveType::TYPE_TIMESTAMPTZ:
+        return _decode_timestamp_tz_column<is_filter>(col_name, data_column, cvb, num_values);
     case PrimitiveType::TYPE_ARRAY: {
         if (orc_column_type->getKind() != orc::TypeKind::LIST) {
             return Status::InternalError(
@@ -2058,7 +2115,8 @@ Status OrcReader::_fill_doris_data_column(const std::string& col_name,
     default:
         break;
     }
-    return Status::InternalError("Unsupported type for column '{}'", col_name);
+    return Status::InternalError("Unsupported type {} for column '{}'", data_type->get_name(),
+                                 col_name);
 }
 
 template <bool is_filter>
@@ -2162,12 +2220,6 @@ Status OrcReader::get_next_block(Block* block, size_t* read_rows, bool* eof) {
             _io_ctx->file_reader_stats->read_rows += _reader_metrics.ReadRowCount;
         }
     }
-    if (_orc_filter) {
-        RETURN_IF_ERROR(_orc_filter->get_status());
-    }
-    if (_string_dict_filter) {
-        RETURN_IF_ERROR(_string_dict_filter->get_status());
-    }
     return Status::OK();
 }
 
@@ -2234,10 +2286,9 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
         std::vector<orc::ColumnVectorBatch*> batch_vec;
         _fill_batch_vec(batch_vec, _batch.get(), 0);
 
-        // todo: maybe do not need to build name to index map every time
-        auto name_to_pos_map = block->get_name_to_pos_map();
         for (auto& col_name : _lazy_read_ctx.lazy_read_columns) {
-            auto& column_with_type_and_name = block->get_by_position(name_to_pos_map[col_name]);
+            auto& column_with_type_and_name =
+                    block->get_by_position((*_col_name_to_block_idx)[col_name]);
             auto& column_ptr = column_with_type_and_name.column;
             auto& column_type = column_with_type_and_name.type;
             auto file_column_name = _table_info_node_ptr->children_file_column_name(col_name);
@@ -2249,6 +2300,9 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
                     col_name, column_ptr, column_type,
                     _table_info_node_ptr->get_children_node(col_name), _type_map[file_column_name],
                     batch_vec[orc_col_idx->second], _batch->numElements));
+#ifndef NDEBUG
+            column_ptr->sanity_check();
+#endif
         }
 
         RETURN_IF_ERROR(_fill_partition_columns(block, _batch->numElements,
@@ -2265,8 +2319,25 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
             return Status::OK();
         }
         {
+#ifndef NDEBUG
+            for (auto col : *block) {
+                col.column->sanity_check();
+
+                DCHECK(block->rows() == col.column->size())
+                        << absl::Substitute("block rows = $0 , column rows = $1, col name = $2",
+                                            block->rows(), col.column->size(), col.name);
+            }
+#endif
             SCOPED_RAW_TIMER(&_statistics.predicate_filter_time);
             _execute_filter_position_delete_rowids(*_filter);
+#ifndef NDEBUG
+            for (auto col : *block) {
+                col.column->sanity_check();
+                DCHECK(block->rows() == col.column->size())
+                        << absl::Substitute("block rows = $0 , column rows = $1, col name = $2",
+                                            block->rows(), col.column->size(), col.name);
+            }
+#endif
             {
                 SCOPED_RAW_TIMER(&_statistics.decode_null_map_time);
                 RETURN_IF_CATCH_EXCEPTION(
@@ -2275,6 +2346,14 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
             Block::erase_useless_column(block, column_to_keep);
             RETURN_IF_ERROR(_convert_dict_cols_to_string_cols(block, &batch_vec));
             *read_rows = block->rows();
+#ifndef NDEBUG
+            for (auto col : *block) {
+                col.column->sanity_check();
+                DCHECK(block->rows() == col.column->size())
+                        << absl::Substitute("block rows = $0 , column rows = $1, col name = $2",
+                                            block->rows(), col.column->size(), col.name);
+            }
+#endif
         }
     } else {
         uint64_t rr;
@@ -2303,17 +2382,15 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
             }
         }
 
-        // todo: maybe do not need to build name to index map every time
-        auto name_to_pos_map = block->get_name_to_pos_map();
         if (!_dict_cols_has_converted && !_dict_filter_cols.empty()) {
             for (auto& dict_filter_cols : _dict_filter_cols) {
                 MutableColumnPtr dict_col_ptr = ColumnInt32::create();
-                if (!name_to_pos_map.contains(dict_filter_cols.first)) {
+                if (!_col_name_to_block_idx->contains(dict_filter_cols.first)) {
                     return Status::InternalError(
                             "Failed to find dict filter column '{}' in block {}",
                             dict_filter_cols.first, block->dump_structure());
                 }
-                auto pos = name_to_pos_map[dict_filter_cols.first];
+                auto pos = (*_col_name_to_block_idx)[dict_filter_cols.first];
                 auto& column_with_type_and_name = block->get_by_position(pos);
                 auto& column_type = column_with_type_and_name.type;
                 if (column_type->is_nullable()) {
@@ -2335,7 +2412,8 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
         _fill_batch_vec(batch_vec, _batch.get(), 0);
 
         for (auto& col_name : _lazy_read_ctx.all_read_columns) {
-            auto& column_with_type_and_name = block->get_by_position(name_to_pos_map[col_name]);
+            auto& column_with_type_and_name =
+                    block->get_by_position((*_col_name_to_block_idx)[col_name]);
             auto& column_ptr = column_with_type_and_name.column;
             auto& column_type = column_with_type_and_name.type;
             auto file_column_name = _table_info_node_ptr->children_file_column_name(col_name);
@@ -2347,6 +2425,9 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
                     col_name, column_ptr, column_type,
                     _table_info_node_ptr->get_children_node(col_name), _type_map[file_column_name],
                     batch_vec[orc_col_idx->second], _batch->numElements));
+#ifndef NDEBUG
+            column_ptr->sanity_check();
+#endif
         }
 
         RETURN_IF_ERROR(_fill_partition_columns(block, _batch->numElements,
@@ -2363,6 +2444,14 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
             return Status::OK();
         }
 
+#ifndef NDEBUG
+        for (auto col : *block) {
+            col.column->sanity_check();
+            DCHECK(block->rows() == col.column->size())
+                    << absl::Substitute("block rows = $0 , column rows = $1, col name = $2",
+                                        block->rows(), col.column->size(), col.name);
+        }
+#endif
         {
             SCOPED_RAW_TIMER(&_statistics.predicate_filter_time);
             _build_delete_row_filter(block, _batch->numElements);
@@ -2416,7 +2505,23 @@ Status OrcReader::_get_next_block_impl(Block* block, size_t* read_rows, bool* eo
                 Block::erase_useless_column(block, column_to_keep);
             }
         }
+#ifndef NDEBUG
+        for (auto col : *block) {
+            col.column->sanity_check();
+            DCHECK(block->rows() == col.column->size())
+                    << absl::Substitute("block rows = $0 , column rows = $1, col name = $2",
+                                        block->rows(), col.column->size(), col.name);
+        }
+#endif
         RETURN_IF_ERROR(_convert_dict_cols_to_string_cols(block, &batch_vec));
+#ifndef NDEBUG
+        for (auto col : *block) {
+            col.column->sanity_check();
+            DCHECK(block->rows() == col.column->size())
+                    << absl::Substitute("block rows = $0 , column rows = $1, col name = $2",
+                                        block->rows(), col.column->size(), col.name);
+        }
+#endif
         *read_rows = block->rows();
     }
     return Status::OK();
@@ -2446,17 +2551,17 @@ void OrcReader::_build_delete_row_filter(const Block* block, size_t rows) {
     if (_delete_rows != nullptr) {
         _delete_rows_filter_ptr = std::make_unique<IColumn::Filter>(rows, 1);
         auto* __restrict _pos_delete_filter_data = _delete_rows_filter_ptr->data();
-        // todo: maybe do not need to build name to index map every time
-        auto name_to_pos_map = block->get_name_to_pos_map();
         const auto& original_transaction_column = assert_cast<const ColumnInt64&>(*remove_nullable(
-                block->get_by_position(
-                             name_to_pos_map[TransactionalHive::ORIGINAL_TRANSACTION_LOWER_CASE])
+                block->get_by_position((*_col_name_to_block_idx)
+                                               [TransactionalHive::ORIGINAL_TRANSACTION_LOWER_CASE])
                         .column));
         const auto& bucket_id_column = assert_cast<const ColumnInt32&>(*remove_nullable(
-                block->get_by_position(name_to_pos_map[TransactionalHive::BUCKET_LOWER_CASE])
+                block->get_by_position(
+                             (*_col_name_to_block_idx)[TransactionalHive::BUCKET_LOWER_CASE])
                         .column));
         const auto& row_id_column = assert_cast<const ColumnInt64&>(*remove_nullable(
-                block->get_by_position(name_to_pos_map[TransactionalHive::ROW_ID_LOWER_CASE])
+                block->get_by_position(
+                             (*_col_name_to_block_idx)[TransactionalHive::ROW_ID_LOWER_CASE])
                         .column));
         for (int i = 0; i < rows; ++i) {
             auto original_transaction = original_transaction_column.get_int(i);
@@ -2480,15 +2585,13 @@ Status OrcReader::filter(orc::ColumnVectorBatch& data, uint16_t* sel, uint16_t s
     size_t origin_column_num = block->columns();
 
     if (!_dict_cols_has_converted && !_dict_filter_cols.empty()) {
-        // todo: maybe do not need to build name to index map every time
-        auto name_to_pos_map = block->get_name_to_pos_map();
         for (auto& dict_filter_cols : _dict_filter_cols) {
-            if (!name_to_pos_map.contains(dict_filter_cols.first)) {
+            if (!_col_name_to_block_idx->contains(dict_filter_cols.first)) {
                 return Status::InternalError("Failed to find dict filter column '{}' in block {}",
                                              dict_filter_cols.first, block->dump_structure());
             }
             MutableColumnPtr dict_col_ptr = ColumnInt32::create();
-            auto pos = name_to_pos_map[dict_filter_cols.first];
+            auto pos = (*_col_name_to_block_idx)[dict_filter_cols.first];
             auto& column_with_type_and_name = block->get_by_position(pos);
             auto& column_type = column_with_type_and_name.type;
             if (column_type->is_nullable()) {
@@ -2514,10 +2617,9 @@ Status OrcReader::filter(orc::ColumnVectorBatch& data, uint16_t* sel, uint16_t s
                                TransactionalHive::READ_ROW_COLUMN_NAMES_LOWER_CASE.begin(),
                                TransactionalHive::READ_ROW_COLUMN_NAMES_LOWER_CASE.end());
     }
-    // todo: maybe do not need to build name to index map every time
-    auto name_to_pos_map = block->get_name_to_pos_map();
     for (auto& table_col_name : table_col_names) {
-        auto& column_with_type_and_name = block->get_by_position(name_to_pos_map[table_col_name]);
+        auto& column_with_type_and_name =
+                block->get_by_position((*_col_name_to_block_idx)[table_col_name]);
         auto& column_ptr = column_with_type_and_name.column;
         auto& column_type = column_with_type_and_name.type;
         auto file_column_name = _table_info_node_ptr->children_file_column_name(table_col_name);
@@ -2529,6 +2631,9 @@ Status OrcReader::filter(orc::ColumnVectorBatch& data, uint16_t* sel, uint16_t s
                 table_col_name, column_ptr, column_type,
                 _table_info_node_ptr->get_children_node(table_col_name),
                 _type_map[file_column_name], batch_vec[orc_col_idx->second], data.numElements));
+#ifndef NDEBUG
+        column_ptr->sanity_check();
+#endif
     }
     RETURN_IF_ERROR(
             _fill_partition_columns(block, size, _lazy_read_ctx.predicate_partition_columns));
@@ -2569,13 +2674,19 @@ Status OrcReader::filter(orc::ColumnVectorBatch& data, uint16_t* sel, uint16_t s
     if (can_filter_all) {
         for (auto& col : table_col_names) {
             // clean block to read predicate columns and acid columns
-            block->get_by_position(name_to_pos_map[col]).column->assume_mutable()->clear();
+            block->get_by_position((*_col_name_to_block_idx)[col])
+                    .column->assume_mutable()
+                    ->clear();
         }
         for (auto& col : _lazy_read_ctx.predicate_partition_columns) {
-            block->get_by_position(name_to_pos_map[col.first]).column->assume_mutable()->clear();
+            block->get_by_position((*_col_name_to_block_idx)[col.first])
+                    .column->assume_mutable()
+                    ->clear();
         }
         for (auto& col : _lazy_read_ctx.predicate_missing_columns) {
-            block->get_by_position(name_to_pos_map[col.first]).column->assume_mutable()->clear();
+            block->get_by_position((*_col_name_to_block_idx)[col.first])
+                    .column->assume_mutable()
+                    ->clear();
         }
         Block::erase_useless_column(block, origin_column_num);
         RETURN_IF_ERROR(_convert_dict_cols_to_string_cols(block, nullptr));
@@ -2885,14 +2996,12 @@ Status OrcReader::_convert_dict_cols_to_string_cols(
         return Status::OK();
     }
     if (!_dict_filter_cols.empty()) {
-        // todo: maybe do not need to build name to index map every time
-        auto name_to_pos_map = block->get_name_to_pos_map();
         for (auto& dict_filter_cols : _dict_filter_cols) {
-            if (!name_to_pos_map.contains(dict_filter_cols.first)) {
+            if (!_col_name_to_block_idx->contains(dict_filter_cols.first)) {
                 return Status::InternalError("Failed to find dict filter column '{}' in block {}",
                                              dict_filter_cols.first, block->dump_structure());
             }
-            auto pos = name_to_pos_map[dict_filter_cols.first];
+            auto pos = (*_col_name_to_block_idx)[dict_filter_cols.first];
             ColumnWithTypeAndName& column_with_type_and_name = block->get_by_position(pos);
             const ColumnPtr& column = column_with_type_and_name.column;
 

@@ -53,6 +53,7 @@
 // NOLINTNEXTLINE(unused-includes)
 #include "vec/exprs/vexpr_context.h" // IWYU pragma: keep
 #include "vec/exprs/vliteral.h"
+#include "vec/functions/cast/cast_to_timestamptz.h"
 #include "vec/runtime/vdatetime_value.h"
 
 namespace doris {
@@ -446,6 +447,10 @@ VOlapTablePartitionParam::VOlapTablePartitionParam(std::shared_ptr<OlapTableSche
         _overwrite_group_id = t_param.overwrite_group_id;
     }
 
+    if (t_param.__isset.master_address) {
+        _master_address = std::make_shared<TNetworkAddress>(t_param.master_address);
+    }
+
     if (_is_auto_partition) {
         // the nullable mode depends on partition_exprs. not column slots. so use them.
         DCHECK(_partition_function.size() <= _slots.size())
@@ -559,9 +564,10 @@ static Status _create_partition_key(const TExprNode& t_expr, BlockRow* part_key,
     //TODO: use assert_cast before insert_data
     switch (t_expr.node_type) {
     case TExprNodeType::DATE_LITERAL: {
-        if (vectorized::DataTypeFactory::instance()
-                    .create_data_type(t_expr.type)
-                    ->get_primitive_type() == TYPE_DATEV2) {
+        auto primitive_type = vectorized::DataTypeFactory::instance()
+                                      .create_data_type(t_expr.type)
+                                      ->get_primitive_type();
+        if (primitive_type == TYPE_DATEV2) {
             DateV2Value<DateV2ValueType> dt;
             if (!dt.from_date_str(t_expr.date_literal.value.c_str(),
                                   t_expr.date_literal.value.size())) {
@@ -570,9 +576,7 @@ static Status _create_partition_key(const TExprNode& t_expr, BlockRow* part_key,
                 return Status::InternalError(ss.str());
             }
             column->insert_data(reinterpret_cast<const char*>(&dt), 0);
-        } else if (vectorized::DataTypeFactory::instance()
-                           .create_data_type(t_expr.type)
-                           ->get_primitive_type() == TYPE_DATETIMEV2) {
+        } else if (primitive_type == TYPE_DATETIMEV2) {
             DateV2Value<DateTimeV2ValueType> dt;
             const int32_t scale =
                     t_expr.type.types.empty() ? -1 : t_expr.type.types.front().scalar_type.scale;
@@ -583,6 +587,21 @@ static Status _create_partition_key(const TExprNode& t_expr, BlockRow* part_key,
                 return Status::InternalError(ss.str());
             }
             column->insert_data(reinterpret_cast<const char*>(&dt), 0);
+        } else if (primitive_type == TYPE_TIMESTAMPTZ) {
+            TimestampTzValue res;
+            vectorized::CastParameters params {.status = Status::OK(), .is_strict = true};
+            const int32_t scale =
+                    t_expr.type.types.empty() ? -1 : t_expr.type.types.front().scalar_type.scale;
+            if (!vectorized::CastToTimstampTz::from_string(
+                        {t_expr.date_literal.value.c_str(), t_expr.date_literal.value.size()}, res,
+                        params, nullptr, scale)) [[unlikely]] {
+                std::stringstream ss;
+                ss << "invalid timestamptz literal in partition column, value="
+                   << t_expr.date_literal;
+                return Status::InternalError(ss.str());
+            } else {
+                column->insert_data(reinterpret_cast<const char*>(&res), 0);
+            }
         } else {
             // TYPE_DATE (DATEV1) or TYPE_DATETIME (DATETIMEV1)
             VecDateTimeValue dt;

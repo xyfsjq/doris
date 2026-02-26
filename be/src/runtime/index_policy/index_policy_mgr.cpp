@@ -20,9 +20,19 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
+#include <unordered_set>
 #include <utility>
 
 namespace doris {
+
+const std::unordered_set<std::string> IndexPolicyMgr::BUILTIN_NORMALIZERS = {"lowercase"};
+
+std::string IndexPolicyMgr::normalize_name(const std::string& name) {
+    std::string result = name;
+    boost::algorithm::trim(result);
+    boost::algorithm::to_lower(result);
+    return result;
+}
 
 void IndexPolicyMgr::apply_policy_changes(const std::vector<TIndexPolicy>& policys_to_update,
                                           const std::vector<int64_t>& policys_to_delete) {
@@ -40,7 +50,8 @@ void IndexPolicyMgr::apply_policy_changes(const std::vector<TIndexPolicy>& polic
                       << "ID: " << id << ", "
                       << "Name: " << it->second.name;
 
-            _name_to_id.erase(it->second.name);
+            // Use normalized name for deletion
+            _name_to_id.erase(normalize_name(it->second.name));
             _policys.erase(it);
             success_deletes++;
         } else {
@@ -56,15 +67,18 @@ void IndexPolicyMgr::apply_policy_changes(const std::vector<TIndexPolicy>& polic
             continue;
         }
 
-        if (_name_to_id.contains(policy.name)) {
+        // Use normalized name for case-insensitive lookup
+        std::string normalized_name = normalize_name(policy.name);
+        if (_name_to_id.contains(normalized_name)) {
             LOG(ERROR) << "Reject update - Duplicate policy name: " << policy.name
-                       << " | Existing ID: " << _name_to_id[policy.name]
+                       << " | Existing ID: " << _name_to_id[normalized_name]
                        << " | New ID: " << policy.id;
             continue;
         }
 
         _policys.emplace(policy.id, policy);
-        _name_to_id.emplace(policy.name, policy.id);
+        // Store with normalized key for case-insensitive lookup
+        _name_to_id.emplace(normalized_name, policy.id);
         success_updates++;
 
         LOG(INFO) << "Successfully applied policy - "
@@ -79,44 +93,63 @@ void IndexPolicyMgr::apply_policy_changes(const std::vector<TIndexPolicy>& polic
               << "Total policies: " << _policys.size();
 }
 
-const Policys& IndexPolicyMgr::get_index_policys() {
+Policys IndexPolicyMgr::get_index_policys() {
     std::shared_lock<std::shared_mutex> r_lock(_mutex);
-    return _policys;
+    return _policys; // Return copy to ensure thread safety after lock release
 }
 
-// TODO: Potential high-concurrency bottleneck
-segment_v2::inverted_index::CustomAnalyzerPtr IndexPolicyMgr::get_policy_by_name(
-        const std::string& name) {
+// NOTE: This function holds a shared_lock while calling build_analyzer_from_policy/
+// build_normalizer_from_policy, which also access _name_to_id and _policys.
+// This is safe because std::shared_mutex allows the same thread to hold multiple
+// shared_locks (read locks are reentrant). The lock is held throughout to ensure
+// consistency when resolving nested policy references (e.g., tokenizer policies).
+AnalyzerPtr IndexPolicyMgr::get_policy_by_name(const std::string& name) {
     std::shared_lock lock(_mutex);
 
-    // Check if policy exists
-    auto name_it = _name_to_id.find(name);
+    // Use normalized name for case-insensitive lookup
+    std::string normalized_name = normalize_name(name);
+    auto name_it = _name_to_id.find(normalized_name);
     if (name_it == _name_to_id.end()) {
+        if (is_builtin_normalizer(normalized_name)) {
+            return build_builtin_normalizer(name);
+        }
         throw Exception(ErrorCode::INVALID_ARGUMENT, "Policy not found with name: " + name);
     }
 
-    // Get policy by ID
     auto policy_it = _policys.find(name_it->second);
     if (policy_it == _policys.end()) {
-        throw Exception(ErrorCode::INVALID_ARGUMENT, "Policy not found with name: " + name);
+        throw Exception(ErrorCode::INVALID_ARGUMENT, "Policy not found with id: " + name);
     }
 
-    const auto& index_policy_analyzer = policy_it->second;
+    const auto& index_policy = policy_it->second;
+    if (index_policy.type == TIndexPolicyType::ANALYZER) {
+        return build_analyzer_from_policy(index_policy);
+    } else if (index_policy.type == TIndexPolicyType::NORMALIZER) {
+        return build_normalizer_from_policy(index_policy);
+    }
+
+    throw Exception(ErrorCode::INVALID_ARGUMENT, "Policy not found with type: " + name);
+}
+
+AnalyzerPtr IndexPolicyMgr::build_analyzer_from_policy(const TIndexPolicy& index_policy_analyzer) {
     segment_v2::inverted_index::CustomAnalyzerConfig::Builder builder;
 
-    // Process tokenizer
     auto tokenizer_it = index_policy_analyzer.properties.find(PROP_TOKENIZER);
     if (tokenizer_it == index_policy_analyzer.properties.end() || tokenizer_it->second.empty()) {
-        throw Exception(ErrorCode::INVALID_ARGUMENT,
-                        "Invalid tokenizer configuration in policy: " + name);
+        throw Exception(
+                ErrorCode::INVALID_ARGUMENT,
+                "Invalid tokenizer configuration in policy: analyzer must have a tokenizer");
     }
-    const auto& tokenzier_name = tokenizer_it->second;
-    if (_name_to_id.contains(tokenzier_name)) {
-        const auto& tokenizer_policy = _policys[_name_to_id[tokenzier_name]];
+
+    const auto& tokenizer_name = tokenizer_it->second;
+    // Use normalized name for case-insensitive lookup
+    std::string normalized_tokenizer_name = normalize_name(tokenizer_name);
+    if (_name_to_id.contains(normalized_tokenizer_name)) {
+        const auto& tokenizer_policy = _policys[_name_to_id[normalized_tokenizer_name]];
         auto type_it = tokenizer_policy.properties.find(PROP_TYPE);
         if (type_it == tokenizer_policy.properties.end()) {
             throw Exception(ErrorCode::INVALID_ARGUMENT,
-                            "Invalid tokenizer configuration in policy: " + tokenzier_name);
+                            "Invalid tokenizer configuration in policy: " + tokenizer_name);
         }
 
         segment_v2::inverted_index::Settings settings;
@@ -127,17 +160,15 @@ segment_v2::inverted_index::CustomAnalyzerPtr IndexPolicyMgr::get_policy_by_name
         }
         builder.with_tokenizer_config(type_it->second, settings);
     } else {
-        builder.with_tokenizer_config(tokenzier_name, {});
+        builder.with_tokenizer_config(tokenizer_name, {});
     }
 
-    // Process char filters
     process_filter_configs(index_policy_analyzer, PROP_CHAR_FILTER, "char filter",
                            [&builder](const std::string& name,
                                       const segment_v2::inverted_index::Settings& settings) {
                                builder.add_char_filter_config(name, settings);
                            });
 
-    // Process token filters
     process_filter_configs(index_policy_analyzer, PROP_TOKEN_FILTER, "token filter",
                            [&builder](const std::string& name,
                                       const segment_v2::inverted_index::Settings& settings) {
@@ -147,6 +178,27 @@ segment_v2::inverted_index::CustomAnalyzerPtr IndexPolicyMgr::get_policy_by_name
     auto custom_analyzer_config = builder.build();
     return segment_v2::inverted_index::CustomAnalyzer::build_custom_analyzer(
             custom_analyzer_config);
+}
+
+AnalyzerPtr IndexPolicyMgr::build_normalizer_from_policy(
+        const TIndexPolicy& index_policy_normalizer) {
+    segment_v2::inverted_index::CustomNormalizerConfig::Builder builder;
+
+    process_filter_configs(index_policy_normalizer, PROP_CHAR_FILTER, "char filter",
+                           [&builder](const std::string& name,
+                                      const segment_v2::inverted_index::Settings& settings) {
+                               builder.add_char_filter_config(name, settings);
+                           });
+
+    process_filter_configs(index_policy_normalizer, PROP_TOKEN_FILTER, "token filter",
+                           [&builder](const std::string& name,
+                                      const segment_v2::inverted_index::Settings& settings) {
+                               builder.add_token_filter_config(name, settings);
+                           });
+
+    auto custom_normalizer_config = builder.build();
+    return segment_v2::inverted_index::CustomNormalizer::build_custom_normalizer(
+            custom_normalizer_config);
 }
 
 void IndexPolicyMgr::process_filter_configs(
@@ -168,9 +220,11 @@ void IndexPolicyMgr::process_filter_configs(
             continue;
         }
 
-        if (_name_to_id.contains(filter_name)) {
+        // Use normalized name for case-insensitive lookup
+        std::string normalized_filter_name = normalize_name(filter_name);
+        if (_name_to_id.contains(normalized_filter_name)) {
             // Nested filter policy
-            const auto& filter_policy = _policys[_name_to_id[filter_name]];
+            const auto& filter_policy = _policys[_name_to_id[normalized_filter_name]];
             auto type_it = filter_policy.properties.find(PROP_TYPE);
             if (type_it == filter_policy.properties.end()) {
                 throw Exception(
@@ -190,6 +244,23 @@ void IndexPolicyMgr::process_filter_configs(
             add_config_func(filter_name, {});
         }
     }
+}
+
+bool IndexPolicyMgr::is_builtin_normalizer(const std::string& name) {
+    return BUILTIN_NORMALIZERS.contains(name);
+}
+
+AnalyzerPtr IndexPolicyMgr::build_builtin_normalizer(const std::string& name) {
+    using namespace segment_v2::inverted_index;
+
+    if (name == "lowercase") {
+        CustomNormalizerConfig::Builder builder;
+        builder.add_token_filter_config("lowercase", Settings {});
+        auto config = builder.build();
+        return CustomNormalizer::build_custom_normalizer(config);
+    }
+
+    throw Exception(ErrorCode::INVALID_ARGUMENT, "Unknown builtin normalizer: " + name);
 }
 
 } // namespace doris

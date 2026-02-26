@@ -94,8 +94,12 @@ public:
 
     // Copy constructor
     InvertedIndexResultBitmap(const InvertedIndexResultBitmap& other)
-            : _data_bitmap(std::make_shared<roaring::Roaring>(*other._data_bitmap)),
-              _null_bitmap(std::make_shared<roaring::Roaring>(*other._null_bitmap)) {}
+            : _data_bitmap(other._data_bitmap
+                                   ? std::make_shared<roaring::Roaring>(*other._data_bitmap)
+                                   : nullptr),
+              _null_bitmap(other._null_bitmap
+                                   ? std::make_shared<roaring::Roaring>(*other._null_bitmap)
+                                   : nullptr) {}
 
     // Move constructor
     InvertedIndexResultBitmap(InvertedIndexResultBitmap&& other) noexcept
@@ -105,8 +109,12 @@ public:
     // Copy assignment operator
     InvertedIndexResultBitmap& operator=(const InvertedIndexResultBitmap& other) {
         if (this != &other) { // Prevent self-assignment
-            _data_bitmap = std::make_shared<roaring::Roaring>(*other._data_bitmap);
-            _null_bitmap = std::make_shared<roaring::Roaring>(*other._null_bitmap);
+            _data_bitmap = other._data_bitmap
+                                   ? std::make_shared<roaring::Roaring>(*other._data_bitmap)
+                                   : nullptr;
+            _null_bitmap = other._null_bitmap
+                                   ? std::make_shared<roaring::Roaring>(*other._null_bitmap)
+                                   : nullptr;
         }
         return *this;
     }
@@ -122,11 +130,15 @@ public:
 
     // Operator &=
     InvertedIndexResultBitmap& operator&=(const InvertedIndexResultBitmap& other) {
-        if (_data_bitmap && _null_bitmap && other._data_bitmap && other._null_bitmap) {
-            auto new_null_bitmap = (*_data_bitmap & *other._null_bitmap) |
-                                   (*_null_bitmap & *other._data_bitmap) |
-                                   (*_null_bitmap & *other._null_bitmap);
+        if (_data_bitmap && other._data_bitmap) {
+            const auto& my_null = _null_bitmap ? *_null_bitmap : _empty_bitmap();
+            const auto& ot_null = other._null_bitmap ? *other._null_bitmap : _empty_bitmap();
+            auto new_null_bitmap = (*_data_bitmap & ot_null) | (my_null & *other._data_bitmap) |
+                                   (my_null & ot_null);
             *_data_bitmap &= *other._data_bitmap;
+            if (!_null_bitmap) {
+                _null_bitmap = std::make_shared<roaring::Roaring>();
+            }
             *_null_bitmap = std::move(new_null_bitmap);
         }
         return *this;
@@ -134,7 +146,9 @@ public:
 
     // Operator |=
     InvertedIndexResultBitmap& operator|=(const InvertedIndexResultBitmap& other) {
-        if (_data_bitmap && _null_bitmap && other._data_bitmap && other._null_bitmap) {
+        if (_data_bitmap && other._data_bitmap) {
+            const auto& my_null = _null_bitmap ? *_null_bitmap : _empty_bitmap();
+            const auto& ot_null = other._null_bitmap ? *other._null_bitmap : _empty_bitmap();
             // SQL three-valued logic for OR:
             // - TRUE OR anything = TRUE (not NULL)
             // - FALSE OR NULL = NULL
@@ -142,9 +156,11 @@ public:
             // Result is NULL when the row is NULL on either side while the other side
             // is not TRUE. Rows that become TRUE must be removed from the NULL bitmap.
             *_data_bitmap |= *other._data_bitmap;
-            auto new_null_bitmap =
-                    (*_null_bitmap - *other._data_bitmap) | (*other._null_bitmap - *_data_bitmap);
+            auto new_null_bitmap = (my_null - *other._data_bitmap) | (ot_null - *_data_bitmap);
             new_null_bitmap -= *_data_bitmap;
+            if (!_null_bitmap) {
+                _null_bitmap = std::make_shared<roaring::Roaring>();
+            }
             *_null_bitmap = std::move(new_null_bitmap);
         }
         return *this;
@@ -152,8 +168,12 @@ public:
 
     // NOT operation
     const InvertedIndexResultBitmap& op_not(const roaring::Roaring* universe) const {
-        if (_data_bitmap && _null_bitmap) {
-            *_data_bitmap = *universe - *_data_bitmap - *_null_bitmap;
+        if (_data_bitmap) {
+            if (_null_bitmap) {
+                *_data_bitmap = *universe - *_data_bitmap - *_null_bitmap;
+            } else {
+                *_data_bitmap = *universe - *_data_bitmap;
+            }
             // The _null_bitmap remains unchanged.
         }
         return *this;
@@ -161,10 +181,14 @@ public:
 
     // Operator -=
     InvertedIndexResultBitmap& operator-=(const InvertedIndexResultBitmap& other) {
-        if (_data_bitmap && _null_bitmap && other._data_bitmap && other._null_bitmap) {
+        if (_data_bitmap && other._data_bitmap) {
             *_data_bitmap -= *other._data_bitmap;
-            *_data_bitmap -= *other._null_bitmap;
-            *_null_bitmap -= *other._null_bitmap;
+            if (other._null_bitmap) {
+                *_data_bitmap -= *other._null_bitmap;
+            }
+            if (_null_bitmap && other._null_bitmap) {
+                *_null_bitmap -= *other._null_bitmap;
+            }
         }
         return *this;
     }
@@ -181,6 +205,12 @@ public:
 
     // Check if both bitmaps are empty
     bool is_empty() const { return (_data_bitmap == nullptr && _null_bitmap == nullptr); }
+
+private:
+    static const roaring::Roaring& _empty_bitmap() {
+        static const roaring::Roaring empty;
+        return empty;
+    }
 };
 
 class InvertedIndexReader : public IndexReader {
@@ -194,7 +224,8 @@ public:
 
     virtual Status query(const IndexQueryContextPtr& context, const std::string& column_name,
                          const void* query_value, InvertedIndexQueryType query_type,
-                         std::shared_ptr<roaring::Roaring>& bit_map) = 0;
+                         std::shared_ptr<roaring::Roaring>& bit_map,
+                         const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) = 0;
     virtual Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
                              const void* query_value, InvertedIndexQueryType query_type,
                              size_t* count) = 0;
@@ -255,7 +286,8 @@ public:
     Status new_iterator(std::unique_ptr<IndexIterator>* iterator) override;
     Status query(const IndexQueryContextPtr& context, const std::string& column_name,
                  const void* query_value, InvertedIndexQueryType query_type,
-                 std::shared_ptr<roaring::Roaring>& bit_map) override;
+                 std::shared_ptr<roaring::Roaring>& bit_map,
+                 const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) override;
     Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
                      const void* query_value, InvertedIndexQueryType query_type,
                      size_t* count) override {
@@ -279,7 +311,8 @@ public:
     Status new_iterator(std::unique_ptr<IndexIterator>* iterator) override;
     Status query(const IndexQueryContextPtr& context, const std::string& column_name,
                  const void* query_value, InvertedIndexQueryType query_type,
-                 std::shared_ptr<roaring::Roaring>& bit_map) override;
+                 std::shared_ptr<roaring::Roaring>& bit_map,
+                 const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) override;
     Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
                      const void* query_value, InvertedIndexQueryType query_type,
                      size_t* count) override {
@@ -338,7 +371,8 @@ public:
     Status new_iterator(std::unique_ptr<IndexIterator>* iterator) override;
     Status query(const IndexQueryContextPtr& context, const std::string& column_name,
                  const void* query_value, InvertedIndexQueryType query_type,
-                 std::shared_ptr<roaring::Roaring>& bit_map) override;
+                 std::shared_ptr<roaring::Roaring>& bit_map,
+                 const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) override;
     Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
                      const void* query_value, InvertedIndexQueryType query_type,
                      size_t* count) override;
@@ -387,17 +421,29 @@ public:
         std::unique_ptr<InvertedIndexQueryParam<PT>> param =
                 InvertedIndexQueryParam<PT>::create_unique();
 
-        CPP_TYPE cpp_val;
-        if constexpr (std::is_same_v<ValueType, doris::vectorized::Field>) {
-            auto field_val =
-                    doris::vectorized::get<doris::vectorized::NearestFieldType<CPP_TYPE>>(*value);
-            cpp_val = static_cast<CPP_TYPE>(field_val);
+        if constexpr (is_string_type(PT)) {
+            if constexpr (std::is_same_v<ValueType, doris::vectorized::Field>) {
+                const auto& str = value->template get<PT>();
+                param->set_value(str);
+            } else if constexpr (std::is_same_v<ValueType, StringRef>) {
+                param->set_value(value);
+            } else {
+                static_assert(std::is_convertible_v<ValueType, std::string>,
+                              "ValueType must be convertible to std::string for string types");
+                param->set_value(std::string(*value));
+            }
         } else {
-            cpp_val = static_cast<CPP_TYPE>(*value);
-        }
+            CPP_TYPE cpp_val;
+            if constexpr (std::is_same_v<ValueType, doris::vectorized::Field>) {
+                auto field_val = value->template get<PT>();
+                cpp_val = static_cast<CPP_TYPE>(field_val);
+            } else {
+                cpp_val = static_cast<CPP_TYPE>(*value);
+            }
 
-        auto storage_val = PrimitiveTypeConvertor<PT>::to_storage_field_type(cpp_val);
-        param->set_value(&storage_val);
+            auto storage_val = PrimitiveTypeConvertor<PT>::to_storage_field_type(cpp_val);
+            param->set_value(&storage_val);
+        }
         result_param = std::move(param);
         return Status::OK();
     }
@@ -453,14 +499,27 @@ class InvertedIndexQueryParam : public InvertedIndexQueryParamFactory {
     using storage_val = typename PrimitiveTypeTraits<PT>::StorageFieldType;
 
 public:
-    void set_value(const storage_val* value) {
-        _value = *reinterpret_cast<const storage_val*>(value);
-    }
+    void set_value(const storage_val* value) { _value = *value; }
 
     const void* get_value() const override { return &_value; }
 
 private:
     storage_val _value;
+};
+
+template <PrimitiveType PT>
+    requires(is_string_type(PT))
+class InvertedIndexQueryParam<PT> : public InvertedIndexQueryParamFactory {
+    ENABLE_FACTORY_CREATOR(InvertedIndexQueryParam);
+
+public:
+    void set_value(const std::string& value) { _value = value; }
+    void set_value(const StringRef* value) { _value.assign(value->data, value->size); }
+
+    const void* get_value() const override { return &_value; }
+
+private:
+    std::string _value;
 };
 
 } // namespace segment_v2

@@ -70,11 +70,11 @@ class VExprContext;
 
 namespace doris::vectorized {
 #include "common/compile_check_begin.h"
-class ParquetReader : public GenericReader, public ExprPushDownHelper {
+class ParquetReader : public GenericReader {
     ENABLE_FACTORY_CREATOR(ParquetReader);
 
 public:
-    struct Statistics {
+    struct ReaderStatistics {
         int32_t filtered_row_groups = 0;
         int32_t filtered_row_groups_by_min_max = 0;
         int32_t filtered_row_groups_by_bloom_filter = 0;
@@ -84,13 +84,12 @@ public:
         int64_t lazy_read_filtered_rows = 0;
         int64_t read_rows = 0;
         int64_t filtered_bytes = 0;
-        int64_t read_bytes = 0;
         int64_t column_read_time = 0;
         int64_t parse_meta_time = 0;
         int64_t parse_footer_time = 0;
         int64_t file_footer_read_calls = 0;
         int64_t file_footer_hit_cache = 0;
-        int64_t open_file_time = 0;
+        int64_t file_reader_create_time = 0;
         int64_t open_file_num = 0;
         int64_t row_group_filter_time = 0;
         int64_t page_index_filter_time = 0;
@@ -106,9 +105,18 @@ public:
                   io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache = nullptr,
                   bool enable_lazy_mat = true);
 
+    ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams& params,
+                  const TFileRangeDesc& range, size_t batch_size, const cctz::time_zone* ctz,
+                  std::shared_ptr<io::IOContext> io_ctx_holder, RuntimeState* state,
+                  FileMetaCache* meta_cache = nullptr, bool enable_lazy_mat = true);
+
     ParquetReader(const TFileScanRangeParams& params, const TFileRangeDesc& range,
                   io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache = nullptr,
                   bool enable_lazy_mat = true);
+
+    ParquetReader(const TFileScanRangeParams& params, const TFileRangeDesc& range,
+                  std::shared_ptr<io::IOContext> io_ctx_holder, RuntimeState* state,
+                  FileMetaCache* meta_cache = nullptr, bool enable_lazy_mat = true);
 
     ~ParquetReader() override;
 #ifdef BE_TEST
@@ -117,7 +125,11 @@ public:
 #endif
 
     Status init_reader(
-            const std::vector<std::string>& all_column_names, const VExprContextSPtrs& conjuncts,
+            const std::vector<std::string>& all_column_names,
+            std::unordered_map<std::string, uint32_t>* col_name_to_block_idx,
+            const VExprContextSPtrs& conjuncts,
+            phmap::flat_hash_map<int, std::vector<std::shared_ptr<ColumnPredicate>>>&
+                    slot_id_to_predicates,
             const TupleDescriptor* tuple_descriptor, const RowDescriptor* row_descriptor,
             const std::unordered_map<std::string, int>* colname_to_slot_id,
             const VExprContextSPtrs* not_single_slot_filter_conjuncts,
@@ -144,7 +156,7 @@ public:
     Status get_parsed_schema(std::vector<std::string>* col_names,
                              std::vector<DataTypePtr>* col_types) override;
 
-    Statistics& statistics() { return _statistics; }
+    ReaderStatistics& reader_statistics() { return _reader_statistics; }
 
     const tparquet::FileMetaData* get_meta_data() const { return _t_metadata; }
 
@@ -172,16 +184,16 @@ private:
         RuntimeProfile::Counter* filtered_row_groups_by_min_max = nullptr;
         RuntimeProfile::Counter* filtered_row_groups_by_bloom_filter = nullptr;
         RuntimeProfile::Counter* to_read_row_groups = nullptr;
+        RuntimeProfile::Counter* total_row_groups = nullptr;
         RuntimeProfile::Counter* filtered_group_rows = nullptr;
         RuntimeProfile::Counter* filtered_page_rows = nullptr;
         RuntimeProfile::Counter* lazy_read_filtered_rows = nullptr;
         RuntimeProfile::Counter* filtered_bytes = nullptr;
         RuntimeProfile::Counter* raw_rows_read = nullptr;
-        RuntimeProfile::Counter* to_read_bytes = nullptr;
         RuntimeProfile::Counter* column_read_time = nullptr;
         RuntimeProfile::Counter* parse_meta_time = nullptr;
         RuntimeProfile::Counter* parse_footer_time = nullptr;
-        RuntimeProfile::Counter* open_file_time = nullptr;
+        RuntimeProfile::Counter* file_reader_create_time = nullptr;
         RuntimeProfile::Counter* open_file_num = nullptr;
         RuntimeProfile::Counter* row_group_filter_time = nullptr;
         RuntimeProfile::Counter* page_index_read_calls = nullptr;
@@ -192,7 +204,16 @@ private:
         RuntimeProfile::Counter* file_footer_hit_cache = nullptr;
         RuntimeProfile::Counter* decompress_time = nullptr;
         RuntimeProfile::Counter* decompress_cnt = nullptr;
+        RuntimeProfile::Counter* page_read_counter = nullptr;
+        RuntimeProfile::Counter* page_cache_write_counter = nullptr;
+        RuntimeProfile::Counter* page_cache_compressed_write_counter = nullptr;
+        RuntimeProfile::Counter* page_cache_decompressed_write_counter = nullptr;
+        RuntimeProfile::Counter* page_cache_hit_counter = nullptr;
+        RuntimeProfile::Counter* page_cache_missing_counter = nullptr;
+        RuntimeProfile::Counter* page_cache_compressed_hit_counter = nullptr;
+        RuntimeProfile::Counter* page_cache_decompressed_hit_counter = nullptr;
         RuntimeProfile::Counter* decode_header_time = nullptr;
+        RuntimeProfile::Counter* read_page_header_time = nullptr;
         RuntimeProfile::Counter* decode_value_time = nullptr;
         RuntimeProfile::Counter* decode_dict_time = nullptr;
         RuntimeProfile::Counter* decode_level_time = nullptr;
@@ -251,8 +272,8 @@ private:
 
     Status _set_read_one_line_impl() override { return Status::OK(); }
 
-    bool _exists_in_file(const VSlotRef* slot) const override;
-    bool _type_matches(const VSlotRef*) const override;
+    bool _exists_in_file(const std::string& expr_name) const;
+    bool _type_matches(const int cid) const;
 
     RuntimeProfile* _profile = nullptr;
     const TFileScanRangeParams& _scan_params;
@@ -313,11 +334,12 @@ private:
     // _table_column_names = _missing_cols + _read_table_columns
     const std::vector<std::string>* _table_column_names = nullptr;
 
-    Statistics _statistics;
-    ParquetColumnReader::Statistics _column_statistics;
+    ReaderStatistics _reader_statistics;
+    ParquetColumnReader::ColumnStatistics _column_statistics;
     ParquetProfile _parquet_profile;
     bool _closed = false;
     io::IOContext* _io_ctx = nullptr;
+    std::shared_ptr<io::IOContext> _io_ctx_holder;
     RuntimeState* _state = nullptr;
     bool _enable_lazy_mat = true;
     bool _enable_filter_by_min_max = true;
@@ -336,10 +358,9 @@ private:
     std::set<uint64_t> _column_ids;
     std::set<uint64_t> _filter_column_ids;
 
-    // Since the filtering conditions for topn are dynamic, the filtering is delayed until create next row group reader.
-    VExprSPtrs _top_runtime_vexprs;
+    std::unordered_map<std::string, uint32_t>* _col_name_to_block_idx = nullptr;
+
     std::vector<std::unique_ptr<MutilColumnBlockPredicate>> _push_down_predicates;
-    std::vector<std::unique_ptr<ColumnPredicate>> _useless_predicates;
     Arena _arena;
 };
 #include "common/compile_check_end.h"

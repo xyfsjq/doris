@@ -48,7 +48,7 @@
 #include "util/runtime_profile.h"
 #include "util/slice.h"
 #include "vec/columns/column.h"
-#include "vec/common/schema_util.h"
+#include "vec/common/variant_util.h"
 #include "vec/core/block.h"
 #include "vec/core/column_with_type_and_name.h"
 #include "vec/core/columns_with_type_and_name.h"
@@ -138,7 +138,7 @@ public:
         _update_profile(profile, _pre_eval_block_predicate, "PreEvaluatePredicates");
 
         if (_opts.delete_condition_predicates != nullptr) {
-            std::set<const ColumnPredicate*> delete_predicate_set;
+            std::set<std::shared_ptr<const ColumnPredicate>> delete_predicate_set;
             _opts.delete_condition_predicates->get_all_column_predicate(delete_predicate_set);
             _update_profile(profile, delete_predicate_set, "DeleteConditionPredicates");
         }
@@ -192,7 +192,8 @@ private:
 
     [[nodiscard]] Status _apply_inverted_index();
     [[nodiscard]] Status _apply_inverted_index_on_column_predicate(
-            ColumnPredicate* pred, std::vector<ColumnPredicate*>& remaining_predicates,
+            std::shared_ptr<ColumnPredicate> pred,
+            std::vector<std::shared_ptr<ColumnPredicate>>& remaining_predicates,
             bool* continue_apply);
     [[nodiscard]] Status _apply_ann_topn_predicate();
     [[nodiscard]] Status _apply_index_expr();
@@ -263,7 +264,7 @@ private:
                 RETURN_IF_ERROR(copy_column_data_by_selector(_current_return_columns[cid].get(),
                                                              tmp, sel_rowid_idx, select_size,
                                                              _opts.block_row_max));
-                RETURN_IF_ERROR(vectorized::schema_util::cast_column(
+                RETURN_IF_ERROR(vectorized::variant_util::cast_column(
                         {tmp->get_ptr(), storage_type, ""}, block->get_by_position(block_cid).type,
                         &block->get_by_position(block_cid).column));
             } else {
@@ -277,7 +278,7 @@ private:
         return Status::OK();
     }
 
-    bool _can_evaluated_by_vectorized(ColumnPredicate* predicate);
+    bool _can_evaluated_by_vectorized(std::shared_ptr<ColumnPredicate> predicate);
 
     [[nodiscard]] Status _extract_common_expr_columns(const vectorized::VExprSPtr& expr);
     // same with _extract_common_expr_columns, but only extract columns that can be used for index
@@ -292,9 +293,10 @@ private:
     // Dictionary column should do something to initial.
     void _convert_dict_code_for_predicate_if_necessary();
 
-    void _convert_dict_code_for_predicate_if_necessary_impl(ColumnPredicate* predicate);
+    void _convert_dict_code_for_predicate_if_necessary_impl(
+            std::shared_ptr<ColumnPredicate> predicate);
 
-    bool _check_apply_by_inverted_index(ColumnPredicate* pred);
+    bool _check_apply_by_inverted_index(std::shared_ptr<ColumnPredicate> pred);
 
     void _output_index_result_column_for_expr(uint16_t* sel_rowid_idx, uint16_t select_size,
                                               vectorized::Block* block);
@@ -384,6 +386,8 @@ private:
 
     void _init_row_bitmap_by_condition_cache();
 
+    void _init_segment_prefetchers();
+
     class BitmapRangeIterator;
     class BackwardBitmapRangeIterator;
 
@@ -424,8 +428,8 @@ private:
     std::map<uint32_t, bool> _need_read_data_indices;
     std::vector<bool> _is_common_expr_column;
     vectorized::MutableColumns _current_return_columns;
-    std::vector<ColumnPredicate*> _pre_eval_block_predicate;
-    std::vector<ColumnPredicate*> _short_cir_eval_predicate;
+    std::vector<std::shared_ptr<ColumnPredicate>> _pre_eval_block_predicate;
+    std::vector<std::shared_ptr<ColumnPredicate>> _short_cir_eval_predicate;
     std::vector<uint32_t> _delete_range_column_ids;
     std::vector<uint32_t> _delete_bloom_filter_column_ids;
     // when lazy materialization is enabled, segmentIter need to read data at least twice
@@ -446,7 +450,7 @@ private:
 
     StorageReadOptions _opts;
     // make a copy of `_opts.column_predicates` in order to make local changes
-    std::vector<ColumnPredicate*> _col_predicates;
+    std::vector<std::shared_ptr<ColumnPredicate>> _col_predicates;
     vectorized::VExprContextSPtrs _common_expr_ctxs_push_down;
     bool _enable_common_expr_pushdown = false;
     std::vector<vectorized::VExprSPtr> _remaining_conjunct_roots;
@@ -475,7 +479,7 @@ private:
     std::unique_ptr<ObjectPool> _pool;
 
     // used to collect filter information.
-    std::vector<ColumnPredicate*> _filter_info_id;
+    std::vector<std::shared_ptr<ColumnPredicate>> _filter_info_id;
     bool _record_rowids = false;
     int64_t _tablet_id = 0;
     std::set<int32_t> _output_columns;
@@ -486,7 +490,7 @@ private:
     * column and column_predicates on it.
     * a boolean value to indicate whether the column has been read by the index.
     */
-    std::unordered_map<ColumnId, std::unordered_map<ColumnPredicate*, bool>>
+    std::unordered_map<ColumnId, std::unordered_map<std::shared_ptr<ColumnPredicate>, bool>>
             _column_predicate_index_exec_status;
 
     /*
@@ -514,7 +518,7 @@ private:
     IndexQueryContextPtr _index_query_context;
 
     // key is column uid, value is the sparse column cache
-    std::unordered_map<int32_t, PathToSparseColumnCacheUPtr> _variant_sparse_column_cache;
+    std::unordered_map<int32_t, PathToBinaryColumnCacheUPtr> _variant_sparse_column_cache;
 
     bool _find_condition_cache = false;
     std::shared_ptr<std::vector<bool>> _condition_cache;

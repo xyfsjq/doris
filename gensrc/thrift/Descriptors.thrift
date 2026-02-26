@@ -96,6 +96,9 @@ struct TColumn {
     23: optional bool is_on_update_current_timestamp = false
     24: optional i32 variant_max_sparse_column_statistics_size = 10000
     25: optional i32 variant_sparse_hash_shard_count
+    26: optional bool variant_enable_doc_mode
+  27: optional i64 variant_doc_materialization_min_rows
+  28: optional i32 variant_doc_hash_shard_count
 }
 
 struct TSlotDescriptor {
@@ -298,6 +301,8 @@ struct TOlapTablePartitionParam {
     11: optional bool enable_auto_detect_overwrite
     12: optional i64 overwrite_group_id
     13: optional bool partitions_is_fake = false
+    // remote insert fe master address
+    14: optional Types.TNetworkAddress master_address
 }
 
 struct TOlapTableIndex {

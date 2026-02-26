@@ -70,7 +70,8 @@ public class OSSPropertiesTest {
         origProps.put("oss.connection.timeout", "1000");
         origProps.put("oss.use_path_style", "true");
         origProps.put("test_non_storage_param", "6000");
-        OSSProperties ossProperties = (OSSProperties) StorageProperties.createAll(origProps).get(0);
+        OSSProperties ossProperties = (OSSProperties) StorageProperties.createAll(origProps).get(1);
+        Assertions.assertEquals(HdfsProperties.class, StorageProperties.createAll(origProps).get(0).getClass());
         Map<String, String> s3Props;
 
         Map<String, String> ossConfig = ossProperties.getMatchedProperties();
@@ -93,7 +94,7 @@ public class OSSPropertiesTest {
         Assertions.assertEquals("1000", s3Props.get("AWS_CONNECTION_TIMEOUT_MS"));
         Assertions.assertEquals("true", s3Props.get("use_path_style"));
         origProps.remove("oss.use_path_style");
-        ossProperties = (OSSProperties) StorageProperties.createAll(origProps).get(0);
+        ossProperties = (OSSProperties) StorageProperties.createAll(origProps).get(1);
         s3Props = ossProperties.generateBackendS3Configuration();
         Assertions.assertEquals("false", s3Props.get("use_path_style"));
     }
@@ -120,7 +121,7 @@ public class OSSPropertiesTest {
         origProps.put("oss.endpoint", "http://s3.oss-cn-hongkong.aliyuncs.com");
         Assertions.assertEquals("cn-hongkong", ((OSSProperties) StorageProperties.createPrimary(origProps)).getRegion());
         origProps.put("oss.endpoint", "https://dlf.cn-beijing.aliyuncs.com");
-        Assertions.assertEquals("cn-beijing", ((OSSProperties) StorageProperties.createAll(origProps).get(0)).getRegion());
+        Assertions.assertEquals("cn-beijing", ((OSSProperties) StorageProperties.createAll(origProps).get(1)).getRegion());
         origProps.put("oss.endpoint", "datalake-vpc.cn-shenzhen.aliyuncs.com");
         Assertions.assertEquals("cn-shenzhen", ((OSSProperties) StorageProperties.createPrimary(origProps)).getRegion());
         origProps.put("oss.endpoint", "https://datalake-vpc.cn-shenzhen.aliyuncs.com");
@@ -245,10 +246,14 @@ public class OSSPropertiesTest {
         ossProps.put("oss.endpoint", "oss-cn-hangzhou.aliyuncs.com");
         OSSProperties ossStorageProperties = (OSSProperties) StorageProperties.createPrimary(ossProps);
         Assertions.assertEquals(AnonymousCredentialsProvider.class, ossStorageProperties.getAwsCredentialsProvider().getClass());
+        Map<String, String> backendProps = ossStorageProperties.getBackendConfigProperties();
+        Assertions.assertEquals("ANONYMOUS", backendProps.get("AWS_CREDENTIALS_PROVIDER_TYPE"));
         ossProps.put("oss.access_key", "myAccessKey");
         ossProps.put("oss.secret_key", "mySecretKey");
         ossStorageProperties = (OSSProperties) StorageProperties.createPrimary(ossProps);
         Assertions.assertEquals(StaticCredentialsProvider.class, ossStorageProperties.getAwsCredentialsProvider().getClass());
+        backendProps = ossStorageProperties.getBackendConfigProperties();
+        Assertions.assertNull(backendProps.get("AWS_CREDENTIALS_PROVIDER_TYPE"));
     }
 
     @Test
@@ -268,4 +273,12 @@ public class OSSPropertiesTest {
         Assertions.assertFalse(s3Properties.hadoopStorageConfig.getBoolean("fs.oss.impl.disable.cache", false));
     }
 
+    @Test
+    public void testOSSBucketEndpointPathProperties() throws UserException {
+        Assertions.assertEquals("oss://my-bucket/path/to/dir/", OSSProperties.rewriteOssBucketIfNecessary("oss://my-bucket/path/to/dir/"));
+        Assertions.assertEquals("oss://my-bucket/path/to/dir/file.txt", OSSProperties.rewriteOssBucketIfNecessary("oss://my-bucket.oss-cn-hangzhou.aliyuncs.com/path/to/dir/file.txt"));
+        Assertions.assertEquals("s3://my-bucket/path/to/dir/file.txt", OSSProperties.rewriteOssBucketIfNecessary("s3://my-bucket.oss-cn-hangzhou.aliyuncs.com/path/to/dir/file.txt"));
+        Assertions.assertEquals("https://bucket-name.oss-cn-hangzhou.aliyuncs.com/path/to/dir/file.txt", OSSProperties.rewriteOssBucketIfNecessary("https://bucket-name.oss-cn-hangzhou.aliyuncs.com/path/to/dir/file.txt"));
+    }
 }
+

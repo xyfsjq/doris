@@ -395,15 +395,6 @@ suite("test_iceberg_optimize_actions_ddl", "p0,external,doris,external_docker,ex
     qt_after_fast_forword_branch """SELECT * FROM test_fast_forward@branch(feature_branch) ORDER BY id"""
 
 
-    // Test expire_snapshots action
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("older_than" = "2024-01-01T00:00:00")
-        """
-        exception "Iceberg expire_snapshots procedure is not implemented yet"
-    }
-
     // Test validation - missing required property
     test {
         sql """
@@ -447,87 +438,6 @@ suite("test_iceberg_optimize_actions_ddl", "p0,external,doris,external_docker,ex
             ()
         """
         exception "Missing required argument: timestamp"
-    }
-
-    // Test expire_snapshots with invalid older_than timestamp
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("older_than" = "not-a-timestamp")
-        """
-        exception "Invalid older_than format"
-    }
-
-    // Test expire_snapshots with negative timestamp
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("older_than" = "-1000")
-        """
-        exception "older_than timestamp must be non-negative"
-    }
-
-    // Test validation - retain_last must be at least 1
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("retain_last" = "0")
-        """
-        exception "retain_last must be positive, got: 0"
-    }
-
-    // Test expire_snapshots with invalid retain_last format
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("retain_last" = "not-a-number")
-        """
-        exception "Invalid retain_last format: not-a-number"
-    }
-
-    // Test expire_snapshots with negative retain_last
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("retain_last" = "-5")
-        """
-        exception "retain_last must be positive, got: -5"
-    }
-
-    // Test expire_snapshots with neither older_than nor retain_last
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ()
-        """
-        exception "At least one of 'older_than' or 'retain_last' must be specified"
-    }
-
-    // Test expire_snapshots with valid timestamp format (milliseconds)
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("older_than" = "1640995200000")
-        """
-        exception "Iceberg expire_snapshots procedure is not implemented yet"
-    }
-
-    // Test expire_snapshots with valid ISO datetime
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("older_than" = "2024-01-01T12:30:45")
-        """
-        exception "Iceberg expire_snapshots procedure is not implemented yet"
-    }
-
-    // Test expire_snapshots with valid retain_last and older_than
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("older_than" = "2024-01-01T00:00:00", "retain_last" = "5")
-        """
-        exception "Iceberg expire_snapshots procedure is not implemented yet"
     }
 
     // Test unknown action
@@ -628,12 +538,97 @@ suite("test_iceberg_optimize_actions_ddl", "p0,external,doris,external_docker,ex
         exception "Snapshot 123456789 not found in table"
     }
 
-    // Test with multiple partitions
-    test {
-        sql """
-            ALTER TABLE ${catalog_name}.${db_name}.${table_name} EXECUTE expire_snapshots
-            ("older_than" = "2024-01-01T00:00:00") PARTITIONS (p1, p2, p3)
-        """
-        exception "Action 'expire_snapshots' does not support partition specification"
-    }
+    // =====================================================================================
+// Test Case 6: publish_changes action with WAP (Write-Audit-Publish) pattern
+// Simplified workflow:
+//
+//   - Main branch is initially empty (0 rows)
+//   - A WAP snapshot exists with wap.id = "test_wap_001" and 2 rows
+//   - publish_changes should cherry-pick the WAP snapshot into the main branch
+// =====================================================================================
+
+logger.info("Starting simplified WAP (Write-Audit-Publish) workflow verification test")
+
+// WAP test database and table
+String wap_db = "wap_test"
+String wap_table = "orders_wap"
+
+// Step 1: Verify no data is visible before publish_changes
+logger.info("Step 1: Verifying table is empty before publish_changes")
+qt_wap_before_publish """
+    SELECT order_id, customer_id, amount, order_date
+    FROM ${catalog_name}.${wap_db}.${wap_table}
+    ORDER BY order_id
+"""
+
+// Step 2: Publish the WAP changes with wap_id = "test_wap_001"
+logger.info("Step 2: Publishing WAP changes with wap_id=test_wap_001")
+sql """
+    ALTER TABLE ${catalog_name}.${wap_db}.${wap_table}
+    EXECUTE publish_changes("wap_id" = "test_wap_001")
+"""
+logger.info("Publish changes executed successfully")
+
+// Step 3: Verify WAP data is visible after publish_changes
+logger.info("Step 3: Verifying WAP data is visible after publish_changes")
+qt_wap_after_publish """
+    SELECT order_id, customer_id, amount, order_date
+    FROM ${catalog_name}.${wap_db}.${wap_table}
+    ORDER BY order_id
+"""
+
+logger.info("Simplified WAP (Write-Audit-Publish) workflow verification completed successfully")
+
+// Negative tests for publish_changes
+
+// publish_changes on table without write.wap.enabled = true (should fail)
+test {
+    String nonWapDb = "wap_test"
+    String nonWapTable = "orders_non_wap"
+
+    sql """
+    ALTER TABLE ${catalog_name}.${nonWapDb}.${nonWapTable}
+    EXECUTE publish_changes("wap_id" = "test_wap_001")
+    """
+    exception "Cannot find snapshot with wap.id = test_wap_001"
+}
+
+
+// publish_changes with missing wap_id (should fail)
+test {
+    sql """
+        ALTER TABLE ${catalog_name}.${db_name}.${table_name}
+        EXECUTE publish_changes ()
+    """
+    exception "Missing required argument: wap_id"
+}
+
+// publish_changes with invalid wap_id (should fail)
+test {
+    sql """
+    ALTER TABLE ${catalog_name}.${wap_db}.${wap_table}
+    EXECUTE publish_changes("wap_id" = "non_existing_wap_id")
+    """
+    exception "Cannot find snapshot with wap.id = non_existing_wap_id"
+}
+
+// publish_changes with partition specification (should fail)
+test {
+    sql """
+        ALTER TABLE ${catalog_name}.${db_name}.${table_name}
+        EXECUTE publish_changes ("wap_id" = "test_wap_001") PARTITIONS (part1)
+    """
+    exception "Action 'publish_changes' does not support partition specification"
+}
+
+// publish_changes with WHERE condition (should fail)
+test {
+    sql """
+        ALTER TABLE ${catalog_name}.${db_name}.${table_name}
+        EXECUTE publish_changes ("wap_id" = "test_wap_001") WHERE id > 0
+    """
+    exception "Action 'publish_changes' does not support WHERE condition"
+}
+
+  
 }

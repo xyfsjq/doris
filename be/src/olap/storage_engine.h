@@ -112,9 +112,19 @@ public:
     // start all background threads. This should be call after env is ready.
     virtual Status start_bg_threads(std::shared_ptr<WorkloadGroup> wg_sptr = nullptr) = 0;
 
+    /* Parameters:
+     * - tablet_id: the id of tablet to get
+     * - sync_stats: the stats of sync rowset
+     * - force_use_only_cached: whether only use cached tablet meta
+     * - cache_on_miss: whether cache the tablet meta when missing in cache
+     */
     virtual Result<BaseTabletSPtr> get_tablet(int64_t tablet_id,
                                               SyncRowsetStats* sync_stats = nullptr,
-                                              bool force_use_only_cached = false) = 0;
+                                              bool force_use_only_cached = false,
+                                              bool cache_on_miss = true) = 0;
+
+    virtual Status get_tablet_meta(int64_t tablet_id, TabletMetaSharedPtr* tablet_meta,
+                                   bool force_use_only_cached = false) = 0;
 
     void register_report_listener(ReportWorker* listener);
     void deregister_report_listener(ReportWorker* listener);
@@ -237,8 +247,18 @@ public:
 
     Status create_tablet(const TCreateTabletReq& request, RuntimeProfile* profile);
 
+    /* Parameters:
+     * - tablet_id: the id of tablet to get
+     * - sync_stats: the stats of sync rowset
+     * - force_use_only_cached: whether only use cached tablet meta
+     * - cache_on_miss: whether cache the tablet meta when missing in cache
+     */
     Result<BaseTabletSPtr> get_tablet(int64_t tablet_id, SyncRowsetStats* sync_stats = nullptr,
-                                      bool force_use_only_cached = false) override;
+                                      bool force_use_only_cached = false,
+                                      bool cache_on_miss = true) override;
+
+    Status get_tablet_meta(int64_t tablet_id, TabletMetaSharedPtr* tablet_meta,
+                           bool force_use_only_cached = false) override;
 
     void clear_transaction_task(const TTransactionId transaction_id);
     void clear_transaction_task(const TTransactionId transaction_id,
@@ -427,6 +447,9 @@ private:
     Status _submit_compaction_task(TabletSharedPtr tablet, CompactionType compaction_type,
                                    bool force);
 
+    void _handle_compaction(TabletSharedPtr tablet, std::shared_ptr<CompactionMixin> compaction,
+                            CompactionType compaction_type, int64_t permits, bool force);
+
     Status _submit_single_replica_compaction_task(TabletSharedPtr tablet,
                                                   CompactionType compaction_type);
 
@@ -436,6 +459,8 @@ private:
     void _remove_unused_remote_files_callback();
     void do_remove_unused_remote_files();
     void _cold_data_compaction_producer_callback();
+    void _handle_cold_data_compaction(TabletSharedPtr tablet);
+    void _follow_cooldown_meta(TabletSharedPtr tablet);
 
     Status _handle_seg_compaction(std::shared_ptr<SegcompactionWorker> worker,
                                   SegCompactionCandidatesSharedPtr segments,
@@ -604,7 +629,9 @@ public:
     CreateTabletRRIdxCache(size_t capacity)
             : LRUCachePolicy(CachePolicy::CacheType::CREATE_TABLET_RR_IDX_CACHE, capacity,
                              LRUCacheType::NUMBER,
-                             /*stale_sweep_time_s*/ 30 * 60, 1) {}
+                             /*stale_sweep_time_s*/ 30 * 60, /*num shards*/ 1,
+                             /*element count capacity */ 0,
+                             /*enable prune*/ true, /*is lru-k*/ false) {}
 };
 
 struct DirInfo {

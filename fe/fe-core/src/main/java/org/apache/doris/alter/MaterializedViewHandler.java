@@ -63,6 +63,7 @@ import org.apache.doris.persist.BatchDropInfo;
 import org.apache.doris.persist.DropInfo;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ConnectContextUtil;
 import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.thrift.TStorageFormat;
 import org.apache.doris.thrift.TStorageMedium;
@@ -201,6 +202,9 @@ public class MaterializedViewHandler extends AlterHandler {
             if (olapTable.existTempPartitions()) {
                 throw new DdlException("Can not alter table when there are temp partitions in table");
             }
+            if (olapTable.hasColumnSeqMapping()) {
+                throw new DdlException("Can not add materialized view when table use column sequence mapping");
+            }
             // check no duplicate column name in full schema
             Set<String> allColumnNames = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
             for (Column column : olapTable.getFullSchema()) {
@@ -230,14 +234,17 @@ public class MaterializedViewHandler extends AlterHandler {
 
             long baseIndexId = checkAndGetBaseIndex(baseIndexName, olapTable);
             // Step1.3: mv clause validation
-            List<Column> mvColumns = checkAndPrepareMaterializedView(createMvCommand, olapTable);
+            Map<String, String> sessionVariables = ConnectContextUtil.getAffectQueryResultInPlanVariables(
+                    ConnectContext.get());
+            List<Column> mvColumns = checkAndPrepareMaterializedView(createMvCommand, olapTable, sessionVariables);
 
             // Step2: create mv job
             RollupJobV2 rollupJobV2 =
                     createMaterializedViewJob(null, mvIndexName, baseIndexName, mvColumns,
                             createMvCommand.getWhereClauseItemColumn(olapTable),
                             createMvCommand.getProperties(), olapTable, db, baseIndexId,
-                            createMvCommand.getMVKeysType(), createMvCommand.getOriginStatement());
+                            createMvCommand.getMVKeysType(), createMvCommand.getOriginStatement(),
+                            sessionVariables);
 
             addAlterJobV2(rollupJobV2);
 
@@ -284,6 +291,9 @@ public class MaterializedViewHandler extends AlterHandler {
             if (olapTable.existTempPartitions()) {
                 throw new DdlException("Can not alter table when there are temp partitions in table");
             }
+            if  (olapTable.hasColumnSeqMapping()) {
+                throw new DdlException("Can not add rollup when table use column sequence mapping");
+            }
 
             // 1 check and make rollup job
             for (AlterOp alterOp : alterOps) {
@@ -324,7 +334,7 @@ public class MaterializedViewHandler extends AlterHandler {
                 RollupJobV2 alterJobV2 =
                         createMaterializedViewJob(rawSql, rollupIndexName, baseIndexName, rollupSchema, null,
                         addRollupOp.getProperties(), olapTable, db, baseIndexId, olapTable.getKeysType(),
-                        null);
+                        null, ConnectContextUtil.getAffectQueryResultInPlanVariables(ConnectContext.get()));
 
                 rollupNameJobMap.put(addRollupOp.getRollupName(), alterJobV2);
                 logJobIdSet.add(alterJobV2.getJobId());
@@ -382,7 +392,7 @@ public class MaterializedViewHandler extends AlterHandler {
     private RollupJobV2 createMaterializedViewJob(String rawSql, String mvName, String baseIndexName,
             List<Column> mvColumns, Column whereColumn, Map<String, String> properties,
             OlapTable olapTable, Database db, long baseIndexId, KeysType mvKeysType,
-            OriginStatement origStmt) throws DdlException, AnalysisException {
+            OriginStatement origStmt, Map<String, String> sessionVariables) throws DdlException, AnalysisException {
         if (mvKeysType == null) {
             // assign rollup index's key type, same as base index's
             mvKeysType = olapTable.getKeysType();
@@ -412,7 +422,7 @@ public class MaterializedViewHandler extends AlterHandler {
                 rawSql, jobId, dbId, tableId, olapTable.getName(), timeoutMs,
                 baseIndexId, mvIndexId, baseIndexName, mvName,
                 mvColumns, whereColumn, baseSchemaHash, mvSchemaHash,
-                mvKeysType, mvShortKeyColumnCount, origStmt);
+                mvKeysType, mvShortKeyColumnCount, origStmt, sessionVariables);
         String newStorageFormatIndexName = NEW_STORAGE_FORMAT_INDEX_NAME_PREFIX + olapTable.getName();
         if (mvName.equals(newStorageFormatIndexName)) {
             mvJob.setStorageFormat(TStorageFormat.V2);
@@ -508,7 +518,7 @@ public class MaterializedViewHandler extends AlterHandler {
     }
 
     private List<Column> checkAndPrepareMaterializedView(CreateMaterializedViewCommand createMvCommand,
-                                                         OlapTable olapTable)
+                                                         OlapTable olapTable, Map<String, String> sessionVariables)
             throws DdlException {
         // check if mv index already exists
         if (olapTable.hasMaterializedIndex(createMvCommand.getMVName())) {
@@ -584,7 +594,7 @@ public class MaterializedViewHandler extends AlterHandler {
                                 "The mvItem[" + mvColumnItem.getName() + "] require slot because it is value column");
                     }
                 }
-                newMVColumns.add(mvColumnItem.toMVColumn(olapTable));
+                newMVColumns.add(mvColumnItem.toMVColumn(olapTable, sessionVariables));
             }
         } else {
             for (MVColumnItem mvColumnItem : mvColumnItemList) {
@@ -593,7 +603,7 @@ public class MaterializedViewHandler extends AlterHandler {
                     throw new DdlException("Base columns is null");
                 }
 
-                newMVColumns.add(mvColumnItem.toMVColumn(olapTable));
+                newMVColumns.add(mvColumnItem.toMVColumn(olapTable, sessionVariables));
             }
         }
 

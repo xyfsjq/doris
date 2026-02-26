@@ -115,7 +115,19 @@ public:
     bool is_variable_length() const override { return true; }
 
     void sanity_check() const override;
-    void sanity_check_simple() const;
+    void sanity_check_simple() const {
+#ifndef NDEBUG
+        auto count = cast_set<int64_t>(offsets.size());
+        if (chars.size() != offsets[count - 1]) {
+            throw Exception(Status::InternalError("row count: {}, chars.size(): {}, offset[{}]: {}",
+                                                  count, chars.size(), count - 1,
+                                                  offsets[count - 1]));
+        }
+        if (offsets[-1] != 0) {
+            throw Exception(Status::InternalError("wrong offsets[-1]: {}", offsets[-1]));
+        }
+#endif
+    }
 
     std::string get_name() const override { return "String"; }
 
@@ -154,7 +166,8 @@ public:
     bool is_column_string64() const override { return sizeof(T) == sizeof(uint64_t); }
 
     void insert_from(const IColumn& src_, size_t n) override {
-        const ColumnStr<T>& src = assert_cast<const ColumnStr<T>&>(src_);
+        const ColumnStr<T>& src =
+                assert_cast<const ColumnStr<T>&, TypeCheckOnRelease::DISABLE>(src_);
         const size_t size_to_append =
                 src.offsets[n] - src.offsets[n - 1]; /// -1th index is Ok, see PaddedPODArray.
 
@@ -427,6 +440,12 @@ public:
                                 uint32_t offset,
                                 const uint8_t* __restrict null_data) const override;
 
+    void update_crc32c_batch(uint32_t* __restrict hashes,
+                             const uint8_t* __restrict null_map) const override;
+
+    void update_crc32c_single(size_t start, size_t end, uint32_t& hash,
+                              const uint8_t* __restrict null_map) const override;
+
     void update_hashes_with_value(uint64_t* __restrict hashes,
                                   const uint8_t* __restrict null_data) const override {
         auto s = size();
@@ -481,7 +500,7 @@ public:
                                              rhs.chars.data() + rhs.offset_at(m), rhs.size_at(m));
     }
 
-    void get_permutation(bool reverse, size_t limit, int nan_direction_hint,
+    void get_permutation(bool reverse, size_t limit, int nan_direction_hint, HybridSorter& sorter,
                          IColumn::Permutation& res) const override;
 
     void reserve(size_t n) override;

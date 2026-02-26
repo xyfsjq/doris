@@ -70,7 +70,8 @@ public class OBSPropertyTest {
         origProps.put("obs.use_path_style", "true");
         origProps.put("test_non_storage_param", "test_non_storage_value");
         origProps.put(StorageProperties.FS_OBS_SUPPORT, "true");
-        OBSProperties obsProperties = (OBSProperties) StorageProperties.createAll(origProps).get(0);
+        OBSProperties obsProperties = (OBSProperties) StorageProperties.createAll(origProps).get(1);
+        Assertions.assertEquals(HdfsProperties.class, StorageProperties.createAll(origProps).get(0).getClass());
         Map<String, String> s3Props = new HashMap<>();
         Map<String, String> obsConfig = obsProperties.getMatchedProperties();
         Assertions.assertTrue(!obsConfig.containsKey("test_non_storage_param"));
@@ -91,7 +92,7 @@ public class OBSPropertyTest {
         Assertions.assertEquals("1000", s3Props.get("AWS_CONNECTION_TIMEOUT_MS"));
         Assertions.assertEquals("true", s3Props.get("use_path_style"));
         origProps.remove("obs.use_path_style");
-        obsProperties = (OBSProperties) StorageProperties.createAll(origProps).get(0);
+        obsProperties = (OBSProperties) StorageProperties.createAll(origProps).get(1);
         s3Props = obsProperties.getBackendConfigProperties();
         Assertions.assertEquals("false", s3Props.get("use_path_style"));
     }
@@ -102,7 +103,8 @@ public class OBSPropertyTest {
         origProps.put("obs.endpoint", "obs.cn-north-4.myhuaweicloud.com");
         origProps.put("obs.access_key", "myOBSAccessKey");
         origProps.put("obs.secret_key", "myOBSSecretKey");
-        OBSProperties obsProperties = (OBSProperties) StorageProperties.createAll(origProps).get(0);
+        OBSProperties obsProperties = (OBSProperties) StorageProperties.createAll(origProps).get(1);
+        Assertions.assertEquals(HdfsProperties.class, StorageProperties.createAll(origProps).get(0).getClass());
         Assertions.assertEquals("cn-north-4", obsProperties.getRegion());
         Assertions.assertEquals("myOBSAccessKey", obsProperties.getAccessKey());
         Assertions.assertEquals("myOBSSecretKey", obsProperties.getSecretKey());
@@ -147,10 +149,14 @@ public class OBSPropertyTest {
         props.put("obs.endpoint", "obs.cn-north-4.myhuaweicloud.com");
         OBSProperties obsStorageProperties = (OBSProperties) StorageProperties.createPrimary(props);
         Assertions.assertEquals(AnonymousCredentialsProvider.class, obsStorageProperties.getAwsCredentialsProvider().getClass());
+        Map<String, String> backendProps = obsStorageProperties.getBackendConfigProperties();
+        Assertions.assertEquals("ANONYMOUS", backendProps.get("AWS_CREDENTIALS_PROVIDER_TYPE"));
         props.put("obs.access_key", "myAccessKey");
         props.put("obs.secret_key", "mySecretKey");
         obsStorageProperties = (OBSProperties) StorageProperties.createPrimary(props);
         Assertions.assertEquals(StaticCredentialsProvider.class, obsStorageProperties.getAwsCredentialsProvider().getClass());
+        backendProps = obsStorageProperties.getBackendConfigProperties();
+        Assertions.assertNull(backendProps.get("AWS_CREDENTIALS_PROVIDER_TYPE"));
     }
 
     @Test
