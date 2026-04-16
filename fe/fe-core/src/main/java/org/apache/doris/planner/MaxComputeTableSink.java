@@ -66,8 +66,7 @@ public class MaxComputeTableSink extends BaseExternalTableDataSink {
 
         MaxComputeExternalCatalog catalog = (MaxComputeExternalCatalog) targetTable.getCatalog();
 
-        tSink.setAccessKey(catalog.getAccessKey());
-        tSink.setSecretKey(catalog.getSecretKey());
+        tSink.setProperties(catalog.getProperties());
         tSink.setEndpoint(catalog.getEndpoint());
         tSink.setProject(catalog.getDefaultProject());
         tSink.setTableName(targetTable.getName());
@@ -75,6 +74,7 @@ public class MaxComputeTableSink extends BaseExternalTableDataSink {
         tSink.setConnectTimeout(catalog.getConnectTimeout());
         tSink.setReadTimeout(catalog.getReadTimeout());
         tSink.setRetryCount(catalog.getRetryTimes());
+        tSink.setMaxWriteBatchRows(catalog.getMaxWriteBatchRows());
 
         // Partition columns
         List<String> partitionColumnNames = targetTable.getPartitionColumns().stream()

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_mc_write_large_data", "p2,external,maxcompute,external_remote,external_remote_maxcompute") {
+suite("test_mc_write_large_data", "p2,external") {
     String enabled = context.config.otherConfigs.get("enableMaxComputeTest")
     if (enabled == null || !enabled.equalsIgnoreCase("true")) {
         logger.info("disable MaxCompute test.")
@@ -25,7 +25,7 @@ suite("test_mc_write_large_data", "p2,external,maxcompute,external_remote,extern
     String ak = context.config.otherConfigs.get("ak")
     String sk = context.config.otherConfigs.get("sk")
     String mc_catalog_name = "test_mc_write_large_data"
-    String defaultProject = "doris_test_schema"
+    String defaultProject = "mc_doris_test_write"
 
     sql """drop catalog if exists ${mc_catalog_name}"""
     sql """
@@ -139,5 +139,54 @@ suite("test_mc_write_large_data", "p2,external,maxcompute,external_remote,extern
         sql """drop database if exists ${mc_catalog_name}.${db}"""
         sql """DROP TABLE IF EXISTS internal.${internal_db}.${internal_tb}"""
         sql """DROP DATABASE IF EXISTS internal.${internal_db}"""
+    }
+
+    // Test: mc.max_write_batch_rows and mc.max_field_size_bytes catalog properties
+    String mc_catalog_props = "test_mc_write_large_data_props"
+    sql """drop catalog if exists ${mc_catalog_props}"""
+    sql """
+    CREATE CATALOG IF NOT EXISTS ${mc_catalog_props} PROPERTIES (
+        "type" = "max_compute",
+        "mc.default.project" = "${defaultProject}",
+        "mc.access_key" = "${ak}",
+        "mc.secret_key" = "${sk}",
+        "mc.endpoint" = "http://service.cn-beijing-vpc.maxcompute.aliyun-inc.com/api",
+        "mc.quota" = "pay-as-you-go",
+        "mc.enable.namespace.schema" = "true",
+        "mc.max_write_batch_rows" = "512",
+        "mc.max_field_size_bytes" = "4194304"
+    );
+    """
+
+    sql """switch ${mc_catalog_props}"""
+    String db_props = "mc_props_test_${uuid}"
+    sql """drop database if exists ${db_props}"""
+    sql """create database ${db_props}"""
+    sql """use ${db_props}"""
+
+    try {
+        String tb_props = "props_verify_${uuid}"
+        sql """DROP TABLE IF EXISTS ${tb_props}"""
+        sql """
+        CREATE TABLE ${tb_props} (
+            id INT,
+            name STRING
+        )
+        """
+
+        // Insert 2000 rows to exceed max_write_batch_rows=512 (will be split into 4 batches)
+        sql """
+        INSERT INTO ${tb_props}
+        SELECT
+            number AS id,
+            concat('name_', cast(number AS STRING)) AS name
+        FROM numbers("number"="2000")
+        """
+
+        qt_props_count """ SELECT count(*) FROM ${tb_props} """
+        order_qt_props_top5 """ SELECT * FROM ${tb_props} ORDER BY id LIMIT 5 """
+    } finally {
+        sql """drop database if exists ${mc_catalog_props}.${db_props}"""
+        sql """drop catalog if exists ${mc_catalog_props}"""
     }
 }

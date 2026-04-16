@@ -22,6 +22,8 @@ import org.apache.doris.alter.AlterJobV2.JobState;
 import org.apache.doris.alter.BatchAlterJobPersistInfo;
 import org.apache.doris.alter.IndexChangeJob;
 import org.apache.doris.analysis.UserIdentity;
+import org.apache.doris.authentication.AuthenticationIntegrationMeta;
+import org.apache.doris.authentication.RoleMappingMeta;
 import org.apache.doris.backup.BackupJob;
 import org.apache.doris.backup.Repository;
 import org.apache.doris.backup.RestoreJob;
@@ -39,8 +41,11 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Function;
 import org.apache.doris.catalog.FunctionSearchDesc;
 import org.apache.doris.catalog.Resource;
+import org.apache.doris.catalog.constraint.Constraint;
+import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.cloud.CloudWarmUpJob;
 import org.apache.doris.cloud.catalog.CloudEnv;
+import org.apache.doris.cloud.persist.CloudMetaSyncPoint;
 import org.apache.doris.cloud.persist.UpdateCloudReplicaInfo;
 import org.apache.doris.cloud.snapshot.SnapshotState;
 import org.apache.doris.common.Config;
@@ -102,6 +107,7 @@ import org.apache.doris.system.Backend;
 import org.apache.doris.system.Frontend;
 import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.transaction.TransactionStatus;
+import org.apache.doris.tso.TSOTimestamp;
 
 import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
@@ -1082,6 +1088,32 @@ public class EditLog {
                     env.getSqlBlockRuleMgr().replayDrop(log.getRuleNames());
                     break;
                 }
+                case OperationType.OP_CREATE_AUTHENTICATION_INTEGRATION: {
+                    AuthenticationIntegrationMeta log = (AuthenticationIntegrationMeta) journal.getData();
+                    env.getAuthenticationIntegrationMgr().replayCreateAuthenticationIntegration(log);
+                    break;
+                }
+                case OperationType.OP_ALTER_AUTHENTICATION_INTEGRATION: {
+                    AuthenticationIntegrationMeta log = (AuthenticationIntegrationMeta) journal.getData();
+                    env.getAuthenticationIntegrationMgr().replayAlterAuthenticationIntegration(log);
+                    break;
+                }
+                case OperationType.OP_DROP_AUTHENTICATION_INTEGRATION: {
+                    DropAuthenticationIntegrationOperationLog log =
+                            (DropAuthenticationIntegrationOperationLog) journal.getData();
+                    env.getAuthenticationIntegrationMgr().replayDropAuthenticationIntegration(log);
+                    break;
+                }
+                case OperationType.OP_CREATE_ROLE_MAPPING: {
+                    RoleMappingMeta log = (RoleMappingMeta) journal.getData();
+                    env.getRoleMappingMgr().replayCreateRoleMapping(log);
+                    break;
+                }
+                case OperationType.OP_DROP_ROLE_MAPPING: {
+                    DropRoleMappingOperationLog log = (DropRoleMappingOperationLog) journal.getData();
+                    env.getRoleMappingMgr().replayDropRoleMapping(log);
+                    break;
+                }
                 case OperationType.OP_MODIFY_TABLE_ENGINE: {
                     ModifyTableEngineOperationLog log = (ModifyTableEngineOperationLog) journal.getData();
                     env.getAlterInstance().replayProcessModifyEngine(log);
@@ -1169,18 +1201,36 @@ public class EditLog {
                 case OperationType.OP_ADD_CONSTRAINT: {
                     final AlterConstraintLog log = (AlterConstraintLog) journal.getData();
                     try {
-                        log.getTableIf().replayAddConstraint(log.getConstraint());
+                        TableNameInfo tni = log.getTableNameInfo();
+                        Constraint constraint = log.getConstraint();
+                        if (tni == null) {
+                            LOG.warn("Failed to replay add constraint {}: "
+                                    + "table name could not be resolved",
+                                    constraint.getName());
+                            break;
+                        }
+                        env.getConstraintManager().addConstraint(
+                                tni, constraint.getName(), constraint, true);
                     } catch (Exception e) {
-                        LOG.error("Failed to replay add constraint", e);
+                        LOG.warn("Failed to replay add constraint", e);
                     }
                     break;
                 }
                 case OperationType.OP_DROP_CONSTRAINT: {
                     final AlterConstraintLog log = (AlterConstraintLog) journal.getData();
                     try {
-                        log.getTableIf().replayDropConstraint(log.getConstraint().getName());
+                        TableNameInfo tni = log.getTableNameInfo();
+                        Constraint constraint = log.getConstraint();
+                        if (tni == null) {
+                            LOG.warn("Failed to replay drop constraint {}: "
+                                    + "table name could not be resolved",
+                                    constraint.getName());
+                            break;
+                        }
+                        env.getConstraintManager().dropConstraint(
+                                tni, constraint.getName(), true);
                     } catch (Exception e) {
-                        LOG.error("Failed to replay drop constraint", e);
+                        LOG.warn("Failed to replay drop constraint", e);
                     }
                     break;
                 }
@@ -1422,6 +1472,15 @@ public class EditLog {
                 case OperationType.OP_BEGIN_SNAPSHOT: {
                     // SnapshotState info = (SnapshotState) journal.getData();
                     // TODO: implement
+                    break;
+                }
+                case OperationType.OP_META_SYNC_POINT: {
+                    // CloudMetaSyncPoint info = (CloudMetaSyncPoint) journal.getData();
+                    // This log is only used to keep FE/MS cut point in journal timeline.
+                    break;
+                }
+                case OperationType.OP_TSO_TIMESTAMP_WINDOW_END: {
+                    env.getTSOService().replayWindowEndTSO((TSOTimestamp) journal.getData());
                     break;
                 }
                 default: {
@@ -1865,6 +1924,10 @@ public class EditLog {
 
     public void logTimestamp(Timestamp stamp) {
         logEdit(OperationType.OP_TIMESTAMP, stamp);
+    }
+
+    public void logTSOTimestampWindowEnd(TSOTimestamp windowEnd) {
+        logEdit(OperationType.OP_TSO_TIMESTAMP_WINDOW_END, windowEnd);
     }
 
     public void logMasterInfo(MasterInfo info) {
@@ -2312,6 +2375,26 @@ public class EditLog {
         logEdit(OperationType.OP_DROP_SQL_BLOCK_RULE, new DropSqlBlockRuleOperationLog(ruleNames));
     }
 
+    public void logCreateAuthenticationIntegration(AuthenticationIntegrationMeta meta) {
+        logEdit(OperationType.OP_CREATE_AUTHENTICATION_INTEGRATION, meta);
+    }
+
+    public void logAlterAuthenticationIntegration(AuthenticationIntegrationMeta meta) {
+        logEdit(OperationType.OP_ALTER_AUTHENTICATION_INTEGRATION, meta);
+    }
+
+    public void logDropAuthenticationIntegration(DropAuthenticationIntegrationOperationLog log) {
+        logEdit(OperationType.OP_DROP_AUTHENTICATION_INTEGRATION, log);
+    }
+
+    public void logCreateRoleMapping(RoleMappingMeta meta) {
+        logEdit(OperationType.OP_CREATE_ROLE_MAPPING, meta);
+    }
+
+    public void logDropRoleMapping(DropRoleMappingOperationLog log) {
+        logEdit(OperationType.OP_DROP_ROLE_MAPPING, log);
+    }
+
     public void logModifyTableEngine(ModifyTableEngineOperationLog log) {
         logEdit(OperationType.OP_MODIFY_TABLE_ENGINE, log);
     }
@@ -2536,5 +2619,9 @@ public class EditLog {
 
     public long logBeginSnapshot(SnapshotState snapshotState) {
         return logEdit(OperationType.OP_BEGIN_SNAPSHOT, snapshotState);
+    }
+
+    public long logMetaSyncPoint(CloudMetaSyncPoint syncPoint) {
+        return logEdit(OperationType.OP_META_SYNC_POINT, syncPoint);
     }
 }

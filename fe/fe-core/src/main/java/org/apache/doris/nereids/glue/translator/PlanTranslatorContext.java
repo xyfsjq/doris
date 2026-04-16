@@ -25,7 +25,6 @@ import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.analysis.TupleId;
 import org.apache.doris.catalog.Column;
-import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.StatementContext;
@@ -44,6 +43,7 @@ import org.apache.doris.planner.PlanFragmentId;
 import org.apache.doris.planner.PlanNode;
 import org.apache.doris.planner.PlanNodeId;
 import org.apache.doris.planner.RuntimeFilterId;
+import org.apache.doris.planner.ScanContext;
 import org.apache.doris.planner.ScanNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
@@ -59,7 +59,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
-import javax.annotation.Nullable;
 
 /**
  * Context of physical plan.
@@ -67,6 +66,7 @@ import javax.annotation.Nullable;
 public class PlanTranslatorContext {
     private final ConnectContext connectContext;
     private final StatementContext statementContext;
+    private final ScanContext scanContext;
     private final List<PlanFragment> planFragments = Lists.newArrayList();
 
     private DescriptorTable descTable;
@@ -99,8 +99,6 @@ public class PlanTranslatorContext {
 
     private final IdGenerator<PlanNodeId> nodeIdGenerator = PlanNodeId.createGenerator();
 
-    private final Map<ExprId, SlotRef> bufferedSlotRefForWindow = Maps.newHashMap();
-
     private final Map<CTEId, PlanFragment> cteProduceFragments = Maps.newHashMap();
 
     private final Map<CTEId, PhysicalCTEProducer> cteProducerMap = Maps.newHashMap();
@@ -122,6 +120,11 @@ public class PlanTranslatorContext {
     public PlanTranslatorContext(CascadesContext ctx) {
         this.connectContext = ctx.getConnectContext();
         this.statementContext = ctx.getStatementContext();
+        this.scanContext = connectContext == null || connectContext.getSessionVariable() == null
+                ? ScanContext.EMPTY
+                : ScanContext.builder()
+                        .clusterName(connectContext.getSessionVariable().resolveCloudClusterName(connectContext))
+                        .build();
         this.translator = new RuntimeFilterTranslator(ctx.getRuntimeFilterContext());
         this.topnFilterContext = ctx.getTopnFilterContext();
         this.runtimeFilterV2Context = ctx.getRuntimeFilterV2Context();
@@ -132,6 +135,11 @@ public class PlanTranslatorContext {
     public PlanTranslatorContext(CascadesContext ctx, DescriptorTable descTable) {
         this.connectContext = ctx.getConnectContext();
         this.statementContext = ctx.getStatementContext();
+        this.scanContext = connectContext == null || connectContext.getSessionVariable() == null
+                ? ScanContext.EMPTY
+                : ScanContext.builder()
+                        .clusterName(connectContext.getSessionVariable().resolveCloudClusterName(connectContext))
+                        .build();
         this.translator = new RuntimeFilterTranslator(ctx.getRuntimeFilterContext());
         this.topnFilterContext = ctx.getTopnFilterContext();
         this.runtimeFilterV2Context = ctx.getRuntimeFilterV2Context();
@@ -145,6 +153,7 @@ public class PlanTranslatorContext {
     public PlanTranslatorContext() {
         this.connectContext = null;
         this.statementContext = new StatementContext();
+        this.scanContext = ScanContext.EMPTY;
         this.translator = null;
         this.topnFilterContext = new TopnFilterContext();
         IdGenerator<RuntimeFilterId> runtimeFilterIdGen = RuntimeFilterId.createGenerator();
@@ -278,6 +287,14 @@ public class PlanTranslatorContext {
         physicalRelations.add(physicalRelation);
     }
 
+    public String getClusterName() {
+        return scanContext.getClusterName();
+    }
+
+    public ScanContext getScanContext() {
+        return scanContext;
+    }
+
     public List<PhysicalRelation> getPhysicalRelations() {
         return physicalRelations;
     }
@@ -290,15 +307,10 @@ public class PlanTranslatorContext {
         return scanNodes;
     }
 
-    public Map<ExprId, SlotRef> getBufferedSlotRefForWindow() {
-        return bufferedSlotRefForWindow;
-    }
-
     /**
      * Create SlotDesc and add it to the mappings from expression to the stales expr.
      */
-    public SlotDescriptor createSlotDesc(TupleDescriptor tupleDesc, SlotReference slotReference,
-            @Nullable TableIf table) {
+    public SlotDescriptor createSlotDesc(TupleDescriptor tupleDesc, SlotReference slotReference) {
         SlotDescriptor slotDescriptor = this.addSlotDesc(tupleDesc);
         // Only the SlotDesc that in the tuple generated for scan node would have corresponding column.
         Optional<Column> column = slotReference.getOriginalColumn();
@@ -332,10 +344,6 @@ public class PlanTranslatorContext {
         }
         this.addExprIdSlotRefPair(slotReference.getExprId(), slotRef);
         return slotDescriptor;
-    }
-
-    public SlotDescriptor createSlotDesc(TupleDescriptor tupleDesc, SlotReference slotReference) {
-        return createSlotDesc(tupleDesc, slotReference, null);
     }
 
     public List<TupleDescriptor> getTupleDesc(PlanNode planNode) {

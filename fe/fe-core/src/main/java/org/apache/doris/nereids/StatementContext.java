@@ -21,18 +21,19 @@ import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.analysis.TableScanParams;
 import org.apache.doris.analysis.TableSnapshot;
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.View;
-import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.Id;
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.common.Pair;
 import org.apache.doris.datasource.mvcc.MvccSnapshot;
 import org.apache.doris.datasource.mvcc.MvccTable;
 import org.apache.doris.datasource.mvcc.MvccTableInfo;
+import org.apache.doris.foundation.format.FormatOptions;
 import org.apache.doris.mtmv.BaseTableInfo;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.exceptions.AnalysisException;
@@ -54,9 +55,11 @@ import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.TableId;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEConsumer;
+import org.apache.doris.nereids.trees.plans.logical.LogicalCTEProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.util.RelationUtil;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.ShortCircuitQueryContext;
@@ -66,6 +69,7 @@ import org.apache.doris.system.Backend;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Stopwatch;
+import com.google.common.base.Strings;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
 import com.google.common.base.Throwables;
@@ -81,10 +85,12 @@ import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -134,6 +140,7 @@ public class StatementContext implements Closeable {
 
     private boolean isDpHyp = false;
 
+    private boolean isDelete = false;
     private boolean hasNondeterministic = false;
 
     // hasUnknownColStats true if any column stats in the tables used by this sql is
@@ -156,7 +163,7 @@ public class StatementContext implements Closeable {
     private final Map<CTEId, Set<LogicalCTEConsumer>> cteIdToConsumers = new HashMap<>();
     private final Map<CTEId, Set<Slot>> cteIdToOutputIds = new HashMap<>();
 
-    private final Map<CTEId, Statistics> cteIdToProducerStats = new HashMap<>();
+    private final Map<CTEId, LogicalCTEProducer<? extends Plan>> cteIdToProducer = new HashMap<>();
 
     private final Map<RelationId, Set<Expression>> consumerIdToFilters = new HashMap<>();
     // Used to update consumer's stats
@@ -300,8 +307,6 @@ public class StatementContext implements Closeable {
     private final Set<List<String>> materializationRewrittenSuccessSet = new HashSet<>();
 
     private boolean isInsert = false;
-    private boolean skipPrunePredicate = false;
-
     private Optional<Map<TableIf, Set<Expression>>> mvRefreshPredicates = Optional.empty();
 
     // For Iceberg rewrite operations: store file scan tasks to be used by
@@ -314,11 +319,19 @@ public class StatementContext implements Closeable {
     private boolean hasNestedColumns;
 
     private final Set<CTEId> mustInlineCTE = new HashSet<>();
+    private final Set<String> usedAIResourceNames = new LinkedHashSet<>();
+
+    private final Map<String, Integer> lowerCaseTableNamesCache = Maps.newHashMap();
+    private final Map<String, Integer> lowerCaseDatabaseNamesCache = Maps.newHashMap();
+
+    // CTEs that must be materialized (e.g., containing non-deterministic functions)
+    private final Set<CTEId> forceMaterializeCTEs = new HashSet<>();
 
     public StatementContext() {
         this(ConnectContext.get(), null, 0);
     }
 
+    // For StatementScopeIdGenerator
     public StatementContext(int initialId) {
         this(ConnectContext.get(), null, initialId);
     }
@@ -330,7 +343,7 @@ public class StatementContext implements Closeable {
     /**
      * StatementContext
      */
-    public StatementContext(ConnectContext connectContext, OriginStatement originStatement, int initialId) {
+    private StatementContext(ConnectContext connectContext, OriginStatement originStatement, int initialId) {
         this.connectContext = connectContext;
         this.originStatement = originStatement;
         exprIdGenerator = ExprId.createGenerator(initialId);
@@ -454,6 +467,17 @@ public class StatementContext implements Closeable {
 
     public ConnectContext getConnectContext() {
         return connectContext;
+    }
+
+    public Set<String> getUsedAIResourceNames() {
+        return Collections.unmodifiableSet(usedAIResourceNames);
+    }
+
+    public void registerUsedAIResourceName(String resourceName) {
+        if (Strings.isNullOrEmpty(resourceName)) {
+            throw new AnalysisException("AI resource name can not be empty");
+        }
+        usedAIResourceNames.add(resourceName);
     }
 
     public void setOriginStatement(OriginStatement originStatement) {
@@ -640,7 +664,7 @@ public class StatementContext implements Closeable {
         return new CteEnvironmentSnapshot(
                 copyMapOfSets(cteIdToConsumers),
                 copyMapOfSets(cteIdToOutputIds),
-                new HashMap<>(cteIdToProducerStats),
+                new HashMap<>(cteIdToProducer),
                 copyMapOfSets(consumerIdToFilters),
                 copyMapOfLists(cteIdToConsumerGroup),
                 new HashMap<>(rewrittenCteProducer),
@@ -655,8 +679,8 @@ public class StatementContext implements Closeable {
         cteIdToOutputIds.clear();
         cteIdToOutputIds.putAll(snapshot.cteIdToOutputIds);
 
-        cteIdToProducerStats.clear();
-        cteIdToProducerStats.putAll(snapshot.cteIdToProducerStats);
+        cteIdToProducer.clear();
+        cteIdToProducer.putAll(snapshot.cteIdToProducer);
 
         consumerIdToFilters.clear();
         consumerIdToFilters.putAll(snapshot.consumerIdToFilters);
@@ -691,7 +715,7 @@ public class StatementContext implements Closeable {
     public static class CteEnvironmentSnapshot {
         private final Map<CTEId, Set<LogicalCTEConsumer>> cteIdToConsumers;
         private final Map<CTEId, Set<Slot>> cteIdToOutputIds;
-        private final Map<CTEId, Statistics> cteIdToProducerStats;
+        private final Map<CTEId, LogicalCTEProducer<? extends Plan>> cteIdToProducer;
         private final Map<RelationId, Set<Expression>> consumerIdToFilters;
         private final Map<CTEId, List<Pair<Multimap<Slot, Slot>, Group>>> cteIdToConsumerGroup;
         private final Map<CTEId, LogicalPlan> rewrittenCteProducer;
@@ -703,14 +727,14 @@ public class StatementContext implements Closeable {
         public CteEnvironmentSnapshot(
                 Map<CTEId, Set<LogicalCTEConsumer>> cteIdToConsumers,
                 Map<CTEId, Set<Slot>> cteIdToOutputIds,
-                Map<CTEId, Statistics> cteIdToProducerStats,
+                Map<CTEId, LogicalCTEProducer<? extends Plan>> cteIdToProducer,
                 Map<RelationId, Set<Expression>> consumerIdToFilters,
                 Map<CTEId, List<Pair<Multimap<Slot, Slot>, Group>>> cteIdToConsumerGroup,
                 Map<CTEId, LogicalPlan> rewrittenCteProducer,
                 Map<CTEId, LogicalPlan> rewrittenCteConsumer) {
             this.cteIdToConsumers = cteIdToConsumers;
             this.cteIdToOutputIds = cteIdToOutputIds;
-            this.cteIdToProducerStats = cteIdToProducerStats;
+            this.cteIdToProducer = cteIdToProducer;
             this.consumerIdToFilters = consumerIdToFilters;
             this.cteIdToConsumerGroup = cteIdToConsumerGroup;
             this.rewrittenCteProducer = rewrittenCteProducer;
@@ -1113,12 +1137,12 @@ public class StatementContext implements Closeable {
         return prepareStage;
     }
 
-    public Statistics getProducerStatsByCteId(CTEId id) {
-        return cteIdToProducerStats.get(id);
+    public LogicalCTEProducer<? extends Plan> getCteProducerByCteId(CTEId id) {
+        return cteIdToProducer.get(id);
     }
 
-    public void setProducerStats(CTEId id, Statistics stats) {
-        cteIdToProducerStats.put(id, stats);
+    public void setCteProducer(CTEId id, LogicalCTEProducer<? extends Plan> producer) {
+        cteIdToProducer.put(id, producer);
     }
 
     public void setIsInsert(boolean isInsert) {
@@ -1172,14 +1196,6 @@ public class StatementContext implements Closeable {
         return this.useGatherForIcebergRewrite;
     }
 
-    public boolean isSkipPrunePredicate() {
-        return skipPrunePredicate;
-    }
-
-    public void setSkipPrunePredicate(boolean skipPrunePredicate) {
-        this.skipPrunePredicate = skipPrunePredicate;
-    }
-
     public boolean hasNestedColumns() {
         return hasNestedColumns;
     }
@@ -1194,5 +1210,39 @@ public class StatementContext implements Closeable {
 
     public Set<CTEId> getMustInlineCTEs() {
         return mustInlineCTE;
+    }
+
+    public void addForceMaterializeCTE(CTEId cteId) {
+        forceMaterializeCTEs.add(cteId);
+    }
+
+    public boolean isForceMaterializeCTE(CTEId cteId) {
+        return forceMaterializeCTEs.contains(cteId);
+    }
+
+    public Set<CTEId> getForceMaterializeCTEs() {
+        return forceMaterializeCTEs;
+    }
+
+    public int getLowerCaseTableNames(String catalogName) {
+        if (catalogName == null) {
+            return GlobalVariable.lowerCaseTableNames;
+        }
+        return lowerCaseTableNamesCache.computeIfAbsent(catalogName, Env::getLowerCaseTableNames);
+    }
+
+    public int getLowerCaseDatabaseNames(String catalogName) {
+        if (catalogName == null) {
+            return 0;
+        }
+        return lowerCaseDatabaseNamesCache.computeIfAbsent(catalogName, Env::getLowerCaseDatabaseNames);
+    }
+
+    public boolean isDelete() {
+        return isDelete;
+    }
+
+    public void setIsDelete(boolean del) {
+        isDelete = del;
     }
 }

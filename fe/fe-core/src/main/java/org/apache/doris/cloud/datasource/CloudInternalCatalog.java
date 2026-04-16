@@ -20,12 +20,14 @@ package org.apache.doris.cloud.datasource;
 import org.apache.doris.analysis.DataSortInfo;
 import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.ColumnToProtobuf;
 import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DistributionInfo;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.EnvFactory;
 import org.apache.doris.catalog.Index;
+import org.apache.doris.catalog.IndexToPbConvertor;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
@@ -37,6 +39,7 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.ReplicaAllocation;
+import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.cloud.catalog.CloudEnv;
@@ -50,14 +53,13 @@ import org.apache.doris.cloud.proto.Cloud.FinishCopyRequest.Action;
 import org.apache.doris.cloud.proto.Cloud.MetaServiceCode;
 import org.apache.doris.cloud.proto.Cloud.ObjectFilePB;
 import org.apache.doris.cloud.rpc.MetaServiceProxy;
-import org.apache.doris.cloud.storage.ObjectFile;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.util.ColumnsUtil;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.filesystem.spi.RemoteObject;
 import org.apache.doris.proto.OlapCommon;
 import org.apache.doris.proto.OlapFile;
 import org.apache.doris.proto.OlapFile.EncryptionAlgorithmPB;
@@ -191,7 +193,8 @@ public class CloudInternalCatalog extends InternalCatalog {
                         tbl.variantEnableFlattenNested(), clusterKeyUids,
                         tbl.storagePageSize(), tbl.getTDEAlgorithmPB(),
                         tbl.storageDictPageSize(), true,
-                        tbl.getColumnSeqMapping());
+                        tbl.getColumnSeqMapping(),
+                                    tbl.getVerticalCompactionNumColumnsPerGroup());
                 requestBuilder.addTabletMetas(builder);
             }
             requestBuilder.setDbId(dbId);
@@ -225,7 +228,8 @@ public class CloudInternalCatalog extends InternalCatalog {
             TInvertedIndexFileStorageFormat invertedIndexFileStorageFormat, long pageSize,
             boolean variantEnableFlattenNested, List<Integer> clusterKeyUids,
             long storagePageSize, EncryptionAlgorithmPB encryptionAlgorithm, long storageDictPageSize,
-            boolean createInitialRowset, Map<String, List<String>> columnSeqMapping) throws DdlException {
+            boolean createInitialRowset, Map<String, List<String>> columnSeqMapping,
+            int verticalCompactionNumColumnsPerGroup) throws DdlException {
         OlapFile.TabletMetaCloudPB.Builder builder = OlapFile.TabletMetaCloudPB.newBuilder();
         builder.setTableId(tableId);
         builder.setIndexId(indexId);
@@ -260,6 +264,7 @@ public class CloudInternalCatalog extends InternalCatalog {
         builder.setTimeSeriesCompactionTimeThresholdSeconds(timeSeriesCompactionTimeThresholdSeconds);
         builder.setTimeSeriesCompactionEmptyRowsetsThreshold(timeSeriesCompactionEmptyRowsetsThreshold);
         builder.setTimeSeriesCompactionLevelThreshold(timeSeriesCompactionLevelThreshold);
+        builder.setVerticalCompactionNumColumnsPerGroup(verticalCompactionNumColumnsPerGroup);
 
         OlapFile.TabletSchemaCloudPB.Builder schemaBuilder = OlapFile.TabletSchemaCloudPB.newBuilder();
         schemaBuilder.setSchemaVersion(schemaVersion);
@@ -341,7 +346,7 @@ public class CloudInternalCatalog extends InternalCatalog {
         schemaBuilder.setSortColNum(dataSortInfo.getColNum());
         for (int i = 0; i < schemaColumns.size(); i++) {
             Column column = schemaColumns.get(i);
-            schemaBuilder.addColumn(column.toPb(bfColumns, indexes));
+            schemaBuilder.addColumn(ColumnToProtobuf.toPb(column, bfColumns, indexes));
         }
 
         Map<Integer, Column> columnMap = Maps.newHashMap();
@@ -350,7 +355,8 @@ public class CloudInternalCatalog extends InternalCatalog {
         }
         if (indexes != null) {
             for (Index index : indexes) {
-                schemaBuilder.addIndex(index.toPb(columnMap, index.getColumnUniqueIds(schemaColumns)));
+                schemaBuilder.addIndex(
+                        IndexToPbConvertor.toPb(index, columnMap, index.getColumnUniqueIds(schemaColumns)));
             }
         }
 
@@ -484,12 +490,22 @@ public class CloudInternalCatalog extends InternalCatalog {
      */
     @Override
     public void afterCreatePartitions(long dbId, long tableId, List<Long> partitionIds, List<Long> indexIds,
-            boolean isCreateTable, boolean isBatchCommit)
+            boolean isCreateTable, boolean isBatchCommit, OlapTable olapTable)
             throws DdlException {
         if (isBatchCommit) {
-            commitMaterializedIndex(dbId, tableId, indexIds, partitionIds, isCreateTable);
+            long tableVersion = commitMaterializedIndex(dbId, tableId, indexIds, partitionIds, isCreateTable);
+            if (olapTable != null && isCreateTable && tableVersion > 0) {
+                olapTable.setCachedTableVersion(tableVersion);
+                ((CloudEnv) Env.getCurrentEnv()).getCloudFEVersionSynchronizer()
+                        .pushVersionAsync(dbId, olapTable, tableVersion);
+            }
         } else {
-            commitPartition(dbId, tableId, partitionIds, indexIds);
+            long tableVersion = commitPartition(dbId, tableId, partitionIds, indexIds);
+            if (olapTable != null && tableVersion > 0) {
+                olapTable.setCachedTableVersion(tableVersion);
+                ((CloudEnv) Env.getCurrentEnv()).getCloudFEVersionSynchronizer()
+                        .pushVersionAsync(dbId, olapTable, tableVersion);
+            }
         }
         if (!Config.check_create_table_recycle_key_remained) {
             return;
@@ -554,11 +570,14 @@ public class CloudInternalCatalog extends InternalCatalog {
         }
     }
 
-    public void commitPartition(long dbId, long tableId, List<Long> partitionIds, List<Long> indexIds)
+    /**
+     * @return table version if returned by MetaService, otherwise return 0
+     */
+    public long commitPartition(long dbId, long tableId, List<Long> partitionIds, List<Long> indexIds)
             throws DdlException {
         if (Config.enable_check_compatibility_mode) {
             LOG.info("skip committing partitions in check compatibility mode");
-            return;
+            return 0;
         }
 
         Cloud.PartitionRequest.Builder partitionRequestBuilder = Cloud.PartitionRequest.newBuilder()
@@ -593,6 +612,10 @@ public class CloudInternalCatalog extends InternalCatalog {
             LOG.warn("commitPartition response: {} ", response);
             throw new DdlException(response.getStatus().getMsg());
         }
+        if (response.hasTableVersion()) {
+            return response.getTableVersion();
+        }
+        return 0;
     }
 
     // if `expiration` = 0, recycler will delete uncommitted indexes in `retention_seconds`
@@ -633,12 +656,15 @@ public class CloudInternalCatalog extends InternalCatalog {
         }
     }
 
-    public void commitMaterializedIndex(long dbId, long tableId, List<Long> indexIds, List<Long> partitionIds,
+    /**
+     * @return table version if returned by MetaService, otherwise return 0
+     */
+    public long commitMaterializedIndex(long dbId, long tableId, List<Long> indexIds, List<Long> partitionIds,
             boolean isCreateTable)
             throws DdlException {
         if (Config.enable_check_compatibility_mode) {
             LOG.info("skip committing materialized index in checking compatibility mode");
-            return;
+            return 0;
         }
 
         Cloud.IndexRequest.Builder indexRequestBuilder = Cloud.IndexRequest.newBuilder()
@@ -651,6 +677,8 @@ public class CloudInternalCatalog extends InternalCatalog {
         if (partitionIds != null) {
             indexRequestBuilder.addAllPartitionIds(partitionIds);
         }
+        LOG.debug("committing materialized index for tableId: {}, partitionIds: {}, indexIds: {}",
+                tableId, partitionIds, indexIds);
         final Cloud.IndexRequest indexRequest = indexRequestBuilder.build();
 
         Cloud.IndexResponse response = null;
@@ -674,6 +702,10 @@ public class CloudInternalCatalog extends InternalCatalog {
             LOG.warn("commitIndex response: {} ", response);
             throw new DdlException(response.getStatus().getMsg());
         }
+        if (isCreateTable && response.hasTableVersion()) {
+            return response.getTableVersion();
+        }
+        return 0;
     }
 
     private void checkPartition(long dbId, long tableId, List<Long> partitionIds)
@@ -925,6 +957,19 @@ public class CloudInternalCatalog extends InternalCatalog {
         if (response.getStatus().getCode() != Cloud.MetaServiceCode.OK) {
             LOG.warn("dropPartition response: {} ", response);
             throw new DdlException(response.getStatus().getMsg());
+        } else if (needUpdateTableVersion && response.hasTableVersion() && response.getTableVersion() > 0) {
+            Database db = Env.getCurrentInternalCatalog().getDbNullable(dbId);
+            if (db == null) {
+                return;
+            }
+            Table table = db.getTableNullable(tableId);
+            if (table != null && table instanceof OlapTable) {
+                OlapTable olapTable = (OlapTable) table;
+                long tableVersion = response.getTableVersion();
+                olapTable.setCachedTableVersion(tableVersion);
+                ((CloudEnv) Env.getCurrentEnv()).getCloudFEVersionSynchronizer()
+                        .pushVersionAsync(dbId, olapTable, tableVersion);
+            }
         }
     }
 
@@ -1228,8 +1273,7 @@ public class CloudInternalCatalog extends InternalCatalog {
         if (response.getStatus().getCode() == MetaServiceCode.STATE_ALREADY_EXISTED_FOR_USER
                 || response.getStatus().getCode() == MetaServiceCode.STAGE_NOT_FOUND) {
             Cloud.StagePB.Builder createStageBuilder = Cloud.StagePB.newBuilder();
-            createStageBuilder.addMysqlUserName(ClusterNamespace
-                    .getNameFromFullName(ConnectContext.get().getCurrentUserIdentity().getQualifiedUser()))
+            createStageBuilder.addMysqlUserName(ConnectContext.get().getCurrentUserIdentity().getQualifiedUser())
                 .setStageId(UUID.randomUUID().toString())
                 .setType(Cloud.StagePB.StageType.INTERNAL).addMysqlUserId(userId);
 
@@ -1494,13 +1538,13 @@ public class CloudInternalCatalog extends InternalCatalog {
         }
     }
 
-    public List<ObjectFilePB> filterCopyFiles(String stageId, long tableId, List<ObjectFile> objectFiles)
+    public List<ObjectFilePB> filterCopyFiles(String stageId, long tableId, List<RemoteObject> objectFiles)
             throws DdlException {
         Cloud.FilterCopyFilesRequest.Builder builder = Cloud.FilterCopyFilesRequest.newBuilder()
                 .setCloudUniqueId(Config.cloud_unique_id)
                 .setRequestIp(FrontendOptions.getLocalHostAddressCached())
                 .setStageId(stageId).setTableId(tableId);
-        for (ObjectFile objectFile : objectFiles) {
+        for (RemoteObject objectFile : objectFiles) {
             builder.addObjectFiles(
                     ObjectFilePB.newBuilder().setRelativePath(objectFile.getRelativePath())
                             .setEtag(objectFile.getEtag()).setSize(objectFile.getSize()).build());
