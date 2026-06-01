@@ -38,9 +38,8 @@
 #include "cloud/config.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/config.h"
-#include "common/metrics/doris_metrics.h"
-#include "cpp/s3_rate_limiter.h"
 #include "cpp/sync_point.h"
+#include "cpp/token_bucket_rate_limiter.h"
 #include "io/cache/block_file_cache.h"
 #include "io/cache/block_file_cache_factory.h"
 #include "io/cache/block_file_cache_profile.h"
@@ -277,9 +276,13 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
     size_t already_read = 0;
     SCOPED_CONCURRENCY_COUNT(ConcurrencyStatsManager::instance().cached_remote_reader_read_at);
 
+    const IOContext default_io_ctx;
+    if (io_ctx == nullptr) {
+        io_ctx = &default_io_ctx;
+    }
+    DCHECK(io_ctx);
     const bool is_dryrun = io_ctx->is_dryrun;
     DCHECK(!closed());
-    DCHECK(io_ctx);
     if (offset > size()) {
         return Status::InvalidArgument(
                 fmt::format("offset exceeds file size(offset: {}, file size: {}, path: {})", offset,

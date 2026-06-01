@@ -120,7 +120,7 @@ public class MysqlConnectProcessor extends ConnectProcessor {
         // null bitmap
         String stmtStr = "";
         try {
-            StatementContext statementContext = prepCtx.statementContext;
+            StatementContext statementContext = prepCtx.getStatementContext();
             if (paramCount > 0) {
                 if (LOG.isDebugEnabled()) {
                     LOG.debug("execute param buf: {}, array: {}", packetBuf, getHexStr(packetBuf));
@@ -248,6 +248,7 @@ public class MysqlConnectProcessor extends ConnectProcessor {
         }
         ctx.setCommand(command);
         ctx.setStartTime();
+        resolveWorkloadGroupName();
 
         switch (command) {
             case COM_INIT_DB:

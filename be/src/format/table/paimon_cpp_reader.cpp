@@ -69,16 +69,16 @@ Status PaimonCppReader::init_reader() {
     return _init_paimon_reader();
 }
 
-Status PaimonCppReader::get_next_block(Block* block, size_t* read_rows, bool* eof) {
+Status PaimonCppReader::_do_get_next_block(Block* block, size_t* read_rows, bool* eof) {
     if (_push_down_agg_type == TPushAggOp::type::COUNT && _remaining_table_level_row_count >= 0) {
         auto rows = std::min(_remaining_table_level_row_count,
                              (int64_t)_state->query_options().batch_size);
         _remaining_table_level_row_count -= rows;
-        auto mutate_columns = block->mutate_columns();
+        auto mutable_columns_guard = block->mutate_columns_scoped();
+        auto& mutate_columns = mutable_columns_guard.mutable_columns();
         for (auto& col : mutate_columns) {
             col->resize(rows);
         }
-        block->set_columns(std::move(mutate_columns));
         *read_rows = rows;
         *eof = false;
         if (_remaining_table_level_row_count == 0) {
@@ -117,6 +117,8 @@ Status PaimonCppReader::get_next_block(Block* block, size_t* read_rows, bool* eo
     auto record_batch = std::move(import_result).ValueUnsafe();
     const auto num_rows = static_cast<size_t>(record_batch->num_rows());
     const auto num_columns = record_batch->num_columns();
+    auto columns_guard = block->mutate_columns_scoped();
+    auto& columns = columns_guard.mutable_columns();
     for (int c = 0; c < num_columns; ++c) {
         const auto& field = record_batch->schema()->field(c);
         if (field->name() == VALUE_KIND_FIELD) {
@@ -128,11 +130,13 @@ Status PaimonCppReader::get_next_block(Block* block, size_t* read_rows, bool* eo
             // Skip columns that are not in the block (e.g., partition columns handled elsewhere)
             continue;
         }
-        const ColumnWithTypeAndName& column_with_name = block->get_by_position(it->second);
+        const auto block_pos = it->second;
         try {
-            RETURN_IF_ERROR(column_with_name.type->get_serde()->read_column_from_arrow(
-                    column_with_name.column->assume_mutable_ref(), record_batch->column(c).get(), 0,
-                    num_rows, _ctzz));
+            RETURN_IF_ERROR(columns_guard.get_datatype_by_position(block_pos)
+                                    ->get_serde()
+                                    ->read_column_from_arrow(*columns[block_pos],
+                                                             record_batch->column(c).get(), 0,
+                                                             num_rows, _ctzz));
         } catch (Exception& e) {
             return Status::InternalError("Failed to convert from arrow to block: {}", e.what());
         }
@@ -143,8 +147,8 @@ Status PaimonCppReader::get_next_block(Block* block, size_t* read_rows, bool* eo
     return Status::OK();
 }
 
-Status PaimonCppReader::get_columns(std::unordered_map<std::string, DataTypePtr>* name_to_type,
-                                    std::unordered_set<std::string>* missing_cols) {
+Status PaimonCppReader::_get_columns_impl(
+        std::unordered_map<std::string, DataTypePtr>* name_to_type) {
     for (const auto& slot : _file_slot_descs) {
         name_to_type->emplace(slot->col_name(), slot->type());
     }

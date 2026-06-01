@@ -45,7 +45,8 @@ NativeReader::~NativeReader() {
 namespace {
 
 Status validate_and_consume_header(io::FileReaderSPtr file_reader, const TFileRangeDesc& range,
-                                   int64_t* file_size, int64_t* current_offset, bool* eof) {
+                                   int64_t* file_size, int64_t* current_offset, bool* eof,
+                                   const io::IOContext* io_ctx) {
     *file_size = file_reader->size();
     *current_offset = 0;
     *eof = (*file_size == 0);
@@ -63,7 +64,7 @@ Status validate_and_consume_header(io::FileReaderSPtr file_reader, const TFileRa
     char header[HEADER_SIZE];
     Slice header_slice(header, sizeof(header));
     size_t bytes_read = 0;
-    RETURN_IF_ERROR(file_reader->read_at(0, header_slice, &bytes_read));
+    RETURN_IF_ERROR(file_reader->read_at(0, header_slice, &bytes_read, io_ctx));
     if (bytes_read != sizeof(header)) {
         return Status::InternalError(
                 "failed to read Doris Native header from file {}, expect {} bytes, got {} bytes",
@@ -140,11 +141,11 @@ Status NativeReader::init_reader() {
     }
 
     RETURN_IF_ERROR(validate_and_consume_header(_file_reader, _scan_range, &_file_size,
-                                                &_current_offset, &_eof));
+                                                &_current_offset, &_eof, _io_ctx));
     return Status::OK();
 }
 
-Status NativeReader::get_next_block(Block* block, size_t* read_rows, bool* eof) {
+Status NativeReader::_do_get_next_block(Block* block, size_t* read_rows, bool* eof) {
     if (_eof) {
         *read_rows = 0;
         *eof = true;
@@ -217,9 +218,7 @@ Status NativeReader::get_next_block(Block* block, size_t* read_rows, bool* eof) 
     return Status::OK();
 }
 
-Status NativeReader::get_columns(std::unordered_map<std::string, DataTypePtr>* name_to_type,
-                                 std::unordered_set<std::string>* missing_cols) {
-    missing_cols->clear();
+Status NativeReader::_get_columns_impl(std::unordered_map<std::string, DataTypePtr>* name_to_type) {
     RETURN_IF_ERROR(init_reader());
 
     if (!_schema_inited) {
@@ -312,7 +311,7 @@ Status NativeReader::_read_next_pblock(std::string* buff, bool* eof) {
     uint64_t len = 0;
     Slice len_slice(reinterpret_cast<char*>(&len), sizeof(len));
     size_t bytes_read = 0;
-    RETURN_IF_ERROR(_file_reader->read_at(_current_offset, len_slice, &bytes_read));
+    RETURN_IF_ERROR(_file_reader->read_at(_current_offset, len_slice, &bytes_read, _io_ctx));
     if (bytes_read == 0) {
         *eof = true;
         return Status::OK();
@@ -334,7 +333,7 @@ Status NativeReader::_read_next_pblock(std::string* buff, bool* eof) {
     buff->assign(len, '\0');
     Slice data_slice(buff->data(), len);
     bytes_read = 0;
-    RETURN_IF_ERROR(_file_reader->read_at(_current_offset, data_slice, &bytes_read));
+    RETURN_IF_ERROR(_file_reader->read_at(_current_offset, data_slice, &bytes_read, _io_ctx));
     if (bytes_read != len) {
         return Status::InternalError(
                 "Failed to read native block body from file {}, expect {}, "
